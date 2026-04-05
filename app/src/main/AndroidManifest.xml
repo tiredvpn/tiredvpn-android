@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Custom permission for ADB/automation control — only apps signed with the same key can use it -->
+    <permission
+        android:name="com.tiredvpn.android.permission.VPN_CONTROL"
+        android:protectionLevel="signature" />
+
+    <!-- Network permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <!-- Boot and background service permissions -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Battery optimization bypass - critical for VPN reliability -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Query packages for split tunneling -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Camera for QR scanning -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Install APK updates from app -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- TV Support -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:name=".TiredVpnApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/tv_banner"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.TiredVPN"
+        tools:targetApi="36">
+
+        <!-- Main Activity -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Welcome/Onboarding -->
+        <activity
+            android:name=".ui.WelcomeActivity"
+            android:exported="false"
+            android:theme="@style/Theme.TiredVPN" />
+
+        <!-- Server Configuration -->
+        <activity
+            android:name=".ui.ServerConfigActivity"
+            android:exported="true"
+            android:parentActivityName=".ui.MainActivity">
+            <!-- Handle tired:// deep links -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tired" />
+            </intent-filter>
+        </activity>
+
+        <!-- Server List -->
+        <activity
+            android:name=".ui.ServerListActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!-- Settings -->
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!-- Split Tunneling -->
+        <activity
+            android:name=".ui.SplitTunnelingActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.SettingsActivity" />
+
+        <!-- About -->
+        <activity
+            android:name=".ui.AboutActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.SettingsActivity" />
+
+        <!-- QR Scanner - DISABLED for 16KB page support on Pixel 9
+        <activity
+            android:name=".ui.QrScannerActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.ServerConfigActivity" />
+        -->
+
+        <!-- Log Viewer -->
+        <activity
+            android:name=".ui.LogViewerActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.SettingsActivity" />
+
+        <!-- FileProvider for sharing logs -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- VPN Service - directBootAware allows starting before device unlock -->
+        <service
+            android:name=".vpn.TiredVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="true" />
+            <!-- Required for Android 14+ to justify specialUse foreground service type -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
+        </service>
+
+        <!-- Boot Receiver for auto-connect - MUST be exported to receive system broadcasts -->
+        <receiver
+            android:name=".receiver.BootReceiver"
+            android:exported="true"
+            android:enabled="true"
+            android:directBootAware="true">
+            <intent-filter android:priority="1000">
+                <!-- Standard boot completed (after unlock) -->
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Direct boot (before unlock) - requires directBootAware="true" -->
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <!-- Quick boot on some devices -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.REBOOT" />
+                <!-- App updated - restart VPN if was running -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Airplane Mode Receiver for auto-reconnect after airplane mode -->
+        <receiver
+            android:name=".receiver.AirplaneModeReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.AIRPLANE_MODE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Config Import Receiver for ADB setup (useful for TV)
+             Requires VPN_CONTROL permission — only apps signed with the same key can trigger this -->
+        <receiver
+            android:name=".receiver.ConfigImportReceiver"
+            android:exported="true"
+            android:permission="com.tiredvpn.android.permission.VPN_CONTROL">
+            <intent-filter>
+                <action android:name="com.tiredvpn.IMPORT_CONFIG" />
+            </intent-filter>
+        </receiver>
+
+        <!-- VPN Control Receiver for ADB control (connect/disconnect via broadcast)
+             Requires VPN_CONTROL permission — only apps signed with the same key can trigger this -->
+        <receiver
+            android:name=".receiver.VpnControlReceiver"
+            android:exported="true"
+            android:enabled="true"
+            android:permission="com.tiredvpn.android.permission.VPN_CONTROL">
+            <intent-filter>
+                <action android:name="com.tiredvpn.ACTION_CONNECT" />
+                <action android:name="com.tiredvpn.ACTION_DISCONNECT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

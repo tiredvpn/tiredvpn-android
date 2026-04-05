@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tired</string>
+
+    <!-- Connection states -->
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="connecting">Connecting…</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="tap_to_connect">Tap to Connect</string>
+
+    <!-- Server -->
+    <string name="server_address">Server address</string>
+    <string name="server_port">Port</string>
+    <string name="secret_key">Secret key</string>
+    <string name="current_location">Current Location</string>
+    <string name="select_server">Select Server</string>
+    <string name="server_flag">Server country flag</string>
+    <string name="your_new_ip">Your new IP</string>
+    <string name="server_locations">Server Locations</string>
+    <string name="search_by_country">Search by country or city</string>
+    <string name="connect_fastest">Connect to Fastest Server</string>
+    <string name="all_locations">All Locations</string>
+
+    <!-- Settings -->
+    <string name="settings">Settings</string>
+    <string name="general">GENERAL</string>
+    <string name="connect_on_launch">Connect on Launch</string>
+    <string name="notifications">Notifications</string>
+    <string name="connection">CONNECTION</string>
+    <string name="connection_mode">Connection Mode</string>
+    <string name="mode_vpn">VPN (Full Tunnel)</string>
+    <string name="mode_http_proxy">HTTP Proxy</string>
+    <string name="proxy_port">Proxy Port</string>
+    <string name="vpn_protocol">VPN Protocol</string>
+    <string name="protocol_auto">Auto (Best Available)</string>
+    <string name="quic_transport">QUIC Transport</string>
+    <string name="rtt_masking">RTT Masking</string>
+    <string name="cover_host">Cover Host</string>
+    <string name="auto_fallback">Auto Fallback</string>
+    <string name="auto_fallback_desc">Switch strategy if blocked</string>
+    <string name="security">SECURITY</string>
+    <string name="kill_switch">Kill Switch</string>
+    <string name="kill_switch_desc">Block internet if VPN drops</string>
+    <string name="always_on_vpn">Always-on VPN</string>
+    <string name="always_on_vpn_desc">Auto-reconnect &amp; block without VPN</string>
+    <string name="split_tunneling">Split Tunneling</string>
+    <string name="battery_optimization">Battery Optimization</string>
+    <string name="battery_optimization_check">Checking…</string>
+    <string name="battery_optimization_disabled">Disabled (recommended)</string>
+    <string name="battery_optimization_enabled">Enabled - tap to fix</string>
+    <string name="debug">DEBUG</string>
+    <string name="debug_logging">Debug Logging</string>
+    <string name="view_logs">View Logs</string>
+    <string name="logs">Logs</string>
+    <string name="no_logs">No logs available</string>
+    <string name="clear_logs">Clear</string>
+    <string name="share_logs">Share</string>
+    <string name="copy_logs">Copy</string>
+    <string name="logs_copied">Logs copied to clipboard</string>
+    <string name="logs_cleared">Logs cleared</string>
+    <string name="search_apps">Search apps…</string>
+    <string name="support_legal">SUPPORT &amp; LEGAL</string>
+    <string name="help_center">Help Center</string>
+    <string name="privacy_policy">Privacy Policy</string>
+    <string name="terms_of_service">Terms of Service</string>
+
+    <!-- Welcome/Onboarding -->
+    <string name="skip">Skip</string>
+    <string name="welcome_title">Welcome to TiredVPN</string>
+    <string name="welcome_subtitle">The easiest way to browse securely and privately. Your self-hosted shield against prying eyes.</string>
+    <string name="feature_security_title">Browse with Peace of Mind</string>
+    <string name="feature_security_desc">Secure your connection on public Wi-Fi and protect your personal data.</string>
+    <string name="feature_unlock_title">Unlock the Internet</string>
+    <string name="feature_unlock_desc">Access global content and bypass regional restrictions with ease.</string>
+    <string name="feature_privacy_title">Your Data is Yours</string>
+    <string name="feature_privacy_desc">Our strict no-logs policy means we never track or store your activity.</string>
+    <string name="get_started">Get Started</string>
+    <string name="terms_agreement">By continuing, you agree to our Terms of Service &amp; Privacy Policy</string>
+
+    <!-- About -->
+    <string name="about">About TiredVPN</string>
+    <string name="your_personal_vpn">Your Personal VPN</string>
+    <string name="about_description">TiredVPN is a self-hosted solution, giving you full control over your privacy. No subscriptions, no data logging. Ever.</string>
+    <string name="how_it_works">How It Works</string>
+    <string name="step_selfhost_title">1. Self-Host</string>
+    <string name="step_selfhost_desc">Deploy your own TiredVPN server. It\'s easier than it sounds! We support popular cloud providers and Docker.</string>
+    <string name="step_connect_title">2. Connect</string>
+    <string name="step_connect_desc">Once your server is running, use this app to scan the configuration QR code and connect instantly.</string>
+    <string name="step_enjoy_title">3. Enjoy</string>
+    <string name="step_enjoy_desc">Browse freely and securely. Your data is routed through your own server, keeping it safe from prying eyes.</string>
+    <string name="view_setup_guide">View Setup Guide</string>
+    <string name="join_community">Join Community Forum</string>
+    <string name="open_source_note">TiredVPN is an open-source project. Contributions are welcome!</string>
+    <string name="github">GitHub</string>
+
+    <!-- VPN Conflict Dialog -->
+    <string name="other_vpn_active_title">Another VPN is Active</string>
+    <string name="other_vpn_active_message">Another VPN app is currently connected. Please disconnect it first, then connect TiredVPN.\n\nYou can manage VPN apps in system settings.</string>
+    <string name="open_vpn_settings">VPN Settings</string>
+    <string name="connect_anyway">Connect Anyway</string>
+    <string name="cancel">Cancel</string>
+
+    <!-- Error Dialogs -->
+    <string name="connection_error_title">Connection Failed</string>
+    <string name="connection_error_message">Failed to connect to VPN server:\n\n%s</string>
+    <string name="timeout_error_message">Connection timed out. Please check your internet connection and try again.</string>
+    <string name="ok">OK</string>
+    <string name="retry">Retry</string>
+
+    <!-- Widget -->
+    <string name="widget_setup">Widget &amp; Deep Link Setup</string>
+    <string name="widget_connect_faster">Connect faster from your Home Screen</string>
+    <string name="widget_description">Set up widgets to connect to your favorite server with a single tap from your home screen.</string>
+    <string name="widget_preview">Widget Preview</string>
+    <string name="small_widget">Small Widget</string>
+    <string name="medium_widget">Medium Widget</string>
+    <string name="quick_connect_desc">Quick connect to the fastest server.</string>
+    <string name="specific_server_desc">Connect to a specific server.</string>
+    <string name="widget_config">Widget Configuration</string>
+    <string name="quick_connect">Quick Connect</string>
+    <string name="specific_server">Specific Server</string>
+    <string name="add_widget">Add Widget to Home Screen</string>
+    <string name="how_to_add_widget">How to Add a Widget</string>
+
+    <!-- Notifications -->
+    <string name="vpn_notification_channel">VPN Status</string>
+    <string name="vpn_notification_title">TiredVPN Active</string>
+    <string name="vpn_notification_text">Tap to manage connection</string>
+
+    <!-- Misc -->
+    <string name="sloth_mascot">TiredVPN sloth mascot</string>
+    <string name="version">Version %s</string>
+    <string name="back">Back</string>
+    <string name="required">Required</string>
+    <string name="save">Save</string>
+    <string name="server_config">Server Configuration</string>
+    <string name="scan_qr_code">Scan QR Code</string>
+    <string name="scan_qr_hint">Scan configuration from your server</string>
+    <string name="import_from_clipboard">Import from Clipboard</string>
+    <string name="import_clipboard_hint">Paste tired:// link from clipboard</string>
+    <string name="or_enter_manually">or enter manually</string>
+    <string name="config_imported">Configuration imported successfully</string>
+    <string name="invalid_url">Invalid tired:// URL format</string>
+    <string name="clipboard_empty">Clipboard is empty or doesn\'t contain tired:// URL</string>
+    <string name="long_tap_hint">Long tap to edit or delete</string>
+    <string name="split_tunneling_desc">Select apps based on the mode above.</string>
+    <string name="split_tunneling_mode">Mode</string>
+    <string name="mode_exclude">Exclude selected apps (bypass VPN)</string>
+    <string name="mode_include">Only selected apps use VPN</string>
+    <string name="mode_off">Disable Split Tunneling</string>
+    <string name="mode_off_description">All traffic will go through the VPN.</string>
+    <string name="toggle_flash">Toggle flash</string>
+    <string name="camera_permission_required">Camera permission is required to scan QR codes</string>
+    <string name="camera_error">Failed to start camera</string>
+    <string name="enter_url">Enter URL</string>
+    <string name="enter_url_hint">Type or paste tired:// link</string>
+    <string name="enter_url_title">Enter Configuration URL</string>
+</resources>
