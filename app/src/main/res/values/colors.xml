@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary palette -->
+    <color name="primary">#30E830</color>
+    <color name="primary_dark">#28C428</color>
+    <color name="primary_variant">#1FA01F</color>
+
+    <!-- Background -->
+    <color name="background_dark">#112111</color>
+    <color name="background_light">#F6F8F6</color>
+    <color name="surface_dark">#1A3A1A</color>
+    <color name="surface_light">#FFFFFF</color>
+
+    <!-- Card backgrounds -->
+    <color name="card_background">#1A3A1A</color>
+    <color name="card_background_highlight">#224422</color>
+
+    <!-- Text colors -->
+    <color name="text_primary_dark">#FFFFFF</color>
+    <color name="text_primary_light">#333333</color>
+    <color name="text_secondary_dark">#93C893</color>
+    <color name="text_secondary_light">#6B7280</color>
+    <color name="text_hint">#9CA3AF</color>
+
+    <!-- Accent colors -->
+    <color name="accent">#A2D5C6</color>
+    <color name="accent_green">#30E830</color>
+
+    <!-- Status colors -->
+    <color name="connected">#30E830</color>
+    <color name="connected_button_background">#1B5E20</color>
+    <color name="connecting">#FFC107</color>
+    <color name="disconnected">#4A5A4A</color>
+    <color name="error">#FF5252</color>
+    <color name="status_connected">#30E830</color>
+    <color name="status_error">#FF9800</color>
+
+    <!-- Signal quality -->
+    <color name="signal_excellent">#30E830</color>
+    <color name="signal_good">#8BC34A</color>
+    <color name="signal_fair">#FFC107</color>
+    <color name="signal_poor">#FF5252</color>
+
+    <!-- Misc -->
+    <color name="mascot_circle_background">#1A3A1A</color>
+    <color name="button_background">#2A4A2A</color>
+    <color name="divider">#2A4A2A</color>
+    <color name="ripple">#4030E830</color>
+    <color name="tiredvpn_purple">#A855F7</color>
+    <color name="white">#FFFFFF</color>
+</resources>

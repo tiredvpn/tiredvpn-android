@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Button dimensions -->
+    <dimen name="button_height">56dp</dimen>
+    <dimen name="button_size">56dp</dimen>
+    <dimen name="button_corner_radius">8dp</dimen>
+
+    <!-- Icon size -->
+    <dimen name="icon_size">24dp</dimen>
+
+    <!-- Text sizes -->
+    <dimen name="text_size_title">24sp</dimen>
+    <dimen name="text_size_body">14sp</dimen>
+    <dimen name="text_size_hint">12sp</dimen>
+
+    <!-- Padding & margins -->
+    <dimen name="padding_horizontal">16dp</dimen>
+    <dimen name="padding_vertical">16dp</dimen>
+    <dimen name="margin_large">16dp</dimen>
+</resources>

@@ -1,0 +1,33 @@
+# Gradle
+.gradle/
+build/
+local.properties
+
+# Android Studio
+.idea/
+*.iml
+.DS_Store
+
+# Binaries
+app/src/main/assets/bin/
+
+# APK
+*.apk
+*.aab
+
+# Signing
+*.keystore
+*.jks
+keystore.properties
+
+# Logs
+*.log
+
+# AI tools
+.claude/
+.cursor/
+.aider/
+.beads/
+
+# Pre-built JNI libs (built by CI)
+app/src/main/jniLibs/
