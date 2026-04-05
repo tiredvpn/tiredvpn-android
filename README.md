@@ -9,6 +9,8 @@
 
 Android client for TiredVPN -- a DPI-resistant VPN designed to operate reliably in censored network environments.
 
+**Related repositories:** [tiredvpn/tiredvpn](https://github.com/tiredvpn/tiredvpn) — Go server and CLI client
+
 ## What is it
 
 TiredVPN Android is the mobile client for the [TiredVPN](https://github.com/tiredvpn/tiredvpn) tunnel system. It embeds the Go VPN core as a native shared library (via JNI) and wraps it in a full-featured Android VPN service. The app automatically selects the best bypass strategy for the current network conditions, reconnects after disruptions, and keeps the tunnel alive in the background.
@@ -93,47 +95,22 @@ app/src/main/java/com/tiredvpn/android/
 
 ### Step 1: Build the Go native library
 
-The VPN core is written in Go and compiled as a C shared library (`libtired.so`) via CGO. You need to cross-compile it for each target architecture.
+Use the provided script — it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) automatically, cross-compiles for all three architectures, and places the `.so` files in the right directories:
 
 ```bash
-# Clone the Go VPN repository
-git clone https://github.com/tiredvpn/tiredvpn.git
-cd tiredvpn
-
-# Set NDK path
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.2.12479018
-
-# Build for arm64 (most common)
-export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
-GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
-  go build -buildmode=c-shared -o libtired.so ./cmd/mobile
-
-# Build for armv7
-export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
-GOOS=android GOARCH=arm CGO_ENABLED=1 \
-  go build -buildmode=c-shared -o libtired-armv7.so ./cmd/mobile
-
-# Build for x86_64 (emulators)
-export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
-GOOS=android GOARCH=amd64 CGO_ENABLED=1 \
-  go build -buildmode=c-shared -o libtired-x86_64.so ./cmd/mobile
+./scripts/build-jni.sh
 ```
 
-### Step 2: Place native libraries
+If you already have the Go core checked out locally:
 
 ```bash
-cd /path/to/tiredvpn-android
-
-mkdir -p app/src/main/jniLibs/arm64-v8a
-mkdir -p app/src/main/jniLibs/armeabi-v7a
-mkdir -p app/src/main/jniLibs/x86_64
-
-cp /path/to/libtired.so        app/src/main/jniLibs/arm64-v8a/
-cp /path/to/libtired-armv7.so  app/src/main/jniLibs/armeabi-v7a/libtired.so
-cp /path/to/libtired-x86_64.so app/src/main/jniLibs/x86_64/libtired.so
+./scripts/build-jni.sh --core-dir /path/to/tiredvpn
 ```
 
-### Step 3: Build the APK
+The script outputs `libtiredvpn.so` into `app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/`.
+
+### Step 2: Build the APK
 
 ```bash
 ./gradlew assembleDebug
