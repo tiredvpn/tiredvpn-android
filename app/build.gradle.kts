@@ -132,7 +132,7 @@ dependencies {
     // implementation("androidx.camera:camera-view:1.3.1")
 
     // WorkManager for VPN watchdog
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
 
     // OkHttp for update checking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
