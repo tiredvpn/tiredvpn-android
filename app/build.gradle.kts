@@ -138,5 +138,5 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Encrypted SharedPreferences for secure credential storage
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.security:security-crypto:1.1.0")
 }
