@@ -2,6 +2,8 @@ package com.tiredvpn.android.porthopping
 
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
 /**
  * Cross-platform synchronization tests for PortHopper.
@@ -12,6 +14,7 @@ import org.junit.Test
  * CRITICAL: If these tests fail after code changes, both Go and Kotlin
  * implementations must be updated together to maintain sync.
  */
+@RunWith(RobolectricTestRunner::class)
 class PortHopperSyncTest {
 
     /**

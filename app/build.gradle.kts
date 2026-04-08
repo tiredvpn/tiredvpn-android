@@ -101,6 +101,12 @@ android {
         disable += "RemoveWorkManagerInitializer"
     }
 
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -142,4 +148,5 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
