@@ -139,4 +139,7 @@ dependencies {
 
     // Encrypted SharedPreferences for secure credential storage
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Testing
+    testImplementation("junit:junit:4.13.2")
 }
