@@ -207,11 +207,11 @@ class PortHopper(
             }
 
             HopStrategy.SEQUENTIAL -> {
-                val next = currentPort + 1
-                if (next > config.portRangeEnd) {
+                if (currentPort < config.portRangeStart || currentPort > config.portRangeEnd) {
                     config.portRangeStart
                 } else {
-                    next
+                    val next = currentPort + 1
+                    if (next > config.portRangeEnd) config.portRangeStart else next
                 }
             }
 
