@@ -49,6 +49,9 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug
 
+      - name: Unit Tests
+        run: ./gradlew test
+
       - name: Lint
         run: ./gradlew lint
 
@@ -64,4 +67,3 @@ jobs:
           format: 'table'
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
-

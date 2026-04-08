@@ -5,6 +5,15 @@ All notable changes to TiredVPN Android are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-04-08
+
+### Changed
+
+- Upgraded OkHttp from 4.12.0 to 5.3.2
+- Upgraded AndroidX Lifecycle from 2.7.0 to 2.10.0
+- Added unit tests step to CI pipeline
+- Release workflow now gates on passing tests and lint before building APK
+
 ## [1.0.0] - 2026-04-03
 
 ### Added
