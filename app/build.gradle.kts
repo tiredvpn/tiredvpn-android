@@ -135,7 +135,7 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.0")
 
     // OkHttp for update checking
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:okhttp:5.3.2")
 
     // Encrypted SharedPreferences for secure credential storage
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
