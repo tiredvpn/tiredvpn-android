@@ -4,6 +4,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
 /**
  * Cross-platform synchronization tests for PortHopper.
@@ -15,6 +16,7 @@ import org.robolectric.RobolectricTestRunner
  * implementations must be updated together to maintain sync.
  */
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class PortHopperSyncTest {
 
     /**
