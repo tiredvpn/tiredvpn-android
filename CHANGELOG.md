@@ -5,6 +5,22 @@ All notable changes to TiredVPN Android are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-04-09
+
+### Added
+
+- **OWASP Dependency Check** — scans Gradle dependencies against NVD for known CVEs
+- **30 new unit tests** — VpnConfig (JSON round-trip, validation), VpnState (sealed class), CountryDetector (emoji flags, country mapping), UpdateConfig (data class defaults)
+- Total test suite: 37 tests (was 7)
+
+### Fixed
+
+- Fixed `PortHopper` sequential strategy starting outside port range
+- Replaced deprecated `Build.CPU_ABI` with `Build.SUPPORTED_ABIS`
+- Replaced deprecated `stopForeground(Boolean)` with `STOP_FOREGROUND_REMOVE`
+- Pinned `trivy-action` from `@master` to `@v0.35.0` (supply chain hardening)
+- Eliminated all Node.js 20 deprecation warnings in CI
+
 ## [1.0.2] - 2026-04-08
 
 ### Changed
