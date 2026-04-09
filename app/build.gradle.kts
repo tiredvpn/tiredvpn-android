@@ -1,5 +1,12 @@
 plugins {
     id("com.android.application")
+    id("org.owasp.dependencycheck")
+}
+
+dependencyCheck {
+    failBuildOnCVSS = 9.0f
+    formats = listOf("JSON", "HTML")
+    analyzers.assemblyEnabled = false
 }
 
 // --- JNI auto-build: compile libtiredvpn.so from Go core when missing ---
