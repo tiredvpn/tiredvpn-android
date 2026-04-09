@@ -182,7 +182,7 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
         vpnInterface = null
 
         _state.value = VpnState.Disconnected
-        stopForeground(true)
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 

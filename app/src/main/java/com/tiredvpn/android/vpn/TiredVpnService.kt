@@ -1076,7 +1076,7 @@ class TiredVpnService : VpnService() {
         // Only extract if binary doesn't exist or assets version is newer
         if (!binaryFile.exists()) {
             FileLogger.i(TAG, "Extracting tiredvpn binary from assets...")
-            val assetName = when (Build.CPU_ABI) {
+            val assetName = when (Build.SUPPORTED_ABIS.firstOrNull()) {
                 "arm64-v8a" -> "tiredvpn-arm64"
                 "armeabi-v7a" -> "tiredvpn-arm32"
                 "x86_64" -> "tiredvpn-x86_64"
@@ -2647,6 +2647,15 @@ class TiredVpnService : VpnService() {
                 vpnInterface = null
 
                 FileLogger.d(TAG, "executeReconnectSequence: Critical cleanup completed, exiting NonCancellable context")
+            }
+
+            // Guard: if disconnect() was called while we were in NonCancellable cleanup
+            // (e.g. onRevoke() from another VPN taking over), abort reconnect.
+            // Without this check the NonCancellable block ignores cancellation and overrides
+            // _state back to Connecting, leaving the UI button stuck.
+            if (_state.value is VpnState.Disconnected) {
+                FileLogger.w(TAG, "executeReconnectSequence: disconnect() called during cleanup, aborting reconnect")
+                return
             }
 
             // 6. Get config first to check connectivity
