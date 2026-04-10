@@ -63,8 +63,8 @@ android {
         applicationId = "com.tiredvpn.android"
         minSdk = 24
         targetSdk = 36  // Android 16
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.4"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
