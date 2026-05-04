@@ -7,7 +7,7 @@
 
 ![TiredVPN](img/github.png)
 
-Android client for TiredVPN -- a DPI-resistant VPN designed to operate reliably in censored network environments.
+Android client for TiredVPN - a DPI-resistant VPN designed to operate reliably in censored network environments.
 
 **Related repositories:** [tiredvpn/tiredvpn](https://github.com/tiredvpn/tiredvpn) — Go server and CLI client
 
@@ -17,17 +17,17 @@ TiredVPN Android is the mobile client for the [TiredVPN](https://github.com/tire
 
 ## Features
 
-- **Multiple DPI bypass strategies** -- the Go core ships with 20+ strategies (REALITY, QUIC Salamander, HTTP/2 Stego, WebSocket Padded, Traffic Morphing, Protocol Confusion, and more). The client rotates through them automatically when one is blocked.
-- **Smart auto-reconnect** -- survives airplane mode toggles, network switches (Wi-Fi / mobile), and device sleep. A WorkManager-based watchdog ensures the tunnel restarts if the service is killed.
-- **Persistent VPN notification** -- foreground service with real-time status, latency, and data counters.
-- **Split tunneling** -- per-app routing: choose which apps go through the tunnel and which use the direct connection.
-- **Port hopping** -- dynamically switches server ports to evade port-based blocking.
-- **Auto-update system** -- checks for new versions, downloads APKs, and prompts for installation.
-- **Deep link & QR import** -- configure servers via `tired://` URI scheme or QR code scan.
-- **ADB control** -- connect, disconnect, and import configs via broadcast intents (useful for Android TV and headless setups).
-- **Boot auto-start** -- optionally connects on device boot, including direct boot (before unlock).
-- **Android TV support** -- leanback launcher category, D-pad navigation, banner icon.
-- **Material Design UI** -- server list, settings, log viewer, split tunneling picker, onboarding wizard.
+- **Multiple DPI bypass strategies** - the Go core ships with 20+ strategies (REALITY, QUIC Salamander, HTTP/2 Stego, WebSocket Padded, Traffic Morphing, Protocol Confusion, and more). The client rotates through them automatically when one is blocked.
+- **Smart auto-reconnect** - survives airplane mode toggles, network switches (Wi-Fi / mobile), and device sleep. A WorkManager-based watchdog ensures the tunnel restarts if the service is killed.
+- **Persistent VPN notification** - foreground service with real-time status, latency, and data counters.
+- **Split tunneling** - per-app routing: choose which apps go through the tunnel and which use the direct connection.
+- **Port hopping** - dynamically switches server ports to evade port-based blocking.
+- **Auto-update system** - checks for new versions, downloads APKs, and prompts for installation.
+- **Deep link & QR import** - configure servers via `tired://` URI scheme or QR code scan.
+- **ADB control** - connect, disconnect, and import configs via broadcast intents (useful for Android TV and headless setups).
+- **Boot auto-start** - optionally connects on device boot, including direct boot (before unlock).
+- **Android TV support** - leanback launcher category, D-pad navigation, banner icon.
+- **Material Design UI** - server list, settings, log viewer, split tunneling picker, onboarding wizard.
 
 ## Requirements
 
