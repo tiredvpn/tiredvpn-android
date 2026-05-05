@@ -5,6 +5,22 @@ All notable changes to TiredVPN Android are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] - 2026-05-05
+
+### Changed
+
+- **Dependency updates**
+  - Android Gradle Plugin: 9.1.0 → 9.2.0
+  - Gradle wrapper: 9.4.1 → 9.5.0
+  - OWASP Dependency Check: 9.1.0 → 12.2.1
+  - Robolectric: 4.14.1 → 4.16.1
+  - aquasecurity/trivy-action: 0.35.0 → 0.36.0
+  - softprops/action-gh-release: 2 → 3
+
+### Docs
+
+- Replaced em-dash double-hyphens with single hyphens in README prose for cleaner rendering.
+
 ## [1.0.4] - 2026-04-10
 
 ### Fixed
