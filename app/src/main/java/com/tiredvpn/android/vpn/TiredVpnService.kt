@@ -21,6 +21,7 @@ import com.tiredvpn.android.R
 import com.tiredvpn.android.TiredVpnApp
 import com.tiredvpn.android.native.NativeProcess
 import com.tiredvpn.android.native.NativeProcessJNI
+import com.tiredvpn.android.native.TiredVpnNative
 import com.tiredvpn.android.native.TiredVpnProcess
 import com.tiredvpn.android.porthopping.HopStrategy
 import com.tiredvpn.android.porthopping.PortHopperConfig
@@ -35,6 +36,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.EmptyCoroutineContext
 import org.json.JSONObject
+import android.system.Os
 import java.io.File
 import java.net.InetAddress
 
@@ -2872,6 +2874,17 @@ class TiredVpnService : VpnService() {
         }
         tiredvpnProcess = null
 
+        // Force-cleanup native Go runtime to kill orphan goroutines holding dup'd TUN fds.
+        // stopClient() only signals the main goroutine; parallel strategy attempts from
+        // multi-attempt connections survive otherwise and keep the TUN fd open, leaving
+        // the system VPN icon visible even after the Android side has disconnected.
+        try {
+            TiredVpnNative.cleanup()
+            FileLogger.d(TAG, "Native library cleaned up (orphan goroutines killed)")
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "Error cleaning up native library", e)
+        }
+
         // Kill any orphan tiredvpn processes that might have leaked
         NativeProcess.killAllTiredVpnProcesses(applicationInfo.nativeLibraryDir)
 
@@ -2883,6 +2896,18 @@ class TiredVpnService : VpnService() {
             FileLogger.w(TAG, "Error closing VPN interface", e)
         }
         vpnInterface = null
+
+        // Force-close any remaining /dev/tun fds that Go goroutines didn't release.
+        // cleanupNative() is async — goroutines may not have closed their dup'd fds yet.
+        // We run an immediate pass plus a background thread that keeps closing new dups
+        // as Go finishes shutting down (typically takes <500ms).
+        forceCloseTunFds()
+        Thread {
+            repeat(10) {
+                Thread.sleep(100)
+                forceCloseTunFds()
+            }
+        }.apply { isDaemon = true; start() }
 
         // Release WakeLock
         releaseWakeLock()
@@ -2955,6 +2980,30 @@ class TiredVpnService : VpnService() {
         val notification = createNotification(status)
         val notificationManager = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
         notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun forceCloseTunFds() {
+        try {
+            val entries = File("/proc/self/fd").list() ?: return
+            var closed = 0
+            for (entry in entries) {
+                val fdNum = entry.toIntOrNull() ?: continue
+                try {
+                    val target = Os.readlink("/proc/self/fd/$entry")
+                    if (target == "/dev/tun") {
+                        ParcelFileDescriptor.adoptFd(fdNum).close()
+                        closed++
+                    }
+                } catch (_: android.system.ErrnoException) {
+                    // ENOENT = fd closed between list() and readlink() — normal race, ignore
+                } catch (e: Exception) {
+                    FileLogger.w(TAG, "forceCloseTunFds: fd=$entry: ${e.message}")
+                }
+            }
+            if (closed > 0) FileLogger.i(TAG, "Force-closed $closed orphan TUN fd(s)")
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "forceCloseTunFds failed: ${e.message}")
+        }
     }
 
     override fun onDestroy() {
