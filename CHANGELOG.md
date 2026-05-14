@@ -5,6 +5,18 @@ All notable changes to TiredVPN Android are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.6] - 2026-05-15
+
+### Fixed
+
+- **VPN icon stays in status bar after disconnect** — Go goroutines from parallel connection attempts held dup'd `/dev/tun` file descriptors after `vpnInterface.close()`. Android kept the VPN system binding alive while any fd pointed to `/dev/tun`. Fixed by enumerating `/proc/self/fd` and force-closing all TUN fds via `ParcelFileDescriptor.adoptFd()`, repeated in a background thread to catch fds closed asynchronously by Go's shutdown sequence.
+
+### Changed
+
+- **Dependency updates**
+  - Android Gradle Plugin: 9.2.0 → 9.2.1
+  - OWASP Dependency Check: 12.2.1 → 12.2.2
+
 ## [1.0.5] - 2026-05-05
 
 ### Changed
