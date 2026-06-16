@@ -53,6 +53,16 @@ class TiredVpnService : VpnService() {
 
         const val ACTION_CONNECT = "com.tiredvpn.android.CONNECT"
         const val ACTION_DISCONNECT = "com.tiredvpn.android.DISCONNECT"
+
+        // Google apps (Meet, Gmail, Maps, ...) offload signaling, push and STUN/auth
+        // to Google Play Services. In include/allowlist mode the selected app is
+        // tunneled but GPS is not, so WebRTC call setup (Meet) never completes.
+        // When a Google app is allowed, pull its network companions into the tunnel too.
+        private val GOOGLE_COMPANION_PACKAGES = listOf(
+            "com.google.android.gms",       // Google Play Services
+            "com.google.android.gsf",       // Google Services Framework
+            "com.android.vending"           // Play Store (license/auth checks)
+        )
     }
 
     private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
@@ -704,6 +714,35 @@ class TiredVpnService : VpnService() {
             args.add("-fallback")
         }
 
+        // Traffic shaper
+        if (config.shaperPreset.isNotBlank()) {
+            args.addAll(listOf("-shaper", config.shaperPreset))
+            if (config.shaperSeed != 0L) {
+                args.addAll(listOf("-shaper-seed", config.shaperSeed.toString()))
+            }
+        }
+
+        // ECH (Encrypted Client Hello)
+        if (config.echEnabled) {
+            args.add("-ech")
+            if (config.echConfig.isNotBlank()) {
+                args.addAll(listOf("-ech-config", config.echConfig))
+            }
+            args.addAll(listOf("-ech-public-name", config.echPublicName))
+        }
+
+        // IPv6 endpoint
+        if (config.serverAddressV6.isNotBlank()) {
+            args.addAll(listOf("-server-v6", config.serverAddressV6))
+            args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
+            args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
+        }
+
+        // QUIC SNI fragmentation
+        if (config.quicSniFrag) {
+            args.add("-quic-sni-frag")
+        }
+
         // Debug logging controlled by settings toggle
         if (config.debugLogging) args.add("-debug")
 
@@ -1065,101 +1104,20 @@ class TiredVpnService : VpnService() {
         }
     }
 
-    /**
-     * Extract tiredvpn binary from assets to a location where it can be executed.
-     * Android 10+ prevents execution from app's filesDir due to W^X policy.
-     * We use codeCacheDir which allows execution.
-     * Returns the path to the extracted binary.
-     */
-    private fun extractTiredVpnBinary(): File {
-        // Use codeCacheDir instead of filesDir - it allows executable code
-        val binaryFile = File(codeCacheDir, "tiredvpn")
-
-        // Only extract if binary doesn't exist or assets version is newer
-        if (!binaryFile.exists()) {
-            FileLogger.i(TAG, "Extracting tiredvpn binary from assets...")
-            val assetName = when (Build.SUPPORTED_ABIS.firstOrNull()) {
-                "arm64-v8a" -> "tiredvpn-arm64"
-                "armeabi-v7a" -> "tiredvpn-arm32"
-                "x86_64" -> "tiredvpn-x86_64"
-                else -> "tiredvpn-arm64"  // Default to arm64
-            }
-
-            assets.open(assetName).use { input ->
-                binaryFile.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            // Make executable - use multiple methods for better compatibility
-            try {
-                // Method 1: Java API
-                binaryFile.setExecutable(true, false)
-                binaryFile.setReadable(true, false)
-
-                // Method 2: Try chmod via Runtime (more reliable on some devices)
-                try {
-                    Runtime.getRuntime().exec(arrayOf("chmod", "755", binaryFile.absolutePath)).waitFor()
-                    FileLogger.i(TAG, "Set permissions via chmod 755")
-                } catch (e: Exception) {
-                    FileLogger.w(TAG, "chmod via Runtime failed: ${e.message}")
-                }
-
-                // Verify permissions were set
-                val canExecute = binaryFile.canExecute()
-                FileLogger.i(TAG, "Binary extracted, canExecute=$canExecute, path=${binaryFile.absolutePath}")
-
-                if (!canExecute) {
-                    FileLogger.e(TAG, "WARNING: Binary may not be executable!")
-                }
-            } catch (e: Exception) {
-                FileLogger.e(TAG, "Error setting executable permissions", e)
-            }
-        } else {
-            // Binary already exists, ensure it's still executable
-            if (!binaryFile.canExecute()) {
-                FileLogger.w(TAG, "Binary exists but not executable, fixing permissions...")
-                try {
-                    binaryFile.setExecutable(true, false)
-                    Runtime.getRuntime().exec(arrayOf("chmod", "755", binaryFile.absolutePath)).waitFor()
-                } catch (e: Exception) {
-                    FileLogger.e(TAG, "Failed to fix permissions", e)
-                }
-            }
-        }
-
-        return binaryFile
-    }
-
     private fun startTiredVpnProcess(config: VpnConfig, serverEndpoint: String, controlPath: String, protectPath: String) {
-        val binaryFile = extractTiredVpnBinary()
-
-        if (!binaryFile.exists()) {
-            throw RuntimeException("tiredvpn binary not found at ${binaryFile.absolutePath}")
-        }
-
-        // Verify binary is executable before attempting to run
-        if (!binaryFile.canExecute()) {
-            FileLogger.e(TAG, "Binary is not executable! Attempting emergency chmod...")
-            try {
-                Runtime.getRuntime().exec(arrayOf("chmod", "755", binaryFile.absolutePath)).waitFor()
-                if (!binaryFile.canExecute()) {
-                    throw RuntimeException("Failed to make binary executable: ${binaryFile.absolutePath}")
-                }
-                FileLogger.i(TAG, "Emergency chmod successful")
-            } catch (e: Exception) {
-                throw RuntimeException("Binary at ${binaryFile.absolutePath} is not executable and cannot be fixed", e)
-            }
-        }
-
-        FileLogger.i(TAG, "Binary verified executable: ${binaryFile.absolutePath}")
+        // The core runs via JNI (NativeProcessJNI) from the embedded libtiredvpn.so,
+        // which ships for every ABI in nativeLibraryDir. No standalone binary is
+        // extracted or executed here: args[0] below is a cosmetic placeholder that
+        // the JNI path drops (args.drop(1)). Extracting an assets binary used to run
+        // on every connect and threw on non-arm64 devices (only arm64 was bundled),
+        // blocking armeabi-v7a and x86_64 from connecting at all.
 
         // CRITICAL: Kill any orphan tiredvpn processes BEFORE starting new one
         // This prevents process leaks during reconnects
         NativeProcess.killAllTiredVpnProcesses(filesDir.absolutePath)
 
         val args = mutableListOf(
-            binaryFile.absolutePath,
+            "tiredvpn",
             "client",
             "-server", serverEndpoint,  // Use pre-resolved IP:port
             "-secret", config.secret,
@@ -1194,6 +1152,40 @@ class TiredVpnService : VpnService() {
         // Fallback
         if (config.fallbackEnabled) {
             args.add("-fallback")
+        }
+
+        // Traffic shaper
+        if (config.shaperPreset.isNotBlank()) {
+            args.addAll(listOf("-shaper", config.shaperPreset))
+            if (config.shaperSeed != 0L) {
+                args.addAll(listOf("-shaper-seed", config.shaperSeed.toString()))
+            }
+        }
+
+        // ECH (Encrypted Client Hello)
+        if (config.echEnabled) {
+            args.add("-ech")
+            if (config.echConfig.isNotBlank()) {
+                args.addAll(listOf("-ech-config", config.echConfig))
+            }
+            args.addAll(listOf("-ech-public-name", config.echPublicName))
+        }
+
+        // IPv6 endpoint
+        if (config.serverAddressV6.isNotBlank()) {
+            args.addAll(listOf("-server-v6", config.serverAddressV6))
+            args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
+            args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
+        }
+
+        // QUIC SNI fragmentation
+        if (config.quicSniFrag) {
+            args.add("-quic-sni-frag")
+        }
+
+        // TUN MTU override (TUN path only)
+        if (config.mtu > 0) {
+            args.addAll(listOf("-tun-mtu", config.mtu.toString()))
         }
 
         // Android mode - disables os/exec, ICMP checks (causes SIGSYS)
@@ -2723,15 +2715,21 @@ class TiredVpnService : VpnService() {
                 else -> tunConfig.ip
             }
 
+            // MTU override: use config.mtu if set (>0), otherwise core-provided MTU
+            val effectiveMtu = if (config.mtu > 0) config.mtu else tunConfig.mtu
+
+            // DNS override: use config.customDns if set & valid, otherwise core/fallback DNS
+            val effectiveDns = config.customDns.takeIf { it.isNotBlank() } ?: tunConfig.dns
+
             val builder = Builder()
                 .setSession("TiredVPN")
-                .setMtu(tunConfig.mtu)
+                .setMtu(effectiveMtu)
                 .addAddress(effectiveIp, 24)
                 .addRoute("0.0.0.0", 0)  // Route all IPv4
-                .addDnsServer(tunConfig.dns)
+                .addDnsServer(effectiveDns)
 
             // Add backup DNS if different
-            if (tunConfig.dns != "8.8.8.8") {
+            if (effectiveDns != "8.8.8.8") {
                 builder.addDnsServer("8.8.8.8")
             }
 
@@ -2785,7 +2783,18 @@ class TiredVpnService : VpnService() {
             "include" -> {
                 // Only selected apps use VPN
                 // Note: when using addAllowedApplication, we can't use addDisallowedApplication
-                for (pkg in selectedApps) {
+                val appsToAllow = LinkedHashSet(selectedApps)
+
+                // If any Google app is tunneled, also tunnel Google Play Services and
+                // friends, otherwise their offloaded signaling/STUN stays off-tunnel
+                // and WebRTC calls (Google Meet) hang on ICE. Companions that aren't
+                // installed are skipped by the per-package try/catch below.
+                if (selectedApps.any { it.startsWith("com.google.android") }) {
+                    appsToAllow += GOOGLE_COMPANION_PACKAGES
+                    FileLogger.i(TAG, "Google app in allowlist, adding companions: $GOOGLE_COMPANION_PACKAGES")
+                }
+
+                for (pkg in appsToAllow) {
                     try {
                         builder.addAllowedApplication(pkg)
                         FileLogger.d(TAG, "VPN only for: $pkg")

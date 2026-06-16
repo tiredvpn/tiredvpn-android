@@ -40,6 +40,53 @@
     <string name="cover_host">Cover Host</string>
     <string name="auto_fallback">Auto Fallback</string>
     <string name="auto_fallback_desc">Switch strategy if blocked</string>
+
+    <!-- Obfuscation / Evasion -->
+    <string name="obfuscation">OBFUSCATION</string>
+    <string name="port_hopping">Port Hopping</string>
+    <string name="port_hopping_desc">Rotate ports to hinder DPI blocking</string>
+    <string name="port_hop_range">Port Range</string>
+    <string name="port_hop_range_start">Start port</string>
+    <string name="port_hop_range_end">End port</string>
+    <string name="port_hop_interval">Hop Interval</string>
+    <string name="port_hop_interval_hint">Interval (seconds)</string>
+    <string name="port_hop_strategy">Hop Strategy</string>
+    <string name="port_hop_seed">Seed (optional)</string>
+    <string name="port_hop_seed_hint">Leave empty for random</string>
+    <string name="port_hop_disabled">Disabled</string>
+    <string name="traffic_shaper">Traffic Shaper</string>
+    <string name="traffic_shaper_off">Off</string>
+    <string name="shaper_seed">Shaper Seed</string>
+    <string name="shaper_seed_hint">0 = random per session</string>
+    <string name="ech">Encrypted Client Hello (ECH)</string>
+    <string name="ech_desc">Hide SNI from DPI</string>
+    <string name="ech_config">ECH Config (base64)</string>
+    <string name="ech_config_hint">Optional ECHConfigList</string>
+    <string name="ech_public_name">ECH Public Name</string>
+    <string name="ech_public_name_hint">Outer SNI (e.g. cloudflare-ech.com)</string>
+    <string name="quic_sni_frag">QUIC SNI Fragmentation</string>
+    <string name="quic_sni_frag_desc">Split SNI in QUIC CRYPTO frames</string>
+
+    <!-- Network -->
+    <string name="network">NETWORK</string>
+    <string name="server_address_v6">IPv6 Endpoint</string>
+    <string name="server_address_v6_hint">host:port or [v6]:port (empty = off)</string>
+    <string name="prefer_ipv6">Prefer IPv6</string>
+    <string name="prefer_ipv6_desc">Use IPv6 endpoint when available</string>
+    <string name="fallback_v4">IPv4 Fallback</string>
+    <string name="fallback_v4_desc">Fall back to IPv4 if IPv6 fails</string>
+    <string name="custom_mtu">Custom MTU</string>
+    <string name="custom_mtu_hint">0 = auto, or 576..1500</string>
+    <string name="custom_dns">Custom DNS</string>
+    <string name="custom_dns_hint">DNS server IP (empty = auto)</string>
+    <string name="not_set">Not set</string>
+    <string name="auto">Auto</string>
+    <string name="enabled">Enabled</string>
+    <string name="value_disabled">Disabled</string>
+    <string name="invalid_value">Invalid value</string>
+    <string name="invalid_dns">Invalid DNS address</string>
+    <string name="invalid_port_range">Invalid port range</string>
+
     <string name="security">SECURITY</string>
     <string name="kill_switch">Kill Switch</string>
     <string name="kill_switch_desc">Block internet if VPN drops</string>

@@ -28,6 +28,66 @@ class SettingsActivity : BaseActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
 
+    companion object {
+        // Full canonical strategy list. The stored value (first) is the EXACT
+        // strategy ID accepted by the core (ForceStrategy by ID/prefix). Labels
+        // are human-readable. "auto" means automatic selection (default).
+        // Verified against tiredvpn-oss/internal/strategy/strategy.go.
+        private val STRATEGIES = listOf(
+            "auto" to "Auto (Best Available)",
+            "reality" to "REALITY",
+            "quic" to "QUIC",
+            "quic_salamander" to "QUIC (Salamander)",
+            "websocket_padded" to "WebSocket (Padded)",
+            "http2_stego" to "HTTP/2 Steganography",
+            "http_polling" to "HTTP Polling",
+            // Space-free prefixes: core ForceStrategy() matches by prefix, and the
+            // JNI bridge splits args on spaces, so the full IDs ("morph_Yandex Video")
+            // would break. Each prefix uniquely matches its morph strategy.
+            "morph_Yandex" to "Traffic Morph (Yandex)",
+            "morph_VK" to "Traffic Morph (VK)",
+            "morph_Baidu" to "Traffic Morph (Baidu)",
+            "morph_Aparat" to "Traffic Morph (Aparat)",
+            "ssh_camouflage" to "SSH Camouflage",
+            "imap_camouflage" to "IMAP Camouflage",
+            "antiprobe" to "Anti-Probe",
+            "confusion_2" to "Protocol Confusion (SSH)",
+            "confusion_0" to "Protocol Confusion (DNS)",
+            "confusion_1" to "Protocol Confusion (HTTP)",
+            "confusion_3" to "Protocol Confusion (TLS/SMTP)",
+            "state_exhaustion" to "State Exhaustion",
+            "geneva_russia" to "Geneva (Russia)",
+            "geneva_china" to "Geneva (China)",
+            "geneva_iran" to "Geneva (Iran)"
+        )
+
+        // Full RTT profile list (7), verified against internal/strategy/rtt.go.
+        private val RTT_PROFILES = listOf(
+            "moscow-yandex" to "Moscow - Yandex",
+            "moscow-vk" to "Moscow - VK",
+            "regional-russia" to "Regional Russia",
+            "siberia" to "Siberia",
+            "cdn" to "CDN",
+            "beijing-baidu" to "Beijing - Baidu",
+            "tehran-aparat" to "Tehran - Aparat"
+        )
+
+        // Traffic shaper presets. "" = off (default).
+        private val SHAPER_PRESETS = listOf(
+            "" to "Off",
+            "youtube_streaming" to "YouTube Streaming",
+            "chrome_browsing" to "Chrome Browsing",
+            "random_per_session" to "Random (per session)"
+        )
+
+        // Port hop strategies accepted by the core: random / sequential / fibonacci.
+        private val PORT_HOP_STRATEGIES = listOf(
+            "random" to "Random",
+            "sequential" to "Sequential",
+            "fibonacci" to "Fibonacci"
+        )
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
@@ -86,12 +146,15 @@ class SettingsActivity : BaseActivity() {
             }
 
             // Load protocol/strategy
-            val strategyName = VpnConfig.STRATEGIES.find { it.first == config.strategy }?.second
+            val strategyName = STRATEGIES.find { it.first == config.strategy }?.second
                 ?: getString(R.string.protocol_auto)
             binding.protocolValue.text = strategyName
 
             // Load advanced settings display
             updateAdvancedSettingsDisplay(config)
+
+            // Load obfuscation / network settings display
+            updateObfuscationDisplay(config)
 
             // Load debug logging state
             binding.debugLoggingSwitch.isChecked = config.debugLogging
@@ -104,11 +167,54 @@ class SettingsActivity : BaseActivity() {
             binding.proxyPortRow.visibility = View.GONE
             binding.connectionModeDivider.visibility = View.GONE
             binding.protocolValue.text = getString(R.string.protocol_auto)
-            binding.rttValue.text = "Disabled"
-            binding.coverHostValue.text = "Not set"
+            binding.rttValue.text = getString(R.string.value_disabled)
+            binding.coverHostValue.text = getString(R.string.not_set)
+            binding.portHoppingValue.text = getString(R.string.port_hop_disabled)
+            binding.shaperValue.text = getString(R.string.traffic_shaper_off)
+            binding.echValue.text = getString(R.string.value_disabled)
+            binding.quicSniFragSwitch.isChecked = false
+            binding.ipv6Value.text = getString(R.string.not_set)
+            binding.preferIpv6Switch.isChecked = false
+            binding.fallbackV4Switch.isChecked = true
+            binding.mtuValue.text = getString(R.string.auto)
+            binding.dnsValue.text = getString(R.string.auto)
             binding.debugLoggingSwitch.isChecked = false
             binding.fallbackSwitch.isChecked = true
         }
+    }
+
+    private fun updateObfuscationDisplay(config: VpnConfig) {
+        // Port hopping
+        binding.portHoppingValue.text = if (config.portHoppingEnabled) {
+            "${config.portHopRangeStart}-${config.portHopRangeEnd}"
+        } else {
+            getString(R.string.port_hop_disabled)
+        }
+
+        // Traffic shaper
+        binding.shaperValue.text = SHAPER_PRESETS.find { it.first == config.shaperPreset }?.second
+            ?: getString(R.string.traffic_shaper_off)
+
+        // ECH
+        binding.echValue.text = if (config.echEnabled) {
+            config.echPublicName.ifEmpty { getString(R.string.enabled) }
+        } else {
+            getString(R.string.value_disabled)
+        }
+
+        // QUIC SNI fragmentation
+        binding.quicSniFragSwitch.isChecked = config.quicSniFrag
+
+        // IPv6 endpoint
+        binding.ipv6Value.text = config.serverAddressV6.ifEmpty { getString(R.string.not_set) }
+        binding.preferIpv6Switch.isChecked = config.preferIpv6
+        binding.fallbackV4Switch.isChecked = config.fallbackV4
+
+        // Custom MTU
+        binding.mtuValue.text = if (config.mtu > 0) config.mtu.toString() else getString(R.string.auto)
+
+        // Custom DNS
+        binding.dnsValue.text = config.customDns.ifEmpty { getString(R.string.auto) }
     }
 
     private fun setPerServerSettingsEnabled(enabled: Boolean) {
@@ -128,14 +234,36 @@ class SettingsActivity : BaseActivity() {
         
         binding.fallbackSwitch.isEnabled = enabled
         binding.fallbackRow.alpha = alpha
+
+        // Obfuscation
+        binding.portHoppingRow.isEnabled = enabled
+        binding.portHoppingRow.alpha = alpha
+        binding.shaperRow.isEnabled = enabled
+        binding.shaperRow.alpha = alpha
+        binding.echRow.isEnabled = enabled
+        binding.echRow.alpha = alpha
+        binding.quicSniFragSwitch.isEnabled = enabled
+        binding.quicSniFragRow.alpha = alpha
+
+        // Network
+        binding.ipv6Row.isEnabled = enabled
+        binding.ipv6Row.alpha = alpha
+        binding.preferIpv6Switch.isEnabled = enabled
+        binding.preferIpv6Row.alpha = alpha
+        binding.fallbackV4Switch.isEnabled = enabled
+        binding.fallbackV4Row.alpha = alpha
+        binding.mtuRow.isEnabled = enabled
+        binding.mtuRow.alpha = alpha
+        binding.dnsRow.isEnabled = enabled
+        binding.dnsRow.alpha = alpha
     }
 
     private fun updateAdvancedSettingsDisplay(config: VpnConfig) {
         // RTT Masking status
         binding.rttValue.text = if (config.rttMasking) {
-            VpnConfig.RTT_PROFILES.find { it.first == config.rttProfile }?.second ?: config.rttProfile
+            RTT_PROFILES.find { it.first == config.rttProfile }?.second ?: config.rttProfile
         } else {
-            "Disabled"
+            getString(R.string.value_disabled)
         }
 
         // Cover host
@@ -198,6 +326,60 @@ class SettingsActivity : BaseActivity() {
             if (ServerRepository.getActiveServer(this) != null) showCoverHostDialog()
         }
 
+        // Port hopping settings
+        binding.portHoppingRow.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showPortHoppingDialog()
+        }
+
+        // Traffic shaper settings
+        binding.shaperRow.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showShaperDialog()
+        }
+
+        // ECH settings
+        binding.echRow.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showEchDialog()
+        }
+
+        // QUIC SNI fragmentation toggle
+        binding.quicSniFragSwitch.setOnCheckedChangeListener { _, isChecked ->
+            val config = ServerRepository.getActiveServer(this)
+            if (config != null && binding.quicSniFragSwitch.isEnabled) {
+                ServerRepository.saveServer(this, config.copy(quicSniFrag = isChecked))
+            }
+        }
+
+        // IPv6 endpoint settings
+        binding.ipv6Row.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showIpv6Dialog()
+        }
+
+        // Prefer IPv6 toggle
+        binding.preferIpv6Switch.setOnCheckedChangeListener { _, isChecked ->
+            val config = ServerRepository.getActiveServer(this)
+            if (config != null && binding.preferIpv6Switch.isEnabled) {
+                ServerRepository.saveServer(this, config.copy(preferIpv6 = isChecked))
+            }
+        }
+
+        // IPv4 fallback toggle
+        binding.fallbackV4Switch.setOnCheckedChangeListener { _, isChecked ->
+            val config = ServerRepository.getActiveServer(this)
+            if (config != null && binding.fallbackV4Switch.isEnabled) {
+                ServerRepository.saveServer(this, config.copy(fallbackV4 = isChecked))
+            }
+        }
+
+        // Custom MTU settings
+        binding.mtuRow.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showMtuDialog()
+        }
+
+        // Custom DNS settings
+        binding.dnsRow.setOnClickListener {
+            if (ServerRepository.getActiveServer(this) != null) showDnsDialog()
+        }
+
         // Split tunneling
         binding.splitTunnelingRow.setOnClickListener {
             startActivity(Intent(this, SplitTunnelingActivity::class.java))
@@ -230,7 +412,7 @@ class SettingsActivity : BaseActivity() {
     private fun showProtocolDialog() {
         val config = ServerRepository.getActiveServer(this) ?: return
         
-        val strategies = VpnConfig.STRATEGIES
+        val strategies = STRATEGIES
         val names = strategies.map { it.second }.toTypedArray()
         val values = strategies.map { it.first }
 
@@ -250,8 +432,8 @@ class SettingsActivity : BaseActivity() {
 
     private fun showRttDialog() {
         val config = ServerRepository.getActiveServer(this) ?: return
-        val profiles = VpnConfig.RTT_PROFILES
-        val names = listOf("Disabled") + profiles.map { it.second }
+        val profiles = RTT_PROFILES
+        val names = listOf(getString(R.string.value_disabled)) + profiles.map { it.second }
         val values = listOf("") + profiles.map { it.first }
 
         val currentIndex = if (!config.rttMasking) {
@@ -322,6 +504,296 @@ class SettingsActivity : BaseActivity() {
                 dialog.dismiss()
             }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // --- Helpers for building dialog form fields (mirrors showCoverHostDialog style) ---
+
+    private fun dialogContainer(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(64, 32, 64, 0)
+    }
+
+    private fun textField(
+        hintText: String,
+        value: String,
+        helper: String? = null,
+        inputTypeFlags: Int = InputType.TYPE_CLASS_TEXT
+    ): Pair<TextInputLayout, TextInputEditText> {
+        val layout = TextInputLayout(this).apply {
+            hint = hintText
+            if (helper != null) helperText = helper
+        }
+        val edit = TextInputEditText(this).apply {
+            setText(value)
+            inputType = inputTypeFlags
+        }
+        layout.addView(edit)
+        return layout to edit
+    }
+
+    private fun isValidIpAddress(value: String): Boolean =
+        android.util.Patterns.IP_ADDRESS.matcher(value).matches()
+
+    private fun showPortHoppingDialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val layout = dialogContainer()
+
+        val enabledSwitch = com.google.android.material.materialswitch.MaterialSwitch(this).apply {
+            text = getString(R.string.port_hopping)
+            isChecked = config.portHoppingEnabled
+        }
+        layout.addView(enabledSwitch)
+
+        val (startLayout, startEdit) = textField(
+            getString(R.string.port_hop_range_start),
+            config.portHopRangeStart.toString(),
+            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
+        )
+        val (endLayout, endEdit) = textField(
+            getString(R.string.port_hop_range_end),
+            config.portHopRangeEnd.toString(),
+            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
+        )
+        val (intervalLayout, intervalEdit) = textField(
+            getString(R.string.port_hop_interval_hint),
+            (config.portHopIntervalMs / 1000L).toString(),
+            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
+        )
+        val (seedLayout, seedEdit) = textField(
+            getString(R.string.port_hop_seed),
+            config.portHopSeed ?: "",
+            helper = getString(R.string.port_hop_seed_hint)
+        )
+
+        // Strategy spinner-like: use a read-only field that opens a sub-dialog
+        var selectedHopStrategy = config.portHopStrategy
+        val (strategyLayout, strategyEdit) = textField(
+            getString(R.string.port_hop_strategy),
+            PORT_HOP_STRATEGIES.find { it.first == selectedHopStrategy }?.second ?: selectedHopStrategy
+        )
+        strategyEdit.isFocusable = false
+        strategyEdit.isClickable = true
+        strategyEdit.setOnClickListener {
+            val names = PORT_HOP_STRATEGIES.map { it.second }.toTypedArray()
+            val values = PORT_HOP_STRATEGIES.map { it.first }
+            val idx = values.indexOf(selectedHopStrategy).coerceAtLeast(0)
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.port_hop_strategy)
+                .setSingleChoiceItems(names, idx) { d, which ->
+                    selectedHopStrategy = values[which]
+                    strategyEdit.setText(names[which])
+                    d.dismiss()
+                }
+                .show()
+        }
+
+        listOf(startLayout, endLayout, intervalLayout, strategyLayout, seedLayout).forEach { layout.addView(it) }
+
+        fun setDetailVisibility(visible: Boolean) {
+            val vis = if (visible) View.VISIBLE else View.GONE
+            listOf(startLayout, endLayout, intervalLayout, strategyLayout, seedLayout).forEach { it.visibility = vis }
+        }
+        setDetailVisibility(config.portHoppingEnabled)
+        enabledSwitch.setOnCheckedChangeListener { _, checked -> setDetailVisibility(checked) }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.port_hopping)
+            .setView(layout)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val enabled = enabledSwitch.isChecked
+                if (!enabled) {
+                    val newConfig = config.copy(portHoppingEnabled = false)
+                    ServerRepository.saveServer(this, newConfig)
+                    updateObfuscationDisplay(newConfig)
+                    return@setPositiveButton
+                }
+                val start = startEdit.text?.toString()?.trim()?.toIntOrNull()
+                val end = endEdit.text?.toString()?.trim()?.toIntOrNull()
+                val intervalSec = intervalEdit.text?.toString()?.trim()?.toLongOrNull()
+                if (start == null || end == null || start !in 1024..65535 || end !in 1024..65535 || start >= end) {
+                    Toast.makeText(this, R.string.invalid_port_range, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val intervalMs = ((intervalSec ?: 60L).coerceAtLeast(1L)) * 1000L
+                val seed = seedEdit.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                val newConfig = config.copy(
+                    portHoppingEnabled = true,
+                    portHopRangeStart = start,
+                    portHopRangeEnd = end,
+                    portHopIntervalMs = intervalMs,
+                    portHopStrategy = selectedHopStrategy,
+                    portHopSeed = seed
+                )
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showShaperDialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val layout = dialogContainer()
+        val (seedLayout, seedEdit) = textField(
+            getString(R.string.shaper_seed),
+            if (config.shaperSeed != 0L) config.shaperSeed.toString() else "",
+            helper = getString(R.string.shaper_seed_hint),
+            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
+        )
+        layout.addView(seedLayout)
+
+        val names = SHAPER_PRESETS.map { it.second }.toTypedArray()
+        val values = SHAPER_PRESETS.map { it.first }
+        var selectedPreset = config.shaperPreset
+        val checkedIndex = values.indexOf(selectedPreset).coerceAtLeast(0)
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.traffic_shaper)
+            .setSingleChoiceItems(names, checkedIndex) { _, which ->
+                selectedPreset = values[which]
+            }
+            .setView(layout)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val seed = seedEdit.text?.toString()?.trim()?.toLongOrNull() ?: 0L
+                val newConfig = config.copy(shaperPreset = selectedPreset, shaperSeed = seed)
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showEchDialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val layout = dialogContainer()
+        val enabledSwitch = com.google.android.material.materialswitch.MaterialSwitch(this).apply {
+            text = getString(R.string.ech)
+            isChecked = config.echEnabled
+        }
+        layout.addView(enabledSwitch)
+
+        val (configLayout, configEdit) = textField(
+            getString(R.string.ech_config),
+            config.echConfig,
+            helper = getString(R.string.ech_config_hint)
+        )
+        val (nameLayout, nameEdit) = textField(
+            getString(R.string.ech_public_name),
+            config.echPublicName,
+            helper = getString(R.string.ech_public_name_hint)
+        )
+        layout.addView(configLayout)
+        layout.addView(nameLayout)
+
+        fun setDetailVisibility(visible: Boolean) {
+            val vis = if (visible) View.VISIBLE else View.GONE
+            configLayout.visibility = vis
+            nameLayout.visibility = vis
+        }
+        setDetailVisibility(config.echEnabled)
+        enabledSwitch.setOnCheckedChangeListener { _, checked -> setDetailVisibility(checked) }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.ech)
+            .setView(layout)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val enabled = enabledSwitch.isChecked
+                val echConfig = configEdit.text?.toString()?.trim() ?: ""
+                val publicName = nameEdit.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: "cloudflare-ech.com"
+                val newConfig = config.copy(
+                    echEnabled = enabled,
+                    echConfig = echConfig,
+                    echPublicName = publicName
+                )
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showIpv6Dialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val layout = dialogContainer()
+        val (hostLayout, hostEdit) = textField(
+            getString(R.string.server_address_v6),
+            config.serverAddressV6,
+            helper = getString(R.string.server_address_v6_hint)
+        )
+        layout.addView(hostLayout)
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.server_address_v6)
+            .setView(layout)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val v6 = hostEdit.text?.toString()?.trim() ?: ""
+                val newConfig = config.copy(serverAddressV6 = v6)
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showMtuDialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(if (config.mtu > 0) config.mtu.toString() else "")
+            hint = getString(R.string.custom_mtu_hint)
+            setPadding(64, 32, 64, 16)
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.custom_mtu)
+            .setView(input)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val raw = input.text.toString().trim()
+                val mtu = if (raw.isEmpty()) 0 else raw.toIntOrNull()
+                if (mtu == null || (mtu != 0 && mtu !in 576..1500)) {
+                    Toast.makeText(this, R.string.invalid_value, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val newConfig = config.copy(mtu = mtu)
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showDnsDialog() {
+        val config = ServerRepository.getActiveServer(this) ?: return
+
+        val layout = dialogContainer()
+        val (dnsLayout, dnsEdit) = textField(
+            getString(R.string.custom_dns),
+            config.customDns,
+            helper = getString(R.string.custom_dns_hint)
+        )
+        layout.addView(dnsLayout)
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.custom_dns)
+            .setView(layout)
+            .setPositiveButton(R.string.save) { _, _ ->
+                val dns = dnsEdit.text?.toString()?.trim() ?: ""
+                if (dns.isNotEmpty() && !isValidIpAddress(dns)) {
+                    Toast.makeText(this, R.string.invalid_dns, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val newConfig = config.copy(customDns = dns)
+                ServerRepository.saveServer(this, newConfig)
+                updateObfuscationDisplay(newConfig)
+            }
+            .setNegativeButton(R.string.cancel, null)
             .show()
     }
 

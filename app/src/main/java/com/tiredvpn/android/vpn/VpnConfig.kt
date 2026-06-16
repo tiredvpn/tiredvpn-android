@@ -27,7 +27,23 @@ data class VpnConfig(
     val portHopRangeEnd: Int = 65535,
     val portHopIntervalMs: Long = 60_000L,
     val portHopStrategy: String = "random", // random, sequential, fibonacci
-    val portHopSeed: String? = null // Optional seed for deterministic hopping (hex string)
+    val portHopSeed: String? = null, // Optional seed for deterministic hopping (hex string)
+    // Traffic shaper
+    val shaperPreset: String = "", // "", "youtube_streaming", "chrome_browsing", "random_per_session"
+    val shaperSeed: Long = 0L, // 0 = random
+    // ECH (Encrypted Client Hello)
+    val echEnabled: Boolean = false,
+    val echConfig: String = "", // base64 ECHConfigList
+    val echPublicName: String = "cloudflare-ech.com",
+    // IPv6 endpoint
+    val serverAddressV6: String = "", // "" = no IPv6 endpoint; format host:port or [v6]:port
+    val preferIpv6: Boolean = false,
+    val fallbackV4: Boolean = true,
+    // QUIC SNI fragmentation
+    val quicSniFrag: Boolean = false,
+    // Tunnel overrides
+    val mtu: Int = 0, // 0 = auto (use core-provided MTU)
+    val customDns: String = "" // "" = use core/fallback DNS
 ) {
     val isValid: Boolean
         get() = serverAddress.isNotBlank() && serverPort in 1..65535 && secret.isNotBlank()
@@ -60,6 +76,22 @@ data class VpnConfig(
             put("portHopIntervalMs", portHopIntervalMs)
             put("portHopStrategy", portHopStrategy)
             portHopSeed?.let { put("portHopSeed", it) }
+            // Traffic shaper
+            put("shaperPreset", shaperPreset)
+            put("shaperSeed", shaperSeed)
+            // ECH
+            put("echEnabled", echEnabled)
+            put("echConfig", echConfig)
+            put("echPublicName", echPublicName)
+            // IPv6 endpoint
+            put("serverAddressV6", serverAddressV6)
+            put("preferIpv6", preferIpv6)
+            put("fallbackV4", fallbackV4)
+            // QUIC SNI fragmentation
+            put("quicSniFrag", quicSniFrag)
+            // Tunnel overrides
+            put("mtu", mtu)
+            put("customDns", customDns)
         }
     }
 
@@ -116,7 +148,23 @@ data class VpnConfig(
                 portHopRangeEnd = json.optInt("portHopRangeEnd", 65535),
                 portHopIntervalMs = json.optLong("portHopIntervalMs", 60_000L),
                 portHopStrategy = json.optString("portHopStrategy", "random"),
-                portHopSeed = json.optString("portHopSeed", null).takeIf { !it.isNullOrEmpty() }
+                portHopSeed = json.optString("portHopSeed", null).takeIf { !it.isNullOrEmpty() },
+                // Traffic shaper
+                shaperPreset = json.optString("shaperPreset", ""),
+                shaperSeed = json.optLong("shaperSeed", 0L),
+                // ECH
+                echEnabled = json.optBoolean("echEnabled", false),
+                echConfig = json.optString("echConfig", ""),
+                echPublicName = json.optString("echPublicName", "cloudflare-ech.com"),
+                // IPv6 endpoint
+                serverAddressV6 = json.optString("serverAddressV6", ""),
+                preferIpv6 = json.optBoolean("preferIpv6", false),
+                fallbackV4 = json.optBoolean("fallbackV4", true),
+                // QUIC SNI fragmentation
+                quicSniFrag = json.optBoolean("quicSniFrag", false),
+                // Tunnel overrides
+                mtu = json.optInt("mtu", 0),
+                customDns = json.optString("customDns", "")
             )
         }
 

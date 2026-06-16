@@ -200,6 +200,19 @@ class ServerConfigActivity : BaseActivity() {
             val rttProfile = uri.getQueryParameter("rttProfile") ?: "moscow-yandex"
             val fallbackEnabled = uri.getQueryParameter("fallback")?.toBooleanStrictOrNull() ?: true
 
+            // New client settings (all optional, default to VpnConfig defaults)
+            val shaperPreset = uri.getQueryParameter("shaper") ?: ""
+            val shaperSeed = uri.getQueryParameter("shaperSeed")?.toLongOrNull() ?: 0L
+            val echEnabled = uri.getQueryParameter("ech")?.toBooleanStrictOrNull() ?: false
+            val echConfig = uri.getQueryParameter("echConfig") ?: ""
+            val echPublicName = uri.getQueryParameter("echPublicName") ?: "cloudflare-ech.com"
+            val serverAddressV6 = uri.getQueryParameter("serverV6") ?: ""
+            val preferIpv6 = uri.getQueryParameter("preferIpv6")?.toBooleanStrictOrNull() ?: false
+            val fallbackV4 = uri.getQueryParameter("fallbackV4")?.toBooleanStrictOrNull() ?: true
+            val quicSniFrag = uri.getQueryParameter("quicSniFrag")?.toBooleanStrictOrNull() ?: false
+            val mtu = uri.getQueryParameter("mtu")?.toIntOrNull() ?: 0
+            val customDns = uri.getQueryParameter("dns") ?: ""
+
             // Show confirmation dialog
             MaterialAlertDialogBuilder(this)
                 .setTitle("Import Configuration")
@@ -228,7 +241,18 @@ class ServerConfigActivity : BaseActivity() {
                         coverHost = coverHost,
                         rttMasking = rttMasking,
                         rttProfile = rttProfile,
-                        fallbackEnabled = fallbackEnabled
+                        fallbackEnabled = fallbackEnabled,
+                        shaperPreset = shaperPreset,
+                        shaperSeed = shaperSeed,
+                        echEnabled = echEnabled,
+                        echConfig = echConfig,
+                        echPublicName = echPublicName,
+                        serverAddressV6 = serverAddressV6,
+                        preferIpv6 = preferIpv6,
+                        fallbackV4 = fallbackV4,
+                        quicSniFrag = quicSniFrag,
+                        mtu = mtu,
+                        customDns = customDns
                     )
                     ServerRepository.saveServer(this, config)
 
