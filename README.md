@@ -95,7 +95,7 @@ app/src/main/java/com/tiredvpn/android/
 
 ### Step 1: Build the Go native library
 
-Use the provided script — it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) automatically, cross-compiles for all three architectures, and places the `.so` files in the right directories:
+Use the provided script - it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) automatically, cross-compiles for all three architectures, and places the `.so` files in the right directories:
 
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.2.12479018
@@ -156,12 +156,12 @@ adb shell am broadcast -a com.tiredvpn.ACTION_DISCONNECT
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| AndroidX Core KTX | 1.12.0 | Kotlin extensions for Android |
-| Material Components | 1.11.0 | UI components and theming |
-| AndroidX Lifecycle | 2.7.0 | ViewModel and lifecycle-aware components |
-| Kotlin Coroutines | 1.7.3 | Asynchronous programming |
+| AndroidX Core KTX | 1.18.0 | Kotlin extensions for Android |
+| Material Components | 1.14.0 | UI components and theming |
+| AndroidX Lifecycle | 2.10.0 | ViewModel and lifecycle-aware components |
+| Kotlin Coroutines | 1.11.0 | Asynchronous programming |
 | AndroidX WorkManager | 2.9.0 | VPN watchdog and update scheduler |
-| OkHttp | 4.12.0 | Update checking and APK downloads |
+| OkHttp | 5.4.0 | Update checking and APK downloads |
 | ConstraintLayout | 2.1.4 | Responsive layouts |
 
 ## Contributing
