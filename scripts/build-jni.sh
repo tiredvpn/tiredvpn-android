@@ -19,12 +19,14 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CORE_DIR="/tmp/tiredvpn-core"
 OUTPUT_DIR="app/src/main/jniLibs"
 CORE_REPO="https://github.com/tiredvpn/tiredvpn.git"
+VERSION="1.3.0-android-jni"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --core-dir)  CORE_DIR="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --core-repo) CORE_REPO="$2"; shift 2 ;;
+    --version)   VERSION="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -54,6 +56,7 @@ fi
 ARCHITECTURES="arm64 arm x86_64"
 
 for arch in $ARCHITECTURES; do
+  unset GOARM
   case "$arch" in
     arm64)
       export GOARCH=arm64
@@ -62,6 +65,7 @@ for arch in $ARCHITECTURES; do
       ;;
     arm)
       export GOARCH=arm
+      export GOARM=7
       CC_PREFIX="armv7a-linux-androideabi"
       JNI_DIR="armeabi-v7a"
       ;;
@@ -75,12 +79,16 @@ for arch in $ARCHITECTURES; do
   export GOOS=android
   export CGO_ENABLED=1
   export CC="${TOOLCHAIN}/${CC_PREFIX}24-clang"
+  # 16KB page alignment is required by Android 15+ (and the default on Android 16).
+  export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
 
   OUT="$OUTPUT_DIR/$JNI_DIR"
   mkdir -p "$OUT"
 
-  echo "==> Building libtiredvpn.so for $arch ($JNI_DIR)"
+  echo "==> Building libtiredvpn.so for $arch ($JNI_DIR), version=$VERSION"
   (cd "$CORE_DIR" && go build -buildmode=c-shared \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -trimpath \
     -o "$OUT/libtiredvpn.so" \
     ./cmd/tiredvpn/)
 
