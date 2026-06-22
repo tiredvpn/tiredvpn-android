@@ -62,9 +62,9 @@ android {
     defaultConfig {
         applicationId = "com.tiredvpn.android"
         minSdk = 24
-        targetSdk = 36  // Android 16 (runtime behavior; bump deliberately + device-test)
-        versionCode = 6
-        versionName = "1.3.0"
+        targetSdk = 37  // Android 16 QPR
+        versionCode = 7
+        versionName = "1.4.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

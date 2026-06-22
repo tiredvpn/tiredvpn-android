@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-22
+
 ### Added
 
 - **Share a server.** Long-press a server in the list to Share or Copy link - it serializes the full config (including the new shaper/ECH/IPv6/MTU/DNS settings) into a `tired://` link and hands it to the system share sheet or the clipboard.
@@ -16,6 +18,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 - **Import from clipboard failed with "doesn't contain tired:// URL" even when a link was present.** The clipboard text was matched with a strict `startsWith("tired://")` against the raw, untrimmed first clip item, so a leading newline, surrounding share text, or a link in a second clip item all broke detection. Import now trims, coerces every clip item to text, finds a `tired://` link anywhere in the content (case-insensitive), and falls back to JSON config. Parsing moved to a single tolerant `VpnConfig.fromUrl`/`extractTiredUrl` used by every import path.
 - **Auto Fallback toggle did not stick.** The switch in Settings had no change handler, so toggling it never wrote back to the active server - on leaving and returning to Settings it reverted to the saved value, and the runtime command kept the old fallback behavior. The toggle now persists to the active server immediately (matching the other per-server switches).
+
+### Changed
+
+- Raised `compileSdk` and `targetSdk` to 37 (Android 16 QPR).
+- Bumped dependencies: androidx.core 1.19.0, material 1.14.0, lifecycle 2.11.0, and the Gradle wrapper to 9.6.0.
 
 ## [1.1.0] - 2026-06-16
 
