@@ -109,7 +109,10 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
                 // Step 1: Build VPN interface
                 val builder = Builder()
                     .setSession("TiredVPN")
-                    .setMtu(1500)
+                    // 1280 matches the core TUN MTU default and leaves headroom for
+                    // tunnel encapsulation; 1500 caused fragmentation / blackholes
+                    // and poor download throughput (issue #27).
+                    .setMtu(1280)
                     .addAddress("10.9.0.2", 24)
                     .addRoute("0.0.0.0", 0)
                     .addDnsServer("1.1.1.1")
