@@ -1393,7 +1393,11 @@ class TiredVpnService : VpnService() {
                     ip = json.getString("ip"),
                     serverIp = json.optString("server_ip", "10.8.0.1"),
                     dns = json.optString("dns", "8.8.8.8"),
-                    mtu = json.optInt("mtu", 1400),
+                    // 1280 (IPv6 minimum) matches the core's TUN MTU default and
+                    // leaves headroom for tunnel encapsulation. 1400 let segments
+                    // exceed the real path MTU once framed, causing fragmentation
+                    // / PMTUD blackholes and poor download throughput (issue #27).
+                    mtu = json.optInt("mtu", 1280),
                     routes = json.optString("routes", "0.0.0.0/0")
                 )
                 FileLogger.d(TAG, "connectToControlSocket: SUCCESS - config=$config")
@@ -2408,7 +2412,8 @@ class TiredVpnService : VpnService() {
                     ip = currentIp,
                     serverIp = "10.9.0.1",
                     dns = "8.8.8.8",
-                    mtu = 1400,
+                    // Keep in sync with the core TUN MTU default (issue #27).
+                    mtu = 1280,
                     routes = "0.0.0.0/0"
                 )
 
