@@ -398,6 +398,15 @@ class SettingsActivity : BaseActivity() {
             requestBatteryOptimizationExemption()
         }
 
+        // Auto Fallback toggle - persist to the active server so it survives
+        // leaving and returning to settings (and is honored by the runtime command).
+        binding.fallbackSwitch.setOnCheckedChangeListener { _, isChecked ->
+            val config = ServerRepository.getActiveServer(this)
+            if (config != null && binding.fallbackSwitch.isEnabled && config.fallbackEnabled != isChecked) {
+                ServerRepository.saveServer(this, config.copy(fallbackEnabled = isChecked))
+            }
+        }
+
         // Debug logging toggle
         binding.debugLoggingSwitch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
