@@ -135,7 +135,7 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
                 val serverEndpoint = "${config.serverAddress}:${config.serverPort}"
                 val args = buildArgs(config, serverEndpoint, protectPath)
 
-                FileLogger.i(TAG, "Starting native client with args: $args")
+                FileLogger.i(TAG, "Starting native client with args: ${args.joinToString(" ")}")
 
                 // Step 4: Start native client (non-blocking)
                 val result = TiredVpnNative.start(args)
@@ -186,7 +186,7 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
         stopSelf()
     }
 
-    private fun buildArgs(config: VpnConfig, serverEndpoint: String, protectPath: String): String {
+    private fun buildArgs(config: VpnConfig, serverEndpoint: String, protectPath: String): Array<String> {
         val args = mutableListOf<String>()
 
         // Server
@@ -221,7 +221,9 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
             args.add(config.coverHost)
         }
 
-        return args.joinToString(" ")
+        // Return a real argv array (one token per element) so values with spaces
+        // (e.g. a "morph_Yandex Video" strategy ID) survive the JNI boundary.
+        return args.toTypedArray()
     }
 
     // TODO: Implement split tunneling functions with new config structure

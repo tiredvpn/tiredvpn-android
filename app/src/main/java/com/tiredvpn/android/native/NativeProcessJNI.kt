@@ -43,17 +43,19 @@ class NativeProcessJNI(
             // Initialize JNI with this callback
             TiredVpnNative.initialize(this)
 
-            // Build args string (skip "client" if it's the first arg)
-            val argsStr = if (args.firstOrNull() == "client") {
-                args.drop(1).joinToString(" ")
+            // Build args array (skip "client" if it's the first arg). Passed as a
+            // real String[] across JNI — no space-joining — so arg values that
+            // contain spaces (e.g. "morph_Yandex Video") are preserved.
+            val argv = if (args.firstOrNull() == "client") {
+                args.drop(1)
             } else {
-                args.joinToString(" ")
-            }
+                args
+            }.toTypedArray()
 
-            FileLogger.i(TAG, "Starting with args: $argsStr")
+            FileLogger.i(TAG, "Starting with args: ${argv.joinToString(" ")}")
 
             // Start the client
-            val result = TiredVpnNative.start(argsStr)
+            val result = TiredVpnNative.start(argv)
             if (result != 0) {
                 FileLogger.e(TAG, "Failed to start JNI client: code=$result")
                 onExit(result)

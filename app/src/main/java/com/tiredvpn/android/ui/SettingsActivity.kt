@@ -49,13 +49,13 @@ class SettingsActivity : BaseActivity() {
             "websocket_padded" to "WebSocket (Padded)",
             "http2_stego" to "HTTP/2 Steganography",
             "http_polling" to "HTTP Polling",
-            // Space-free prefixes: core ForceStrategy() matches by prefix, and the
-            // JNI bridge splits args on spaces, so the full IDs ("morph_Yandex Video")
-            // would break. Each prefix uniquely matches its morph strategy.
-            "morph_Yandex" to "Traffic Morph (Yandex)",
-            "morph_VK" to "Traffic Morph (VK)",
-            "morph_Baidu" to "Traffic Morph (Baidu)",
-            "morph_Aparat" to "Traffic Morph (Aparat)",
+            // Canonical core strategy IDs (morph_ + profile name, with the literal
+            // space). The JNI bridge now passes argv as a real String[], so these
+            // IDs reach the core intact and ForceStrategy matches them exactly.
+            "morph_Yandex Video" to "Traffic Morph (Yandex)",
+            "morph_VK Video" to "Traffic Morph (VK)",
+            "morph_Baidu Video" to "Traffic Morph (Baidu)",
+            "morph_Aparat Video" to "Traffic Morph (Aparat)",
             "ssh_camouflage" to "SSH Camouflage",
             "imap_camouflage" to "IMAP Camouflage",
             "antiprobe" to "Anti-Probe",
