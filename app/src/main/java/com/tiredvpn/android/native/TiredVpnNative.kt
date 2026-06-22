@@ -31,7 +31,7 @@ object TiredVpnNative {
     // JNI native methods
     private external fun initNative(callback: NativeCallback)
     private external fun cleanupNative()
-    private external fun startClient(args: String): Int
+    private external fun startClient(args: Array<String>): Int
     private external fun stopClient()
     private external fun setTunFd(fd: Int)
     private external fun getTunFd(): Int
@@ -68,12 +68,16 @@ object TiredVpnNative {
     /**
      * Start VPN client with command line arguments.
      *
-     * @param args Space-separated command line arguments (without "client" command)
-     *             Example: "-server host:port -secret xxx -tun -tun-ip auto"
+     * Args are passed as a real string array across the JNI boundary (one token
+     * per element), so values containing spaces (e.g. a "morph_Yandex Video"
+     * strategy ID) survive intact. The "client" command must already be stripped.
+     *
+     * @param args Argv tokens without the "client" command.
+     *             Example: ["-server", "host:port", "-secret", "xxx", "-tun"]
      * @return 0 on success, non-zero on error
      */
-    fun start(args: String): Int {
-        FileLogger.i(TAG, "Starting client with args: $args")
+    fun start(args: Array<String>): Int {
+        FileLogger.i(TAG, "Starting client with ${args.size} args: ${args.joinToString(" ")}")
         return startClient(args)
     }
 
