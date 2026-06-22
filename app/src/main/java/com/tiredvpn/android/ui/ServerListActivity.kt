@@ -9,6 +9,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityServerLocationsBinding
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
@@ -70,10 +71,14 @@ class ServerListActivity : BaseActivity() {
         val clipData = clipboard.primaryClip
 
         if (clipData != null && clipData.itemCount > 0) {
-            val clipText = clipData.getItemAt(0).text?.toString() ?: ""
+            val clipText = (0 until clipData.itemCount)
+                .joinToString("\n") { clipData.getItemAt(it).coerceToText(this).toString() }
+                .trim()
 
-            // Check if clipboard contains server config (JSON or tired:// URL)
-            if (clipText.startsWith("tired://") || clipText.contains("serverAddress")) {
+            // Check if clipboard contains server config (tired:// URL anywhere in text, or JSON)
+            val hasLink = VpnConfig.extractTiredUrl(clipText) != null
+            val hasJson = clipText.contains("serverAddress")
+            if (hasLink || hasJson) {
                 MaterialAlertDialogBuilder(this)
                     .setTitle("Import from Clipboard")
                     .setMessage("Found server config in clipboard. Import it?")
@@ -99,15 +104,11 @@ class ServerListActivity : BaseActivity() {
 
     private fun importServerFromClipboard(clipText: String) {
         try {
-            val config = if (clipText.startsWith("tired://")) {
-                // Parse tired:// URL format
-                parseUrlConfig(clipText)
-            } else {
-                // Parse JSON format
-                VpnConfig.fromJson(org.json.JSONObject(clipText))
-            }
+            // tired:// link takes priority (tolerant parser handles embedded/whitespace).
+            val config = VpnConfig.fromUrl(clipText)
+                ?: runCatching { VpnConfig.fromJson(org.json.JSONObject(clipText.trim())) }.getOrNull()
 
-            if (config.isValid) {
+            if (config != null && config.isValid) {
                 ServerRepository.saveServer(this, config)
                 ServerRepository.setActiveServerId(this, config.id)
                 refreshList()
@@ -118,22 +119,6 @@ class ServerListActivity : BaseActivity() {
         } catch (e: Exception) {
             Toast.makeText(this, "Failed to import: ${e.message}", Toast.LENGTH_LONG).show()
         }
-    }
-
-    private fun parseUrlConfig(url: String): VpnConfig {
-        // Parse tired://server:port?secret=xxx&name=xxx format
-        val uri = android.net.Uri.parse(url)
-        val serverAddress = uri.host ?: throw IllegalArgumentException("Missing server address")
-        val serverPort = uri.port.takeIf { it != -1 } ?: 993
-        val secret = uri.getQueryParameter("secret") ?: throw IllegalArgumentException("Missing secret")
-        val name = uri.getQueryParameter("name") ?: serverAddress
-
-        return VpnConfig(
-            name = name,
-            serverAddress = serverAddress,
-            serverPort = serverPort,
-            secret = secret
-        )
     }
 
     private fun refreshList() {
@@ -172,16 +157,36 @@ class ServerListActivity : BaseActivity() {
     }
 
     private fun showServerOptions(server: VpnConfig) {
-        val options = arrayOf("Edit", "Delete")
+        val options = arrayOf("Share", "Copy link", "Edit", "Delete")
         MaterialAlertDialogBuilder(this)
             .setTitle(server.name)
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> editServer(server)
-                    1 -> deleteServer(server)
+                    0 -> shareServer(server)
+                    1 -> copyServerLink(server)
+                    2 -> editServer(server)
+                    3 -> deleteServer(server)
                 }
             }
             .show()
+    }
+
+    private fun shareServer(server: VpnConfig) {
+        val link = server.toUrl()
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "TiredVPN: ${server.name}")
+            putExtra(Intent.EXTRA_TEXT, link)
+        }
+        startActivity(Intent.createChooser(shareIntent, getString(R.string.share_server)))
+    }
+
+    private fun copyServerLink(server: VpnConfig) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(
+            android.content.ClipData.newPlainText("TiredVPN config", server.toUrl())
+        )
+        Toast.makeText(this, R.string.link_copied, Toast.LENGTH_SHORT).show()
     }
 
     private fun editServer(server: VpnConfig) {

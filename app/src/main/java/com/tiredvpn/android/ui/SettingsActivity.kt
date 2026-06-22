@@ -11,9 +11,13 @@ import android.view.View
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import org.json.JSONArray
+import java.io.File
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import android.content.pm.PackageManager
@@ -27,6 +31,10 @@ import com.tiredvpn.android.vpn.VpnConfig
 class SettingsActivity : BaseActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
+
+    private val restoreLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let { restoreConfigs(it) } }
 
     companion object {
         // Full canonical strategy list. The stored value (first) is the EXACT
@@ -403,10 +411,122 @@ class SettingsActivity : BaseActivity() {
             startActivity(Intent(this, LogViewerActivity::class.java))
         }
 
+        // Backup / export configs to a file and share
+        binding.backupConfigsRow.setOnClickListener {
+            backupConfigs()
+        }
+
+        // Restore configs from a backup file
+        binding.restoreConfigsRow.setOnClickListener {
+            try {
+                restoreLauncher.launch(
+                    arrayOf("application/json", "text/plain", "application/octet-stream", "*/*")
+                )
+            } catch (e: Exception) {
+                Toast.makeText(this, "No file picker available", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         // About
         binding.aboutRow.setOnClickListener {
             startActivity(Intent(this, AboutActivity::class.java))
         }
+    }
+
+    private fun backupConfigs() {
+        val servers = ServerRepository.getServers(this)
+        if (servers.isEmpty()) {
+            Toast.makeText(this, R.string.backup_no_servers, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.backup_configs)
+            .setMessage(getString(R.string.backup_warning, servers.size))
+            .setPositiveButton(R.string.backup_share) { _, _ -> exportAndShare(servers) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun exportAndShare(servers: List<VpnConfig>) {
+        try {
+            val json = JSONArray().apply { servers.forEach { put(it.toJson()) } }
+            val file = File(cacheDir, "tiredvpn-backup.json")
+            file.writeText(json.toString(2))
+
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "TiredVPN backup (${servers.size} servers)")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(shareIntent, getString(R.string.backup_share)))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Backup failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun restoreConfigs(uri: Uri) {
+        val text = try {
+            contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+        } catch (e: Exception) {
+            Toast.makeText(this, "Failed to read file: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val configs = parseBackup(text)
+        if (configs.isEmpty()) {
+            Toast.makeText(this, R.string.restore_invalid, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.restore_configs)
+            .setMessage(getString(R.string.restore_found, configs.size))
+            .setPositiveButton(R.string.restore_import) { _, _ ->
+                configs.forEach { ServerRepository.saveServer(this, it) }
+                Toast.makeText(
+                    this,
+                    getString(R.string.restore_done, configs.size),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Parse a backup payload into valid configs. Accepts a JSON array of servers
+     * (the backup format), a single JSON object, or text containing tired:// links.
+     */
+    private fun parseBackup(text: String): List<VpnConfig> {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return emptyList()
+
+        // JSON array (backup file) or single object.
+        try {
+            when {
+                trimmed.startsWith("[") -> {
+                    val arr = JSONArray(trimmed)
+                    return (0 until arr.length())
+                        .map { VpnConfig.fromJson(arr.getJSONObject(it)) }
+                        .filter { it.isValid }
+                }
+                trimmed.startsWith("{") -> {
+                    val config = VpnConfig.fromJson(org.json.JSONObject(trimmed))
+                    return if (config.isValid) listOf(config) else emptyList()
+                }
+            }
+        } catch (e: Exception) {
+            // fall through to link parsing
+        }
+
+        // Fallback: one tired:// link per line.
+        return trimmed.lineSequence()
+            .mapNotNull { VpnConfig.fromUrl(it) }
+            .filter { it.isValid }
+            .toList()
     }
 
     private fun showProtocolDialog() {

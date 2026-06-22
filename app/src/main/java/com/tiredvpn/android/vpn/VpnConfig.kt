@@ -1,6 +1,7 @@
 package com.tiredvpn.android.vpn
 
 import android.content.Context
+import android.net.Uri
 import org.json.JSONObject
 import java.util.UUID
 
@@ -95,6 +96,41 @@ data class VpnConfig(
         }
     }
 
+    /**
+     * Serialize this config into a shareable tired:// URL.
+     * Only non-default optional parameters are included to keep the link short.
+     * Roundtrips with [fromUrl].
+     */
+    fun toUrl(): String {
+        val params = mutableListOf<String>()
+        params.add("secret=" + Uri.encode(secret))
+        if (name.isNotBlank() && name != "Server") params.add("name=" + Uri.encode(name))
+        if (strategy != "auto") params.add("strategy=" + Uri.encode(strategy))
+        if (!enableQuic) params.add("quic=false")
+        if (quicPort != 443) params.add("quicPort=$quicPort")
+        if (coverHost != "api.googleapis.com") params.add("cover=" + Uri.encode(coverHost))
+        if (rttMasking) {
+            params.add("rtt=true")
+            if (rttProfile != "moscow-yandex") params.add("rttProfile=" + Uri.encode(rttProfile))
+        }
+        if (!fallbackEnabled) params.add("fallback=false")
+        if (shaperPreset.isNotEmpty()) params.add("shaper=" + Uri.encode(shaperPreset))
+        if (shaperSeed != 0L) params.add("shaperSeed=$shaperSeed")
+        if (echEnabled) {
+            params.add("ech=true")
+            if (echConfig.isNotEmpty()) params.add("echConfig=" + Uri.encode(echConfig))
+            if (echPublicName != "cloudflare-ech.com") params.add("echPublicName=" + Uri.encode(echPublicName))
+        }
+        if (serverAddressV6.isNotEmpty()) params.add("serverV6=" + Uri.encode(serverAddressV6))
+        if (preferIpv6) params.add("preferIpv6=true")
+        if (!fallbackV4) params.add("fallbackV4=false")
+        if (quicSniFrag) params.add("quicSniFrag=true")
+        if (mtu != 0) params.add("mtu=$mtu")
+        if (customDns.isNotEmpty()) params.add("dns=" + Uri.encode(customDns))
+
+        return "tired://$serverAddress:$serverPort?" + params.joinToString("&")
+    }
+
     companion object {
         // Connection modes
         val CONNECTION_MODES = listOf(
@@ -174,5 +210,85 @@ data class VpnConfig(
             "sequential" to "Sequential",
             "fibonacci" to "Fibonacci"
         )
+
+        // Matches a tired:// link possibly embedded in surrounding text (share messages, etc.)
+        private val TIRED_URL_REGEX = Regex("""tired://[^\s]+""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Extract a tired:// link from arbitrary clipboard/shared text.
+         * Handles leading/trailing whitespace, newlines, and links wrapped in a message.
+         * Returns null if no tired:// link is present.
+         */
+        fun extractTiredUrl(text: String?): String? {
+            if (text.isNullOrBlank()) return null
+            val trimmed = text.trim()
+            if (trimmed.startsWith("tired://", ignoreCase = true)) {
+                // Whole text is the link; strip any trailing whitespace/newlines only
+                return trimmed.substringBefore('\n').trim().ifEmpty { null }
+            }
+            return TIRED_URL_REGEX.find(trimmed)?.value
+        }
+
+        /**
+         * Parse a tired:// URL into a VpnConfig. Tolerant of surrounding text via [extractTiredUrl].
+         * Returns null if the link is missing, malformed, or lacks server/secret.
+         */
+        fun fromUrl(rawUrl: String?): VpnConfig? {
+            val url = extractTiredUrl(rawUrl) ?: return null
+            return try {
+                val uri = Uri.parse(url)
+                if (!uri.scheme.equals("tired", ignoreCase = true)) return null
+
+                // Resolve host:port. Fall back to manual authority parsing if Uri.host is null
+                // (can happen for some hostnames Android's parser rejects).
+                var host = uri.host
+                var port = uri.port
+                if (host.isNullOrBlank()) {
+                    val authority = uri.authority
+                        ?: url.removePrefix("tired://").substringBefore("?").substringBefore("/")
+                    val hostPort = authority.substringAfterLast('@') // drop optional userinfo
+                    if (hostPort.startsWith("[")) {
+                        // IPv6 literal [::1]:port
+                        host = hostPort.substringAfter('[').substringBefore(']')
+                        port = hostPort.substringAfterLast("]:", "").toIntOrNull() ?: -1
+                    } else {
+                        host = hostPort.substringBeforeLast(':', hostPort)
+                        port = hostPort.substringAfterLast(':', "").toIntOrNull() ?: -1
+                    }
+                }
+                if (host.isNullOrBlank()) return null
+                val resolvedPort = port.takeIf { it in 1..65535 } ?: 993
+
+                val secret = uri.getQueryParameter("secret") ?: return null
+                if (secret.isBlank()) return null
+
+                VpnConfig(
+                    name = uri.getQueryParameter("name")?.takeIf { it.isNotBlank() } ?: host,
+                    serverAddress = host,
+                    serverPort = resolvedPort,
+                    secret = secret,
+                    strategy = uri.getQueryParameter("strategy") ?: "auto",
+                    enableQuic = uri.getQueryParameter("quic")?.toBooleanStrictOrNull() ?: true,
+                    quicPort = uri.getQueryParameter("quicPort")?.toIntOrNull() ?: 443,
+                    coverHost = uri.getQueryParameter("cover") ?: "api.googleapis.com",
+                    rttMasking = uri.getQueryParameter("rtt")?.toBooleanStrictOrNull() ?: false,
+                    rttProfile = uri.getQueryParameter("rttProfile") ?: "moscow-yandex",
+                    fallbackEnabled = uri.getQueryParameter("fallback")?.toBooleanStrictOrNull() ?: true,
+                    shaperPreset = uri.getQueryParameter("shaper") ?: "",
+                    shaperSeed = uri.getQueryParameter("shaperSeed")?.toLongOrNull() ?: 0L,
+                    echEnabled = uri.getQueryParameter("ech")?.toBooleanStrictOrNull() ?: false,
+                    echConfig = uri.getQueryParameter("echConfig") ?: "",
+                    echPublicName = uri.getQueryParameter("echPublicName") ?: "cloudflare-ech.com",
+                    serverAddressV6 = uri.getQueryParameter("serverV6") ?: "",
+                    preferIpv6 = uri.getQueryParameter("preferIpv6")?.toBooleanStrictOrNull() ?: false,
+                    fallbackV4 = uri.getQueryParameter("fallbackV4")?.toBooleanStrictOrNull() ?: true,
+                    quicSniFrag = uri.getQueryParameter("quicSniFrag")?.toBooleanStrictOrNull() ?: false,
+                    mtu = uri.getQueryParameter("mtu")?.toIntOrNull() ?: 0,
+                    customDns = uri.getQueryParameter("dns") ?: ""
+                )
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 }

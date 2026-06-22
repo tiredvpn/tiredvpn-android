@@ -5,6 +5,17 @@ All notable changes to TiredVPN Android are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Share a server.** Long-press a server in the list to Share or Copy link - it serializes the full config (including the new shaper/ECH/IPv6/MTU/DNS settings) into a `tired://` link and hands it to the system share sheet or the clipboard.
+- **Backup and restore configs.** Settings has a "Backup configs" entry that exports every saved server to a `tiredvpn-backup.json` file and opens the share sheet (with a warning that the file holds server secrets), and a "Restore configs" entry that picks a backup file and imports all servers from it. Restore accepts the JSON array backup, a single JSON object, or a file of `tired://` links, and is idempotent (servers keep their id, so re-importing updates in place instead of duplicating).
+
+### Fixed
+
+- **Import from clipboard failed with "doesn't contain tired:// URL" even when a link was present.** The clipboard text was matched with a strict `startsWith("tired://")` against the raw, untrimmed first clip item, so a leading newline, surrounding share text, or a link in a second clip item all broke detection. Import now trims, coerces every clip item to text, finds a `tired://` link anywhere in the content (case-insensitive), and falls back to JSON config. Parsing moved to a single tolerant `VpnConfig.fromUrl`/`extractTiredUrl` used by every import path.
+
 ## [1.1.0] - 2026-06-16
 
 ### Added

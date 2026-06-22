@@ -204,4 +204,17 @@
     <string name="enter_url">Enter URL</string>
     <string name="enter_url_hint">Type or paste tired:// link</string>
     <string name="enter_url_title">Enter Configuration URL</string>
+    <string name="share_server">Share server</string>
+    <string name="link_copied">Link copied to clipboard</string>
+    <string name="backup_configs">Backup configs</string>
+    <string name="backup_configs_hint">Export all servers to a file and send</string>
+    <string name="backup_share">Export &amp; send</string>
+    <string name="backup_no_servers">No servers to back up</string>
+    <string name="backup_warning">This file contains your server secrets. Export %1$d server(s) and send to a trusted destination only.</string>
+    <string name="restore_configs">Restore configs</string>
+    <string name="restore_configs_hint">Import servers from a backup file</string>
+    <string name="restore_import">Import</string>
+    <string name="restore_invalid">No valid server configs found in the file</string>
+    <string name="restore_found">Found %1$d server(s) in the file. Import them?</string>
+    <string name="restore_done">Imported %1$d server(s)</string>
 </resources>

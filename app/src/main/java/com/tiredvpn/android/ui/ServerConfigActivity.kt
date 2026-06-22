@@ -152,14 +152,47 @@ class ServerConfigActivity : BaseActivity() {
             return
         }
 
-        val text = clipData.getItemAt(0).text?.toString() ?: ""
+        // Concatenate all clip items so we don't miss the link if it lands in a second item.
+        val text = (0 until clipData.itemCount)
+            .joinToString("\n") { clipData.getItemAt(it).coerceToText(this).toString() }
+            .trim()
 
-        if (!text.startsWith("tired://")) {
+        if (text.isEmpty()) {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
         }
 
-        parseAndApplyUrl(text, fromExternalSource = false)
+        // Try tired:// link (tolerant: handles whitespace and links embedded in text).
+        val link = VpnConfig.extractTiredUrl(text)
+        if (link != null) {
+            parseAndApplyUrl(link, fromExternalSource = false)
+            return
+        }
+
+        // Fall back to JSON config exported via backup.
+        val jsonConfig = tryParseJsonConfig(text)
+        if (jsonConfig != null) {
+            confirmAndSave(jsonConfig, fromExternalSource = false)
+            return
+        }
+
+        Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun tryParseJsonConfig(text: String): VpnConfig? {
+        return try {
+            val trimmed = text.trim()
+            when {
+                trimmed.startsWith("{") -> VpnConfig.fromJson(org.json.JSONObject(trimmed))
+                trimmed.startsWith("[") -> {
+                    val arr = org.json.JSONArray(trimmed)
+                    if (arr.length() > 0) VpnConfig.fromJson(arr.getJSONObject(0)) else null
+                }
+                else -> null
+            }?.takeIf { it.isValid }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /**
@@ -170,103 +203,37 @@ class ServerConfigActivity : BaseActivity() {
      * tired://SERVER:PORT?secret=SECRET
      */
     private fun parseAndApplyUrl(url: String, fromExternalSource: Boolean = false): Boolean {
-        try {
-            val uri = Uri.parse(url)
-
-            if (uri.scheme != "tired") {
-                Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
-                return false
-            }
-
-            // Parse host:port
-            val host = uri.host ?: run {
-                Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
-                return false
-            }
-            val port = uri.port.takeIf { it > 0 } ?: 993
-
-            // Parse query parameters
-            val secret = uri.getQueryParameter("secret") ?: run {
-                Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
-                return false
-            }
-
-            // Optional parameters
-            val strategy = uri.getQueryParameter("strategy") ?: "auto"
-            val enableQuic = uri.getQueryParameter("quic")?.toBooleanStrictOrNull() ?: true
-            val quicPort = uri.getQueryParameter("quicPort")?.toIntOrNull() ?: port
-            val coverHost = uri.getQueryParameter("cover") ?: "api.googleapis.com"
-            val rttMasking = uri.getQueryParameter("rtt")?.toBooleanStrictOrNull() ?: false
-            val rttProfile = uri.getQueryParameter("rttProfile") ?: "moscow-yandex"
-            val fallbackEnabled = uri.getQueryParameter("fallback")?.toBooleanStrictOrNull() ?: true
-
-            // New client settings (all optional, default to VpnConfig defaults)
-            val shaperPreset = uri.getQueryParameter("shaper") ?: ""
-            val shaperSeed = uri.getQueryParameter("shaperSeed")?.toLongOrNull() ?: 0L
-            val echEnabled = uri.getQueryParameter("ech")?.toBooleanStrictOrNull() ?: false
-            val echConfig = uri.getQueryParameter("echConfig") ?: ""
-            val echPublicName = uri.getQueryParameter("echPublicName") ?: "cloudflare-ech.com"
-            val serverAddressV6 = uri.getQueryParameter("serverV6") ?: ""
-            val preferIpv6 = uri.getQueryParameter("preferIpv6")?.toBooleanStrictOrNull() ?: false
-            val fallbackV4 = uri.getQueryParameter("fallbackV4")?.toBooleanStrictOrNull() ?: true
-            val quicSniFrag = uri.getQueryParameter("quicSniFrag")?.toBooleanStrictOrNull() ?: false
-            val mtu = uri.getQueryParameter("mtu")?.toIntOrNull() ?: 0
-            val customDns = uri.getQueryParameter("dns") ?: ""
-
-            // Show confirmation dialog
-            MaterialAlertDialogBuilder(this)
-                .setTitle("Import Configuration")
-                .setMessage(buildString {
-                    if (fromExternalSource) {
-                        appendLine("⚠️ This configuration was opened from an external link (browser or another app). Make sure you trust the source.")
-                        appendLine()
-                    }
-                    appendLine("Server: $host:$port")
-                    appendLine("Strategy: $strategy")
-                    appendLine("QUIC: ${if (enableQuic) "Enabled (port $quicPort)" else "Disabled"}")
-                    appendLine("Cover Host: $coverHost")
-                    appendLine("RTT Masking: ${if (rttMasking) rttProfile else "Disabled"}")
-                    appendLine("Fallback: ${if (fallbackEnabled) "Enabled" else "Disabled"}")
-                })
-                .setPositiveButton("Import") { _, _ ->
-                    // Create and save config
-                    val config = VpnConfig(
-                        name = "Server $host",
-                        serverAddress = host,
-                        serverPort = port,
-                        secret = secret,
-                        strategy = strategy,
-                        enableQuic = enableQuic,
-                        quicPort = quicPort,
-                        coverHost = coverHost,
-                        rttMasking = rttMasking,
-                        rttProfile = rttProfile,
-                        fallbackEnabled = fallbackEnabled,
-                        shaperPreset = shaperPreset,
-                        shaperSeed = shaperSeed,
-                        echEnabled = echEnabled,
-                        echConfig = echConfig,
-                        echPublicName = echPublicName,
-                        serverAddressV6 = serverAddressV6,
-                        preferIpv6 = preferIpv6,
-                        fallbackV4 = fallbackV4,
-                        quicSniFrag = quicSniFrag,
-                        mtu = mtu,
-                        customDns = customDns
-                    )
-                    ServerRepository.saveServer(this, config)
-
-                    Toast.makeText(this, R.string.config_imported, Toast.LENGTH_SHORT).show()
-                    finish()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-
-            return true
-        } catch (e: Exception) {
+        val config = VpnConfig.fromUrl(url)
+        if (config == null) {
             Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
             return false
         }
+        confirmAndSave(config, fromExternalSource)
+        return true
+    }
+
+    private fun confirmAndSave(config: VpnConfig, fromExternalSource: Boolean) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Import Configuration")
+            .setMessage(buildString {
+                if (fromExternalSource) {
+                    appendLine("⚠️ This configuration was opened from an external link (browser or another app). Make sure you trust the source.")
+                    appendLine()
+                }
+                appendLine("Server: ${config.serverAddress}:${config.serverPort}")
+                appendLine("Strategy: ${config.strategy}")
+                appendLine("QUIC: ${if (config.enableQuic) "Enabled (port ${config.quicPort})" else "Disabled"}")
+                appendLine("Cover Host: ${config.coverHost}")
+                appendLine("RTT Masking: ${if (config.rttMasking) config.rttProfile else "Disabled"}")
+                appendLine("Fallback: ${if (config.fallbackEnabled) "Enabled" else "Disabled"}")
+            })
+            .setPositiveButton("Import") { _, _ ->
+                ServerRepository.saveServer(this, config)
+                Toast.makeText(this, R.string.config_imported, Toast.LENGTH_SHORT).show()
+                finish()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun saveConfig() {
