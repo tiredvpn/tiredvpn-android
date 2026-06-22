@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-23
+
+### Fixed
+
+- **Client arguments with spaces no longer get mangled.** The JNI bridge joined argv into one space-separated string, so values containing a space (notably morph strategy IDs like `Yandex Video`) were split apart inside the core. Argv is now passed as a string array end to end, and Settings uses the exact core strategy IDs instead of a space-free-prefix workaround. Requires core >= 1.3.2 (paired JNI signature change).
+- **TUN download throughput.** The VpnService interface came up at MTU 1400 while the core clamped MSS against a 1500 TUN MTU, so outer packets exceeded the path MTU and fragmented / black-holed (worst on download). The interface now defaults to MTU 1280, matching the core, so framing and MSS clamping agree.
+
 ## [1.4.0] - 2026-06-22
 
 ### Added
