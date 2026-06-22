@@ -57,12 +57,12 @@ tasks.named("preBuild") {
 
 android {
     namespace = "com.tiredvpn.android"
-    compileSdk = 36
+    compileSdk = 37  // required by androidx.core 1.19.0 AAR metadata
 
     defaultConfig {
         applicationId = "com.tiredvpn.android"
         minSdk = 24
-        targetSdk = 36  // Android 16
+        targetSdk = 36  // Android 16 (runtime behavior; bump deliberately + device-test)
         versionCode = 6
         versionName = "1.3.0"
 
