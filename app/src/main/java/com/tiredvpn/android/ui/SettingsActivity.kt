@@ -886,7 +886,12 @@ class SettingsActivity : BaseActivity() {
             .setPositiveButton(R.string.save) { _, _ ->
                 val raw = input.text.toString().trim()
                 val mtu = if (raw.isEmpty()) 0 else raw.toIntOrNull()
-                if (mtu == null || (mtu != 0 && mtu !in 576..1500)) {
+                // 0 (empty) = auto -> core default (1280). A custom value must be
+                // in 1280..9000: below 1280 there is no headroom for tunnel
+                // encapsulation (see #27); 9000 covers jumbo-frame paths. The same
+                // value is sent both as -tun-mtu to the core and to
+                // VpnService.Builder.setMtu(), so the two stay in sync.
+                if (mtu == null || (mtu != 0 && mtu !in 1280..9000)) {
                     Toast.makeText(this, R.string.invalid_value, Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }

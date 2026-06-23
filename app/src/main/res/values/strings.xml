@@ -76,7 +76,7 @@
     <string name="fallback_v4">IPv4 Fallback</string>
     <string name="fallback_v4_desc">Fall back to IPv4 if IPv6 fails</string>
     <string name="custom_mtu">Custom MTU</string>
-    <string name="custom_mtu_hint">0 = auto, or 576..1500</string>
+    <string name="custom_mtu_hint">empty = auto (1280), or 1280..9000</string>
     <string name="custom_dns">Custom DNS</string>
     <string name="custom_dns_hint">DNS server IP (empty = auto)</string>
     <string name="not_set">Not set</string>
