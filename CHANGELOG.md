@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-06-23
+
+### Changed
+
+- **MTU setting now accepts 1280-9000.** The custom-MTU dialog validated 576-1500, which blocked the larger MTUs enabled by the new server-side `-tun-mtu` (core 1.3.3) and allowed values below the safe 1280 floor. The range is now 1280-9000 (empty = auto, kernel default 1280). The MTU value already flowed correctly to both the `-tun-mtu` argv and `VpnService.Builder.setMtu`, so no plumbing change was needed.
+
 ## [1.4.1] - 2026-06-23
 
 ### Fixed
