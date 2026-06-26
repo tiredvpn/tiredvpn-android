@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-06-26
+
+### Changed
+
+- **Bundles core 1.3.7.** The release build compiles the JNI native library from the core's latest tag, so this version ships the 1.3.6 -> 1.3.7 core fixes: TUN throughput (HTTP/2 receive window raised to 4 MB plus kTLS), client lifecycle (no longer flips to offline before a connection exists, and routes are installed only after the handshake completes), a stable sticky TUN address on REALITY-mux, QUIC reconnect backoff, IP-pool TTL handling, and admission control that bounds memory under DPI reconnect storms (OOM protection). No app-side code changed; the gains arrive through the rebuilt `.so`.
+
 ## [1.4.2] - 2026-06-23
 
 ### Changed
