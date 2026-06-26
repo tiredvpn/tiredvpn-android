@@ -7,6 +7,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-06-26
+
+### Changed
+
+- **Bundles core 1.3.11** (was 1.3.7). The native library is rebuilt from the latest core, bringing:
+  - Idle connections no longer reconnect every ~30 seconds on the HTTP/2-stego strategy (the server now echoes the client keepalive), so a paused session no longer blips on the next request.
+  - A pass of hot-path performance work across the transport strategies (REALITY encrypt/read, Morph, Geneva, WebSocket, stego, probes) and larger client TCP socket buffers (4 MB) for better throughput on high-latency links.
+  - A shared TLS session cache so reconnects skip the full TLS handshake.
+
 ## [1.4.3] - 2026-06-26
 
 ### Changed
