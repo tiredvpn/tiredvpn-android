@@ -39,6 +39,8 @@ import com.tiredvpn.android.util.CountryDetector
 import com.tiredvpn.android.util.TvUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.URL
@@ -54,6 +56,11 @@ class MainActivity : BaseActivity() {
     private var ipFetchJob: Job? = null
     private var countryFetchJob: Job? = null
     private var pendingForceUpdate: UpdateConfig? = null
+
+    // Current connection phase published by the service, plus the ticker that
+    // animates it (rotating "Phase." / "Phase.." / "Phase…") while connecting.
+    private var currentPhase: String = ""
+    private var phaseAnimJob: Job? = null
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -173,6 +180,13 @@ class MainActivity : BaseActivity() {
         updateServerInfo()
     }
 
+    override fun onStop() {
+        // Don't keep the phase ticker running in the background; observeVpnState's
+        // collector restarts it via updateUI() when we return to STARTED.
+        stopPhaseAnimation()
+        super.onStop()
+    }
+
     private fun checkConnectOnLaunch() {
         val settingsPrefs = getSharedPreferences("tiredvpn_settings", MODE_PRIVATE)
         if (settingsPrefs.getBoolean("connect_on_launch", false)) {
@@ -235,6 +249,9 @@ class MainActivity : BaseActivity() {
             when (currentState) {
                 is VpnState.Disconnected, is VpnState.Error -> {
                     Log.d(TAG, "Action: Calling connect()")
+                    // Immediate visual feedback so the tap always feels responsive,
+                    // without waiting for the (possibly lagging) global state.
+                    showConnectingFeedback()
                     connect()
                 }
                 is VpnState.Connected, is VpnState.Connecting -> {
@@ -245,6 +262,13 @@ class MainActivity : BaseActivity() {
                     Log.e(TAG, "Unknown state: $currentState")
                 }
             }
+        }
+
+        // Long-press = emergency force reset. Lets the user recover a wedged state
+        // without having to "force stop" the app from Android settings.
+        binding.connectButton.setOnLongClickListener {
+            forceReset()
+            true
         }
 
         // Server selector - open server config
@@ -261,14 +285,48 @@ class MainActivity : BaseActivity() {
     private fun observeVpnState() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                TiredVpnService.state.collect { state ->
-                    updateUI(state)
+                launch {
+                    TiredVpnService.state.collect { state ->
+                        updateUI(state)
+                    }
+                }
+                // Phase updates only feed currentPhase; the animation ticker (started
+                // by updateUI for the Connecting state) is the sole writer of statusText
+                // while connecting, so the two collectors never fight over the view.
+                launch {
+                    TiredVpnService.connectingPhase.collect { phase ->
+                        currentPhase = phase
+                    }
                 }
             }
         }
     }
 
+    private fun startPhaseAnimation() {
+        if (phaseAnimJob?.isActive == true) return
+        phaseAnimJob = lifecycleScope.launch {
+            var dots = 0
+            while (isActive) {
+                val base = currentPhase.ifEmpty { getString(R.string.connecting) }
+                    .trimEnd('…', '.', ' ')
+                binding.statusText.text = base + ".".repeat(dots % 4)
+                dots++
+                delay(400)
+            }
+        }
+    }
+
+    private fun stopPhaseAnimation() {
+        phaseAnimJob?.cancel()
+        phaseAnimJob = null
+    }
+
     private fun updateUI(state: VpnState) {
+        // The phase ticker owns statusText only while Connecting; stop it before any
+        // other branch writes to statusText.
+        if (state !is VpnState.Connecting) {
+            stopPhaseAnimation()
+        }
         when (state) {
             is VpnState.Disconnected -> {
                 binding.statusText.text = getString(R.string.disconnected)
@@ -281,7 +339,9 @@ class MainActivity : BaseActivity() {
                 binding.mascotImage.setImageResource(R.drawable.sloth_disconnected)
             }
             is VpnState.Connecting -> {
-                binding.statusText.text = getString(R.string.connecting)
+                // statusText is driven by the animated phase ticker (rotating dots +
+                // the current phase such as "Resolving server", "Handshake", …).
+                startPhaseAnimation()
                 binding.statusHint.text = "" // Clear text but keep space
                 binding.statusHint.visibility = View.INVISIBLE
                 binding.connectButton.setIconTintResource(R.color.connecting)
@@ -386,6 +446,34 @@ class MainActivity : BaseActivity() {
         Log.d(TAG, "Sending disconnect intent to TiredVpnService")
         startService(intent)
         Log.d(TAG, "Disconnect intent sent")
+    }
+
+    /**
+     * Paint the button into the transitional (connecting) look immediately on tap,
+     * so the UI never feels frozen while the service spins up. observeVpnState()
+     * repaints with the real state shortly after.
+     */
+    private fun showConnectingFeedback() {
+        binding.statusText.text = getString(R.string.connecting)
+        binding.statusHint.text = ""
+        binding.statusHint.visibility = View.INVISIBLE
+        binding.connectButton.setIconTintResource(R.color.connecting)
+        binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
+        binding.connectionInfo.visibility = View.GONE
+    }
+
+    /**
+     * Emergency force reset (long-press). Tells the service to wipe the native core
+     * and all stuck state so the next connect starts clean — replaces the old
+     * "force stop the app in settings" workaround.
+     */
+    private fun forceReset() {
+        Log.d(TAG, "=== FORCE RESET requested ===")
+        val intent = Intent(this, TiredVpnService::class.java).apply {
+            action = TiredVpnService.ACTION_FORCE_RESET
+        }
+        startService(intent)
+        Toast.makeText(this, getString(R.string.force_reset_toast), Toast.LENGTH_SHORT).show()
     }
 
     private fun fetchExternalIP() {

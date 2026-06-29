@@ -10,6 +10,18 @@
     <string name="disconnected">Disconnected</string>
     <string name="tap_to_connect">Tap to Connect</string>
 
+    <!-- Connection phases (shown instead of a bare "Connecting…"; the UI appends animated dots) -->
+    <string name="phase_resolving">Resolving server</string>
+    <string name="phase_starting_core">Starting core</string>
+    <string name="phase_control_socket">Negotiating</string>
+    <string name="phase_creating_tunnel">Creating tunnel</string>
+    <string name="phase_handshake">Handshake</string>
+    <string name="phase_trying_strategy">Trying %s</string>
+    <string name="phase_reconnecting">Reconnecting</string>
+    <string name="phase_activating">Almost there</string>
+
+    <string name="force_reset_toast">Resetting…</string>
+
     <!-- Server -->
     <string name="server_address">Server address</string>
     <string name="server_port">Port</string>

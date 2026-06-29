@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-06-29
+
+### Fixed
+
+- **Connect button no longer gets stuck in "Disconnected".** The button could stop toggling the core - it sat in Disconnected and only a "force stop" from Android settings recovered it. Root causes: a reconnect mutex that stayed locked forever when a reconnect hung inside a non-cancellable cleanup block, the process-global VPN state surviving a dead service instance, and `connect()` not clearing orphan Go goroutines / TUN fds before starting. Every connect now runs an authoritative clean reset first (kills orphans, frees the mutex, resets the coroutine scope), `onStartCommand` dedups duplicate start intents, a blocking `stopAndWait()` is now time-bounded, and a queued reconnect aborts if the user disconnected during its backoff. A new instance also reconciles stale global state on create.
+- **Emergency reset.** Long-pressing the connect button now force-resets the core, so a wedged state no longer requires force-stopping the app from system settings.
+
+### Added
+
+- **Connecting screen shows the current phase.** Instead of a static "Connecting…", the status line cycles animated phases pulled from the connection pipeline - Resolving server, Starting core, Negotiating, Creating tunnel, Handshake - and shows "Reconnecting" when the tunnel is re-establishing.
+
 ## [1.4.4] - 2026-06-26
 
 ### Changed

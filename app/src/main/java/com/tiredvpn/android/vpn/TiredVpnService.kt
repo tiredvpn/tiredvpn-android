@@ -51,8 +51,16 @@ class TiredVpnService : VpnService() {
         private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
         val state: StateFlow<VpnState> = _state.asStateFlow()
 
+        // Fine-grained connection phase shown by the UI instead of a static
+        // "Connecting…". Empty string means "no phase" (UI falls back to the
+        // generic connecting label). Kept separate from VpnState so the sealed
+        // state machine and its when() exhaustiveness stay untouched.
+        private val _connectingPhase = MutableStateFlow("")
+        val connectingPhase: StateFlow<String> = _connectingPhase.asStateFlow()
+
         const val ACTION_CONNECT = "com.tiredvpn.android.CONNECT"
         const val ACTION_DISCONNECT = "com.tiredvpn.android.DISCONNECT"
+        const val ACTION_FORCE_RESET = "com.tiredvpn.android.FORCE_RESET"
 
         // Google apps (Meet, Gmail, Maps, ...) offload signaling, push and STUN/auth
         // to Google Play Services. In include/allowlist mode the selected app is
@@ -148,6 +156,19 @@ class TiredVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         FileLogger.d(TAG, "Service created")
+
+        // Reconcile stale process-global state: a fresh service instance holds no
+        // resources, so any non-Disconnected value here is leftover from a dead
+        // instance (the static _state survives instance death). Clearing it — and
+        // releasing a possibly-stuck reconnect mutex — prevents the UI button from
+        // getting wedged. A legitimate connect arrives next as its own onStartCommand.
+        if (_state.value !is VpnState.Disconnected) {
+            FileLogger.w(TAG, "onCreate: stale state ${_state.value}, reconciling to Disconnected")
+            _state.value = VpnState.Disconnected
+        }
+        if (reconnectMutex.isLocked) {
+            try { reconnectMutex.unlock() } catch (_: Exception) {}
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -157,6 +178,18 @@ class TiredVpnService : VpnService() {
                 val config = ServerRepository.getActiveServer(this)
                 FileLogger.d(TAG, "onStartCommand: config=${if (config != null) "present, valid=${config.isValid}" else "null"}")
                 if (config != null && config.isValid) {
+                    // Dedup: drop a duplicate start intent while a connection attempt is
+                    // already running, so we don't kill an almost-finished connectionJob.
+                    if (_state.value is VpnState.Connecting && connectionJob?.isActive == true) {
+                        FileLogger.w(TAG, "onStartCommand: already connecting with live job, ignoring duplicate CONNECT")
+                        return START_STICKY
+                    }
+                    // Authoritative clean slate on every tap: kills orphan goroutines /
+                    // TUN fds, frees a stuck reconnect mutex and blocked IO threads, so the
+                    // core ALWAYS starts cleanly without needing a force-stop. Internal
+                    // auto-reconnects call connect() directly (bypassing onStartCommand),
+                    // so they are not affected by this.
+                    forceResetCore("connect")
                     startForeground(NOTIFICATION_ID, createNotification("Connecting..."))
                     connect(config)
                 } else {
@@ -167,6 +200,15 @@ class TiredVpnService : VpnService() {
             }
             ACTION_DISCONNECT -> {
                 disconnect()
+            }
+            ACTION_FORCE_RESET -> {
+                FileLogger.w(TAG, "onStartCommand: ACTION_FORCE_RESET")
+                forceResetCore("user force reset")
+                _state.value = VpnState.Disconnected
+                BootReceiver.markVpnDisconnected(this)
+                VpnWatchdogWorker.cancel(this)
+                try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+                stopSelf()
             }
         }
         return START_STICKY
@@ -312,6 +354,7 @@ class TiredVpnService : VpnService() {
                 }
             } catch (e: TimeoutCancellationException) {
                 FileLogger.e(TAG, "Connection timed out after ${CONNECTION_TIMEOUT/1000} seconds")
+                clearPhase()
                 _state.value = VpnState.Error("Connection timed out")
                 cleanupFailedConnection()
                 // Schedule auto-reconnect after timeout
@@ -322,6 +365,7 @@ class TiredVpnService : VpnService() {
                 return@launch
             } catch (e: Exception) {
                 FileLogger.e(TAG, "Connection failed", e)
+                clearPhase()
                 _state.value = VpnState.Error(e.message ?: "Unknown error")
                 cleanupFailedConnection()
                 // Schedule auto-reconnect after failure
@@ -403,6 +447,15 @@ class TiredVpnService : VpnService() {
                 FileLogger.i(TAG, "scheduleAutoReconnect: Starting reconnect (attempt $reconnectAttempts)")
 
                 withContext(NonCancellable) {
+                    // Final guard: the user may have hit disconnect() during the backoff
+                    // delay. NonCancellable means delay's cancellation can't abort us, so
+                    // re-check before reconnecting to avoid reviving the VPN against the
+                    // user's will.
+                    if (_state.value is VpnState.Disconnected) {
+                        FileLogger.i(TAG, "scheduleAutoReconnect: Disconnected during backoff, aborting reconnect")
+                        isReconnecting = false
+                        return@withContext
+                    }
                     isReconnecting = true
                     try {
                         connect(config)
@@ -455,6 +508,87 @@ class TiredVpnService : VpnService() {
         releaseWakeLock()
     }
 
+    /**
+     * Authoritative, synchronous, idempotent reset of the native core and all
+     * service state. Consolidates the cleanup helpers already used by disconnect()
+     * so a fresh connect can ALWAYS start from a clean slate — even when the
+     * previous attempt left a stuck reconnect mutex, leaked Go goroutines holding
+     * the TUN fd, or blocked Dispatchers.IO threads. This is what makes "force-stop
+     * the app from Android settings" unnecessary.
+     *
+     * MUST be called from onStartCommand (main service thread), NOT from inside a
+     * scope coroutine — the final resetScope() would cancel the calling coroutine.
+     */
+    private fun forceResetCore(reason: String) {
+        FileLogger.w(TAG, "=== forceResetCore: $reason ===")
+
+        // 1. Cancel connection / reconnect coroutines
+        connectionJob?.cancel()
+        connectionJob = null
+        pendingReconnectJob?.cancel()
+        pendingReconnectJob = null
+
+        // 2. Stop all background jobs
+        statusMonitorJob?.cancel()
+        statusMonitorJob = null
+        stopProcessWatchdog()
+        stopHealthCheck()
+        stopNetworkMonitoring()
+        stopActiveNetworkMonitor()
+        stopNetworkWatchdog()
+        stopNetworkRecoveryJob()
+        stopProtectServer()
+
+        // 3. Close control socket
+        try { controlSocket?.close() } catch (_: Exception) {}
+        controlSocket = null
+
+        // 4. Stop native process (non-blocking stop, not stopAndWait)
+        try { tiredvpnProcess?.stop() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: stop process", e) }
+        tiredvpnProcess = null
+
+        // 5. Kill orphan Go goroutines holding the TUN fd (synchronous)
+        try { TiredVpnNative.cleanup() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: native cleanup", e) }
+
+        // 6. Kill any leaked native processes
+        NativeProcess.killAllTiredVpnProcesses(applicationInfo.nativeLibraryDir)
+
+        // 7. Close VPN interface
+        try { vpnInterface?.close() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: close vpnInterface", e) }
+        vpnInterface = null
+
+        // 8. Force-close any remaining /dev/tun fds Go didn't release yet
+        forceCloseTunFds()
+        Thread {
+            repeat(10) {
+                Thread.sleep(100)
+                forceCloseTunFds()
+            }
+        }.apply { isDaemon = true; start() }
+
+        // 9. Delete socket files
+        File("${filesDir.absolutePath}/control.sock").delete()
+        File("${filesDir.absolutePath}/protect.sock").delete()
+
+        // 10. Force-unlock reconnect mutex (tryLock() takes it without an owner token,
+        // so unlock() with no token is valid; guard against IllegalStateException).
+        if (reconnectMutex.isLocked) {
+            try { reconnectMutex.unlock() } catch (_: Exception) {}
+        }
+
+        // 11. Reset all sticky flags
+        isReconnecting = false
+        reconnectAttempts = 0
+        isNetworkLost = false
+        connectAttemptsSinceBodyEntered = 0
+        clearPhase()
+
+        // 12. Reset coroutine scope last (releases stuck Dispatchers.IO threads)
+        resetScope()
+
+        FileLogger.d(TAG, "forceResetCore: done")
+    }
+
     private suspend fun connectTunMode(config: VpnConfig) {
         val controlPath = "${filesDir.absolutePath}/control.sock"
         val protectPath = "${filesDir.absolutePath}/protect.sock"
@@ -468,6 +602,7 @@ class TiredVpnService : VpnService() {
 
         // 0. CRITICAL: Resolve DNS BEFORE starting VPN
         // After VPN is established, DNS queries go through the tunnel (which doesn't work yet)
+        setPhase(getString(R.string.phase_resolving))
         FileLogger.i(TAG, "STEP 0: Pre-resolving server hostname...")
         val resolvedEndpoint = resolveServerEndpoint(config.serverEndpoint)
         if (resolvedEndpoint == null) {
@@ -482,11 +617,13 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "STEP 1a: Protect server started")
 
         // 1b. Start tiredvpn with control socket (using resolved IP)
+        setPhase(getString(R.string.phase_starting_core))
         FileLogger.i(TAG, "STEP 1b: Starting tiredvpn process...")
         startTiredVpnProcess(config, resolvedEndpoint, controlPath, protectPath)
         FileLogger.i(TAG, "STEP 1b: Process started")
 
         // 2. Wait for socket and connect
+        setPhase(getString(R.string.phase_control_socket))
         FileLogger.i(TAG, "STEP 2: Connecting to control socket...")
         val tunConfig = connectToControlSocket(controlPath)
             ?: throw RuntimeException("Failed to get tunnel config from server")
@@ -494,6 +631,7 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "STEP 2: Got tunnel config: IP=${tunConfig.ip}, DNS=${tunConfig.dns}, MTU=${tunConfig.mtu}")
 
         // 3. Create VPN interface with server-provided config
+        setPhase(getString(R.string.phase_creating_tunnel))
         FileLogger.i(TAG, "STEP 3: Creating VPN interface...")
         val vpnFd = establishVpn(config, tunConfig)
             ?: throw RuntimeException("Failed to establish VPN interface")
@@ -516,6 +654,7 @@ class TiredVpnService : VpnService() {
 
         while (finalIp == null && handshakeAttempt < maxHandshakeRetries) {
             handshakeAttempt++
+            setPhase(getString(R.string.phase_handshake))
             FileLogger.i(TAG, "STEP 4: Sending TUN fd=$tunFd to tiredvpn (attempt $handshakeAttempt/$maxHandshakeRetries)...")
             finalIp = sendTunFd(tunFd)
 
@@ -553,6 +692,7 @@ class TiredVpnService : VpnService() {
         }
 
         FileLogger.i(TAG, "STEP 5: Connection complete, updating state...")
+        clearPhase()
         _state.value = VpnState.Connected(
             strategy = connectedStrategy.ifEmpty { config.strategy },
             latencyMs = connectedLatencyMs,
@@ -604,10 +744,12 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "=== PROXY MODE CONNECT START ===")
 
         // 1. Start tiredvpn in proxy mode (without -tun, without control socket)
+        setPhase(getString(R.string.phase_starting_core))
         FileLogger.i(TAG, "STEP 1: Starting tiredvpn in proxy mode...")
         startTiredVpnProxyProcess(config)
 
         // 2. Wait for proxy port to be ready
+        setPhase(getString(R.string.phase_control_socket))
         FileLogger.i(TAG, "STEP 2: Waiting for proxy port ${config.proxyPort} to be ready...")
         val proxyReady = waitForProxyPort(config.proxyPort)
         if (!proxyReady) {
@@ -616,6 +758,7 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "STEP 2: Proxy is listening on port ${config.proxyPort}")
 
         // 3. Create VPN with HTTP proxy (Android 10+)
+        setPhase(getString(R.string.phase_creating_tunnel))
         FileLogger.i(TAG, "STEP 3: Creating VPN with HTTP proxy...")
         val vpnFd = establishProxyVpn(config)
         if (vpnFd == null) {
@@ -627,6 +770,7 @@ class TiredVpnService : VpnService() {
         val proxyAddress = "127.0.0.1:${config.proxyPort}"
         FileLogger.i(TAG, "STEP 4: Proxy mode connected at $proxyAddress")
 
+        clearPhase()
         _state.value = VpnState.Connected(
             strategy = connectedStrategy.ifEmpty { config.strategy },
             latencyMs = connectedLatencyMs,
@@ -1570,10 +1714,11 @@ class TiredVpnService : VpnService() {
                                     "reconnecting" -> {
                                         FileLogger.i(TAG, "Go is reconnecting: $data")
                                         _state.value = VpnState.Connecting
-                                        updateNotification("Reconnecting...")
+                                        setPhase(getString(R.string.phase_reconnecting))
                                     }
                                     "connected" -> {
                                         FileLogger.i(TAG, "Reconnect successful")
+                                        clearPhase()
                                         lastKeepaliveTime = System.currentTimeMillis()
                                         // Parse reconnect metadata from event data (JSON)
                                         if (data.startsWith("{")) {
@@ -2623,7 +2768,15 @@ class TiredVpnService : VpnService() {
 
                 FileLogger.d(TAG, "executeReconnectSequence: Step 3 - Stop process and WAIT")
                 // 3. WAIT for process to actually die (sync!)
-                tiredvpnProcess?.stopAndWait()
+                // Bound the wait: a hung stopAndWait() inside NonCancellable would
+                // otherwise block this coroutine forever and leave reconnectMutex
+                // locked, silently killing all future reconnects. killAll below
+                // still force-kills whatever survives the timeout.
+                try {
+                    withTimeout(3000L) { tiredvpnProcess?.stopAndWait() }
+                } catch (e: TimeoutCancellationException) {
+                    FileLogger.w(TAG, "executeReconnectSequence: stopAndWait timed out, force-killing")
+                }
                 tiredvpnProcess = null
 
                 // ITERATION 2: Force kill any remaining Go processes to handle long disconnect case
@@ -2831,6 +2984,7 @@ class TiredVpnService : VpnService() {
 
         // CRITICAL: Set state to Disconnected FIRST to prevent handleControlSocketBroken race condition
         // If we close control socket before setting state, event listener will trigger reconnect
+        clearPhase()
         _state.value = VpnState.Disconnected
 
         // Mark VPN as disconnected (user action - don't auto-reconnect on boot)
@@ -2994,6 +3148,18 @@ class TiredVpnService : VpnService() {
         val notification = createNotification(status)
         val notificationManager = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
         notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    /** Publish a connection phase to the UI and the ongoing notification. */
+    private fun setPhase(text: String) {
+        _connectingPhase.value = text
+        updateNotification(text)
+        FileLogger.d(TAG, "Phase: $text")
+    }
+
+    /** Clear the connection phase (called when leaving the Connecting state). */
+    private fun clearPhase() {
+        _connectingPhase.value = ""
     }
 
     private fun forceCloseTunFds() {
