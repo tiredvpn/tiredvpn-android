@@ -61,16 +61,33 @@
         app:layout_constraintTop_toBottomOf="@id/topBar"
         app:layout_constraintBottom_toTopOf="@id/serverSelector">
 
-        <!-- Left side: Mascot -->
-        <com.google.android.material.imageview.ShapeableImageView
-            android:id="@+id/mascotImage"
+        <!-- Left side: Mascot (static image + connecting video stacked) -->
+        <FrameLayout
             android:layout_width="180dp"
-            android:layout_height="180dp"
-            android:src="@drawable/sloth_disconnected"
-            android:scaleType="centerCrop"
-            android:background="@color/mascot_circle_background"
-            app:shapeAppearanceOverlay="@style/CircleImageStyle"
-            android:contentDescription="@string/sloth_mascot" />
+            android:layout_height="180dp">
+
+            <com.google.android.material.imageview.ShapeableImageView
+                android:id="@+id/mascotImage"
+                android:layout_width="180dp"
+                android:layout_height="180dp"
+                android:src="@drawable/sloth_disconnected"
+                android:scaleType="centerCrop"
+                android:background="@color/mascot_circle_background"
+                app:shapeAppearanceOverlay="@style/CircleImageStyle"
+                android:contentDescription="@string/sloth_mascot" />
+
+            <!-- Looping muted video shown while connecting; circle-clipped in code. -->
+            <androidx.media3.ui.PlayerView
+                android:id="@+id/mascotVideo"
+                android:layout_width="180dp"
+                android:layout_height="180dp"
+                android:background="@color/mascot_circle_background"
+                android:visibility="gone"
+                app:surface_type="texture_view"
+                app:use_controller="false"
+                app:resize_mode="zoom" />
+
+        </FrameLayout>
 
         <!-- Center: Status and Button -->
         <LinearLayout

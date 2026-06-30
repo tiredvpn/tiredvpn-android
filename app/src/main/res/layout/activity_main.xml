@@ -66,6 +66,23 @@
         app:layout_constraintEnd_toEndOf="parent"
         android:contentDescription="@string/sloth_mascot" />
 
+    <!-- Looping muted video shown over the mascot while connecting. Clipped to a
+         circle in code (ViewOutlineProvider); texture_view surface so the outline
+         clip actually applies (a SurfaceView would punch through). -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/mascotVideo"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:background="@color/mascot_circle_background"
+        android:visibility="gone"
+        app:surface_type="texture_view"
+        app:use_controller="false"
+        app:resize_mode="zoom"
+        app:layout_constraintTop_toTopOf="@id/mascotImage"
+        app:layout_constraintBottom_toBottomOf="@id/mascotImage"
+        app:layout_constraintStart_toStartOf="@id/mascotImage"
+        app:layout_constraintEnd_toEndOf="@id/mascotImage" />
+
     <!-- Status Text -->
     <TextView
         android:id="@+id/statusText"

@@ -147,6 +147,10 @@ dependencies {
     // WorkManager for VPN watchdog
     implementation("androidx.work:work-runtime-ktx:2.9.0")
 
+    // Looping muted mascot video on the connecting screen
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
+
     // OkHttp for update checking
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
 

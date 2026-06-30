@@ -16,6 +16,13 @@ import android.util.Log
 import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
+import android.graphics.Outline
+import androidx.annotation.OptIn
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
 import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,6 +52,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.URL
 
+@OptIn(UnstableApi::class)
 class MainActivity : BaseActivity() {
 
     companion object {
@@ -61,6 +69,11 @@ class MainActivity : BaseActivity() {
     // animates it (rotating "Phase." / "Phase.." / "Phase…") while connecting.
     private var currentPhase: String = ""
     private var phaseAnimJob: Job? = null
+
+    // ExoPlayer for the looping muted mascot video shown while Connecting. Created
+    // lazily on first need, released in onDestroy. Volume is forced to 0 (the asset
+    // has no audio track either, so this is belt-and-suspenders).
+    private var mascotPlayer: ExoPlayer? = null
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -121,6 +134,7 @@ class MainActivity : BaseActivity() {
             startActivity(Intent(this, WelcomeActivity::class.java))
         }
 
+        setupMascotVideoClip()
         requestNotificationPermission()
         requestBatteryOptimizationExemption()
         setupListeners()
@@ -184,7 +198,57 @@ class MainActivity : BaseActivity() {
         // Don't keep the phase ticker running in the background; observeVpnState's
         // collector restarts it via updateUI() when we return to STARTED.
         stopPhaseAnimation()
+        // Don't burn CPU decoding video while not visible; updateUI() resumes it
+        // when we return to a Connecting state.
+        mascotPlayer?.playWhenReady = false
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        mascotPlayer?.release()
+        mascotPlayer = null
+        super.onDestroy()
+    }
+
+    /**
+     * Clip the connecting video to the same circle as the static mascot. PlayerView
+     * doesn't clip its surface on its own, so we drive it via an outline provider on
+     * the texture_view-backed PlayerView.
+     */
+    private fun setupMascotVideoClip() {
+        binding.mascotVideo.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setOval(0, 0, view.width, view.height)
+            }
+        }
+        binding.mascotVideo.clipToOutline = true
+    }
+
+    /** Lazily create the looping, muted player bound to the mascot video view. */
+    private fun ensureMascotPlayer(): ExoPlayer {
+        mascotPlayer?.let { return it }
+        val player = ExoPlayer.Builder(this).build().apply {
+            setMediaItem(MediaItem.fromUri("android.resource://$packageName/${R.raw.sloth_connecting}"))
+            repeatMode = Player.REPEAT_MODE_ALL
+            volume = 0f
+            prepare()
+        }
+        binding.mascotVideo.player = player
+        mascotPlayer = player
+        return player
+    }
+
+    private fun startMascotVideo() {
+        binding.mascotVideo.visibility = View.VISIBLE
+        ensureMascotPlayer().playWhenReady = true
+    }
+
+    private fun stopMascotVideo() {
+        mascotPlayer?.let {
+            it.playWhenReady = false
+            it.seekTo(0)
+        }
+        binding.mascotVideo.visibility = View.GONE
     }
 
     private fun checkConnectOnLaunch() {
@@ -336,12 +400,15 @@ class MainActivity : BaseActivity() {
                 binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
                 binding.connectionInfo.visibility = View.GONE
                 // Update mascot to sleeping/disconnected
+                stopMascotVideo()
                 binding.mascotImage.setImageResource(R.drawable.sloth_disconnected)
             }
             is VpnState.Connecting -> {
                 // statusText is driven by the animated phase ticker (rotating dots +
                 // the current phase such as "Resolving server", "Handshake", …).
                 startPhaseAnimation()
+                // Play the looping sloth video over the static mascot.
+                startMascotVideo()
                 binding.statusHint.text = "" // Clear text but keep space
                 binding.statusHint.visibility = View.INVISIBLE
                 binding.connectButton.setIconTintResource(R.color.connecting)
@@ -353,6 +420,7 @@ class MainActivity : BaseActivity() {
                 // Dark green background with white icon
                 binding.connectButton.setIconTintResource(R.color.text_primary_dark)
                 binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.connected_button_background))
+                stopMascotVideo()
                 binding.mascotImage.setImageResource(R.drawable.sloth_connected)
 
                 // Show latency and strategy in hint (no server name - it's in the card below)
@@ -364,6 +432,7 @@ class MainActivity : BaseActivity() {
                 binding.connectionInfo.visibility = View.GONE
             }
             is VpnState.Error -> {
+                stopMascotVideo()
                 binding.statusText.text = getString(R.string.disconnected)
                 binding.statusHint.text = state.message
                 binding.statusHint.visibility = View.VISIBLE
