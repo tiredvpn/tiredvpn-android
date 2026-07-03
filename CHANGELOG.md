@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-07-03
+
+### Fixed
+
+- **Native crash (SIGABRT/fdsan) on reconnect.** `forceResetCore()`'s cleanup spawned a background thread that kept force-closing any `/dev/tun` file descriptor for a full second after a reset, with no awareness of a new connection attempt establishing its own TUN interface in that same window. When a fresh `vpnInterface` landed inside that window, the sweep adopted its still-owned fd and Android's `fdsan` aborted the process (`failed to exchange ownership of file descriptor ... expected to be unowned`), killing the app - reliably reproducible on every reconnect, not just under flaky Wi-Fi. The sweep now stops as soon as a new `vpnInterface` is assigned, since the fd is no longer an orphan at that point.
+- **Bundles core 1.3.19** (was 1.3.11-linked at the time of 1.4.4/1.4.5's JNI rebuild). The native library is rebuilt from the latest core, bringing the fix for the Android JNI entrypoint dropping `AndroidMode` when building its strategy config - which let already-dead QUIC/QUIC-Salamander attempts sort first on `-no-quic` servers and stall the connection for 15-20s before ever reaching a working strategy like REALITY - plus the HTTP/2-stego handshake now honoring the caller's timeout instead of a hardcoded 30s wait.
+
 ## [1.4.5] - 2026-06-29
 
 ### Fixed
