@@ -557,12 +557,19 @@ class TiredVpnService : VpnService() {
         try { vpnInterface?.close() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: close vpnInterface", e) }
         vpnInterface = null
 
-        // 8. Force-close any remaining /dev/tun fds Go didn't release yet
+        // 8. Force-close any remaining /dev/tun fds Go didn't release yet.
+        // Guarded by vpnInterface == null: a new connect() may already be
+        // establishing a fresh TUN interface while this delayed sweep runs, and
+        // blindly adopting that live fd races with its owning ParcelFileDescriptor,
+        // aborting the process via fdsan ("expected to be unowned"). Once a new
+        // vpnInterface is assigned, the fd is no longer an orphan — stop sweeping.
         forceCloseTunFds()
         Thread {
             repeat(10) {
                 Thread.sleep(100)
-                forceCloseTunFds()
+                if (vpnInterface == null) {
+                    forceCloseTunFds()
+                }
             }
         }.apply { isDaemon = true; start() }
 

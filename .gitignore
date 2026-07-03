@@ -32,3 +32,4 @@ keystore.properties
 
 # Pre-built JNI libs (built by CI)
 app/src/main/jniLibs/
+CLAUDE.local.md
