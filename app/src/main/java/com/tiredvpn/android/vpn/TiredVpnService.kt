@@ -62,6 +62,24 @@ class TiredVpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.tiredvpn.android.DISCONNECT"
         const val ACTION_FORCE_RESET = "com.tiredvpn.android.FORCE_RESET"
 
+        // CONNECT WATCHDOG: safety net for the residual case where a blocking native
+        // (cgo) call into the Go core never returns, wedging the Dispatchers.IO worker
+        // thread it's running on forever. Cancelling a Job is cooperative and does NOT
+        // reclaim that thread, so if enough attempts wedge threads this way, the whole
+        // shared IO pool eventually has zero free workers and a brand-new connect()
+        // coroutine can be queued but never actually dispatched — its body never runs
+        // and "COROUTINE BODY ENTERED" never prints. A healthy body enters immediately
+        // (the slow work happens AFTER entry), so this threshold has ample margin.
+        private const val CONNECT_BODY_WATCHDOG_MS = 14_000L
+
+        // Deliberately its OWN dedicated thread, never scope / Dispatchers.IO — that
+        // pool is exactly what's suspected of being fully wedged, so a watchdog
+        // scheduled on it would be just as stuck as the thing it's meant to catch.
+        private val connectWatchdogExecutor: java.util.concurrent.ScheduledExecutorService =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+                Thread(r, "TiredVpnConnectWatchdog").apply { isDaemon = true }
+            }
+
         // Google apps (Meet, Gmail, Maps, ...) offload signaling, push and STUN/auth
         // to Google Play Services. In include/allowlist mode the selected app is
         // tunneled but GPS is not, so WebRTC call setup (Meet) never completes.
@@ -96,6 +114,34 @@ class TiredVpnService : VpnService() {
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + exceptionHandler)
     }
 
+    /**
+     * Arm the connect watchdog: if COROUTINE BODY ENTERED doesn't print within
+     * CONNECT_BODY_WATCHDOG_MS, we conclude a previous blocking native call has
+     * wedged an IO thread forever (see companion object comment) and kill the
+     * process — the only way left to reclaim a native thread the JVM can't stop.
+     */
+    private fun armConnectWatchdog(reason: String) {
+        disarmConnectWatchdog()
+        FileLogger.w(TAG, "armConnectWatchdog[$reason]: armed, ${CONNECT_BODY_WATCHDOG_MS}ms to reach BODY ENTERED or process is killed")
+        connectWatchdogFuture = connectWatchdogExecutor.schedule({
+            FileLogger.e(TAG, "CONNECT WATCHDOG FIRED[$reason]: coroutine body never entered within " +
+                "${CONNECT_BODY_WATCHDOG_MS}ms (scopeActive=${scope.isActive}) - a native call is presumed " +
+                "wedged forever on an IO thread that the JVM cannot reclaim; killing process so the system " +
+                "or user can relaunch cleanly")
+            Log.e(TAG, "CONNECT WATCHDOG FIRED: killing process to release a wedged native thread")
+            // Best-effort: give FileLogger's writer thread (flushes every ~100ms) one
+            // cycle to persist the line above before the process dies.
+            try { Thread.sleep(200) } catch (_: InterruptedException) {}
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }, CONNECT_BODY_WATCHDOG_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    /** Disarm the connect watchdog: body entered, or connect/disconnect concluded. */
+    private fun disarmConnectWatchdog() {
+        connectWatchdogFuture?.cancel(false)
+        connectWatchdogFuture = null
+    }
+
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tiredvpnProcess: TiredVpnProcess? = null  // Can be NativeProcess or NativeProcessJNI
     private var controlSocket: LocalSocket? = null
@@ -103,6 +149,7 @@ class TiredVpnService : VpnService() {
     private var protectServerJob: Job? = null  // Socket protection server
     private var connectionJob: Job? = null  // Current connection attempt - can be cancelled
     private var connectAttemptsSinceBodyEntered = 0  // Track if coroutine body ever starts
+    @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var connectionManager: ConnectionManager? = null  // Port hopping manager
@@ -308,6 +355,10 @@ class TiredVpnService : VpnService() {
     }
 
     private fun connect(config: VpnConfig) {
+        // WATCHDOG: arm before anything else below, so even the (currently harmless)
+        // cancel/init calls that follow are inside the guarded window.
+        armConnectWatchdog("connect")
+
         // Cancel any existing connection attempt
         connectionJob?.cancel()
 
@@ -331,6 +382,16 @@ class TiredVpnService : VpnService() {
 
         FileLogger.d(TAG, "connect: launching coroutine (scopeActive=${scope.isActive}, scopeJob=${scope.coroutineContext[kotlinx.coroutines.Job]})")
 
+        // DIAG: nothing above this line can block the calling (onStartCommand) thread -
+        // connectionJob?.cancel() does not join/wait, there is no mutex/lock acquired
+        // here. So this is the exact point where a new coroutine is handed to scope's
+        // dispatcher (Dispatchers.IO's shared thread pool) for execution. If neither
+        // this dispatch test nor COROUTINE BODY ENTERED below ever print, the gate is
+        // NOT a scope/mutex/join block in this function - it means Dispatchers.IO has
+        // no free worker thread (all wedged in blocking native calls) to run the new
+        // coroutine on.
+        FileLogger.w(TAG, "connect: dispatching onto scope now (Dispatchers.IO) - if BODY ENTERED doesn't follow, IO pool is exhausted, not a scope/lock/join block")
+
         // Diagnostic: test if scope can dispatch at all
         scope.launch {
             Log.d(TAG, ">>> SCOPE DISPATCH TEST OK on thread=${Thread.currentThread().name}")
@@ -341,6 +402,9 @@ class TiredVpnService : VpnService() {
             connectAttemptsSinceBodyEntered = 0  // Reset counter — body is executing
             Log.d(TAG, ">>> COROUTINE BODY ENTERED on thread=${Thread.currentThread().name}")
             FileLogger.d(TAG, ">>> COROUTINE BODY ENTERED on thread=${Thread.currentThread().name}")
+            // WATCHDOG: body reached, disarm immediately - whatever happens next
+            // (success, timeout, error) is real coroutine execution, not a wedge.
+            disarmConnectWatchdog()
             try {
                 FileLogger.i(TAG, "=== CONNECT START === mode=${config.connectionMode}, portHopping=${config.portHoppingEnabled}")
                 _state.value = VpnState.Connecting
@@ -523,6 +587,7 @@ class TiredVpnService : VpnService() {
         FileLogger.w(TAG, "=== forceResetCore: $reason ===")
 
         // 1. Cancel connection / reconnect coroutines
+        disarmConnectWatchdog()  // explicit reset, not a wedge - don't kill for this
         connectionJob?.cancel()
         connectionJob = null
         pendingReconnectJob?.cancel()
@@ -3001,6 +3066,7 @@ class TiredVpnService : VpnService() {
         VpnWatchdogWorker.cancel(this)
 
         // Cancel any ongoing connection attempt
+        disarmConnectWatchdog()  // user disconnected explicitly - don't kill for this
         connectionJob?.cancel()
         connectionJob = null
 

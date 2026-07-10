@@ -7,6 +7,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Connect watchdog for the unkillable native-thread case.** When `connect()`'s coroutine body never runs - previously requiring `adb shell am force-stop` to recover - a dedicated watchdog thread (independent of `Dispatchers.IO`/`scope`, since that pool is the thing suspected of being wedged) now kills the process after 14s if `COROUTINE BODY ENTERED` hasn't fired. The Go core is getting its own deadline fix for the underlying blocking native call; this is the client-side backstop for whatever residual case still slips through.
+
 ## [1.4.6] - 2026-07-03
 
 ### Fixed
