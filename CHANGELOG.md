@@ -7,7 +7,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.7] - 2026-07-11
+
 ### Added
+
+- **seqovl (TCP sequence overlap) strategy, selectable in settings.** Bundles Go core 1.3.23, which adds the seqovl desync strategy adapted from zapret2: the client prepends a secret-marked decoy TLS record before the REALITY ClientHello so a censor's stateful reassembler fingerprints the junk, while the server drops the decoy and reads the real first flight. Android runs the app-framing (level B) path — the packet-level variant is Linux-only. `seqovl` now appears in the strategy picker; in auto mode the core already uses it as a REALITY fallback.
 
 - **Connect watchdog for the unkillable native-thread case.** When `connect()`'s coroutine body never runs - previously requiring `adb shell am force-stop` to recover - a dedicated watchdog thread (independent of `Dispatchers.IO`/`scope`, since that pool is the thing suspected of being wedged) now kills the process after 14s if `COROUTINE BODY ENTERED` hasn't fired. The Go core is getting its own deadline fix for the underlying blocking native call; this is the client-side backstop for whatever residual case still slips through.
 
