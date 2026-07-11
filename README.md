@@ -17,7 +17,7 @@ TiredVPN Android is the mobile client for the [TiredVPN](https://github.com/tire
 
 ## Features
 
-- **Multiple DPI bypass strategies** - the Go core ships with 20+ strategies (REALITY, QUIC Salamander, HTTP/2 Stego, WebSocket Padded, Traffic Morphing, Protocol Confusion, and more). The client rotates through them automatically when one is blocked.
+- **Multiple DPI bypass strategies** - the Go core ships with 20+ strategies (REALITY, Seqovl sequence overlap, QUIC Salamander, HTTP/2 Stego, WebSocket Padded, Traffic Morphing, Protocol Confusion, and more). The client rotates through them automatically when one is blocked, and any strategy can be forced from Settings.
 - **Smart auto-reconnect** - survives airplane mode toggles, network switches (Wi-Fi / mobile), and device sleep. A WorkManager-based watchdog ensures the tunnel restarts if the service is killed.
 - **Persistent VPN notification** - foreground service with real-time status, latency, and data counters.
 - **Split tunneling** - per-app routing: choose which apps go through the tunnel and which use the direct connection.
