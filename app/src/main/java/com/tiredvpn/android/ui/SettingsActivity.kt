@@ -44,6 +44,7 @@ class SettingsActivity : BaseActivity() {
         private val STRATEGIES = listOf(
             "auto" to "Auto (Best Available)",
             "reality" to "REALITY",
+            "seqovl" to "Seqovl (sequence overlap)",
             "quic" to "QUIC",
             "quic_salamander" to "QUIC (Salamander)",
             "websocket_padded" to "WebSocket (Padded)",

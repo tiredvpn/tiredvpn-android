@@ -142,6 +142,7 @@ data class VpnConfig(
         val STRATEGIES = listOf(
             "auto" to "Auto (Best Available)",
             "reality" to "REALITY Protocol",
+            "seqovl" to "Seqovl (sequence overlap)",
             "quic" to "QUIC Tunnel",
             "websocket_padded" to "WebSocket Salamander",
             "http2_stego" to "HTTP/2 Steganography",
