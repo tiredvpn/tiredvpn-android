@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import android.widget.Toast
 import com.tiredvpn.android.vpn.ServerRepository
+import com.tiredvpn.android.vpn.SplitTunnelSettings
 import com.tiredvpn.android.vpn.VpnConfig
 import org.json.JSONObject
 import java.io.File
@@ -52,7 +53,6 @@ class ConfigImportReceiver : BroadcastReceiver() {
         const val ACTION_IMPORT_CONFIG = "com.tiredvpn.IMPORT_CONFIG"
         private const val EXTRA_JSON = "json"
         private const val EXTRA_FILE = "file"
-        private const val PREFS_SETTINGS = "tiredvpn_settings"
         private const val TAG = "ConfigImportReceiver"
     }
 
@@ -132,17 +132,17 @@ class ConfigImportReceiver : BroadcastReceiver() {
         if (json.has("split_tunneling")) {
             val splitObj = json.getJSONObject("split_tunneling")
             Log.d(TAG, "split_tunneling object: $splitObj")
-            importSplitTunneling(context, splitObj)
+            importSplitTunneling(context, splitObj, config.id)
         } else {
             Log.d(TAG, "No split_tunneling in JSON. Keys: ${json.keys().asSequence().toList()}")
         }
     }
 
-    private fun importSplitTunneling(context: Context, splitJson: JSONObject) {
+    private fun importSplitTunneling(context: Context, splitJson: JSONObject, profileId: String) {
         val mode = splitJson.optString("mode", "exclude")
         val appsArray = splitJson.optJSONArray("apps")
 
-        Log.d(TAG, "importSplitTunneling: mode=$mode, appsArray=$appsArray")
+        Log.d(TAG, "importSplitTunneling: profile=$profileId, mode=$mode, appsArray=$appsArray")
 
         val apps = mutableSetOf<String>()
         if (appsArray != null) {
@@ -152,11 +152,8 @@ class ConfigImportReceiver : BroadcastReceiver() {
         }
 
         Log.d(TAG, "Saving split tunneling: mode=$mode, apps=$apps")
-        context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .edit()
-            .putString("split_tunneling_mode", mode)
-            .putStringSet("split_tunneling_apps", apps)
-            .apply()
+        // Bind imported split settings to the profile they arrived with.
+        SplitTunnelSettings.save(context, profileId, mode, apps)
         Log.d(TAG, "Split tunneling saved successfully")
     }
 

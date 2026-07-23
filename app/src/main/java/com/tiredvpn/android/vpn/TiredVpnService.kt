@@ -1153,8 +1153,8 @@ class TiredVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .setHttpProxy(proxyInfo)
 
-            // Apply split tunneling
-            val usesAllowedApps = applySplitTunneling(builder)
+            // Apply split tunneling for this profile
+            val usesAllowedApps = applySplitTunneling(builder, config.id)
 
             // Exclude our own app if not using allowedApps mode
             if (!usesAllowedApps) {
@@ -2963,8 +2963,8 @@ class TiredVpnService : VpnService() {
                 builder.addDnsServer("8.8.8.8")
             }
 
-            // Apply split tunneling (handles app inclusion/exclusion)
-            val usesAllowedApps = applySplitTunneling(builder)
+            // Apply split tunneling (handles app inclusion/exclusion) for this profile
+            val usesAllowedApps = applySplitTunneling(builder, config.id)
 
             // Exclude our own app to prevent loops (only if not using addAllowedApplication)
             if (!usesAllowedApps) {
@@ -2985,12 +2985,12 @@ class TiredVpnService : VpnService() {
      * Apply split tunneling settings.
      * @return true if addAllowedApplication was used (can't mix with addDisallowedApplication)
      */
-    private fun applySplitTunneling(builder: Builder): Boolean {
-        val prefs = getSharedPreferences("tiredvpn_settings", MODE_PRIVATE)
-        val mode = prefs.getString("split_tunneling_mode", "exclude") ?: "exclude"
-        val selectedApps = prefs.getStringSet("split_tunneling_apps", emptySet()) ?: emptySet()
+    private fun applySplitTunneling(builder: Builder, profileId: String?): Boolean {
+        val prefs = getSharedPreferences(SplitTunnelSettings.PREFS_NAME, MODE_PRIVATE)
+        val mode = SplitTunnelSettings.getMode(prefs, profileId)
+        val selectedApps = SplitTunnelSettings.getApps(prefs, profileId)
 
-        FileLogger.i(TAG, "Split tunneling: mode=$mode, apps=${selectedApps.size} (${selectedApps.joinToString()})")
+        FileLogger.i(TAG, "Split tunneling: profile=$profileId, mode=$mode, apps=${selectedApps.size} (${selectedApps.joinToString()})")
 
         if (selectedApps.isEmpty()) {
             FileLogger.d(TAG, "No apps selected for split tunneling")
