@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.8] - 2026-08-07
+
+### Added
+
+- **Split tunneling is now per server profile instead of one global setting.** The mode and the app set were stored under a single pair of keys, so a split configured for a home profile silently applied to every other profile too — the wrong apps ended up in or out of the tunnel after switching exits. Keys are now namespaced by profile id (`split_tunneling_mode_<id>` / `split_tunneling_apps_<id>`), the split screen edits the active profile and names it in the header, and `VpnService` applies that profile's split in both TUN and proxy modes. Config imported over broadcast writes its split into the profile it arrived with. Upgrades read the old global keys as defaults, so an existing configuration survives.
+
+### Fixed
+
+- **The app list in the split screen took seconds to open and stuttered while scrolling.** Building the list called `getLaunchIntentForPackage()` once per installed package — one IPC per app, hundreds of them — and loaded every icon on the UI thread. The launcher lookup is now a single `queryIntentActivities()` call, the unnecessary `GET_META_DATA` flag is gone, and icons load off the UI thread behind an `LruCache`.
+
+### Changed
+
+- Bundles Go core 1.3.27 (configurable `-redis-db` / `-redis-prefix` on the server side; no client-visible change).
+- Dependency bumps: Android Gradle Plugin 9.3.1, `androidx.constraintlayout` 2.2.2, `actions/setup-java` 5.6.0, `actions/setup-go` 7.
+
 ## [1.4.7] - 2026-07-11
 
 ### Added
