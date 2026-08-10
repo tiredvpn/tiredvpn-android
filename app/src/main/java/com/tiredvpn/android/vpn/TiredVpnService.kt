@@ -48,6 +48,10 @@ class TiredVpnService : VpnService() {
         private const val CONTROL_SOCKET_TIMEOUT = 30_000 // 30 sec for connection
         private const val CONNECTION_TIMEOUT = 30_000L // 30 sec max for full connection
 
+        // IPv4 resolver used as backup, and as replacement for a configured IPv6
+        // resolver, which is unreachable behind the IPv6 blackhole (see Ipv6Guard)
+        private const val FALLBACK_DNS = "8.8.8.8"
+
         private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
         val state: StateFlow<VpnState> = _state.asStateFlow()
 
@@ -1145,13 +1149,20 @@ class TiredVpnService : VpnService() {
         return try {
             val proxyInfo = ProxyInfo.buildDirectProxy("127.0.0.1", config.proxyPort)
 
+            val proxyMtu = 1500
             val builder = Builder()
                 .setSession("TiredVPN Proxy")
-                .setMtu(1500)
+                .setMtu(proxyMtu)
                 .addAddress("10.255.255.1", 32)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
+                .addDnsServer(FALLBACK_DNS)
                 .setHttpProxy(proxyInfo)
+
+            // Apps bypassing the HTTP proxy with a direct v6 socket would otherwise
+            // go out over the native IPv6 route in the clear (issue #55)
+            if (!Ipv6Guard.blackholeIpv6(builder, proxyMtu)) {
+                FileLogger.w(TAG, "Proxy MTU $proxyMtu < ${Ipv6Guard.MIN_IPV6_MTU}: cannot claim ::/0, IPv6 may leak outside the tunnel")
+            }
 
             // Apply split tunneling for this profile
             val usesAllowedApps = applySplitTunneling(builder, config.id)
@@ -2948,8 +2959,16 @@ class TiredVpnService : VpnService() {
             // MTU override: use config.mtu if set (>0), otherwise core-provided MTU
             val effectiveMtu = if (config.mtu > 0) config.mtu else tunConfig.mtu
 
-            // DNS override: use config.customDns if set & valid, otherwise core/fallback DNS
-            val effectiveDns = config.customDns.takeIf { it.isNotBlank() } ?: tunConfig.dns
+            // DNS override: use config.customDns if set & valid, otherwise core/fallback DNS.
+            // An IPv6 resolver would sit behind the ::/0 blackhole installed below and
+            // never answer, so v6 literals are replaced by the IPv4 fallback.
+            val requestedDns = config.customDns.takeIf { it.isNotBlank() } ?: tunConfig.dns
+            val effectiveDns = if (Ipv6Guard.isIpv6Literal(requestedDns)) {
+                FileLogger.w(TAG, "Ignoring IPv6 DNS $requestedDns - unreachable behind the IPv6 blackhole, using $FALLBACK_DNS")
+                FALLBACK_DNS
+            } else {
+                requestedDns
+            }
 
             val builder = Builder()
                 .setSession("TiredVPN")
@@ -2958,9 +2977,15 @@ class TiredVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)  // Route all IPv4
                 .addDnsServer(effectiveDns)
 
+            // Pull IPv6 into the tunnel so it dies here instead of leaking out over
+            // the device's native v6 default route (issue #55)
+            if (!Ipv6Guard.blackholeIpv6(builder, effectiveMtu)) {
+                FileLogger.w(TAG, "MTU $effectiveMtu < ${Ipv6Guard.MIN_IPV6_MTU}: cannot claim ::/0, IPv6 may leak outside the tunnel")
+            }
+
             // Add backup DNS if different
-            if (effectiveDns != "8.8.8.8") {
-                builder.addDnsServer("8.8.8.8")
+            if (effectiveDns != FALLBACK_DNS) {
+                builder.addDnsServer(FALLBACK_DNS)
             }
 
             // Apply split tunneling (handles app inclusion/exclusion) for this profile

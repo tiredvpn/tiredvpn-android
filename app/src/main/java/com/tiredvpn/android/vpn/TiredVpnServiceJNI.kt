@@ -107,15 +107,23 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
                 FileLogger.i(TAG, "STEP 0: Protect server started")
 
                 // Step 1: Build VPN interface
+                // 1280 matches the core TUN MTU default and leaves headroom for
+                // tunnel encapsulation; 1500 caused fragmentation / blackholes
+                // and poor download throughput (issue #27). It is also the IPv6
+                // minimum, so the blackhole below fits.
+                val mtu = 1280
                 val builder = Builder()
                     .setSession("TiredVPN")
-                    // 1280 matches the core TUN MTU default and leaves headroom for
-                    // tunnel encapsulation; 1500 caused fragmentation / blackholes
-                    // and poor download throughput (issue #27).
-                    .setMtu(1280)
+                    .setMtu(mtu)
                     .addAddress("10.9.0.2", 24)
                     .addRoute("0.0.0.0", 0)
                     .addDnsServer("1.1.1.1")
+
+                // Pull IPv6 into the tunnel so it dies here instead of leaking out
+                // over the device's native v6 default route (issue #55)
+                if (!Ipv6Guard.blackholeIpv6(builder, mtu)) {
+                    FileLogger.w(TAG, "MTU $mtu < ${Ipv6Guard.MIN_IPV6_MTU}: cannot claim ::/0, IPv6 may leak outside the tunnel")
+                }
 
                 // Split tunneling
                 // TODO: Implement split tunneling with new config structure
