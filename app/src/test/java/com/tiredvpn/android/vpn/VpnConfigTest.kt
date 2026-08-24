@@ -141,4 +141,39 @@ class VpnConfigTest {
         val config = VpnConfig.fromJson(json)
         assertEquals(36, config.id.length)
     }
+
+    // --- tunnelIpv6 (dual-stack policy) ---
+
+    @Test
+    fun `tunnelIpv6 defaults to off`() {
+        assertEquals("off", validConfig().tunnelIpv6)
+
+        val json = JSONObject().apply {
+            put("serverAddress", "10.0.0.1")
+            put("serverPort", 993)
+            put("secret", "s")
+        }
+        // Old persisted configs lack the field - must stay off (old app + new core)
+        assertEquals("off", VpnConfig.fromJson(json).tunnelIpv6)
+    }
+
+    @Test
+    fun `tunnelIpv6 survives the JSON round-trip`() {
+        val dual = validConfig().copy(tunnelIpv6 = "dual")
+        assertEquals("dual", VpnConfig.fromJson(dual.toJson()).tunnelIpv6)
+
+        val off = validConfig().copy(tunnelIpv6 = "off")
+        assertEquals("off", VpnConfig.fromJson(off.toJson()).tunnelIpv6)
+    }
+
+    @Test
+    fun `tunnelIpv6 survives the URL round-trip only when non-default`() {
+        val dual = validConfig().copy(tunnelIpv6 = "dual")
+        assertEquals("dual", VpnConfig.fromUrl(dual.toUrl())!!.tunnelIpv6)
+
+        // Default off is omitted from the URL to keep it short
+        val off = validConfig()
+        assertFalse(off.toUrl().contains("tunIpv6"))
+        assertEquals("off", VpnConfig.fromUrl(off.toUrl())!!.tunnelIpv6)
+    }
 }

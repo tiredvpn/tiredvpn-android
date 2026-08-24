@@ -163,6 +163,8 @@ class TiredVpnService : VpnService() {
     private var connectedLatencyMs: Long = 0
     private var connectedAttempts: Int = 1
     private var currentVpnIp: String = ""  // Current assigned VPN IP
+    private var currentVpnIp6: String = ""  // Negotiated dual-stack v6 ("" = v4-only session)
+    private var currentVpnServerIp6: String = ""  // Server's tunnel v6 (informational)
 
     // Network monitoring - ignore events right after connection
     private var connectionTime: Long = 0
@@ -776,6 +778,10 @@ class TiredVpnService : VpnService() {
         )
         updateNotification("Connected • $finalIp")
         currentVpnIp = finalIp
+        // Remember the negotiated dual-stack addresses so the network-change
+        // path can recreate the interface with the same v6 configuration.
+        currentVpnIp6 = tunConfig.ip6 ?: ""
+        currentVpnServerIp6 = tunConfig.serverIp6 ?: ""
         FileLogger.i(TAG, "=== VPN CONNECTED === strategy=$connectedStrategy, latency=${connectedLatencyMs}ms, ip=$finalIp")
 
         // Record connection time and reset reconnect counter
@@ -1415,6 +1421,13 @@ class TiredVpnService : VpnService() {
             args.addAll(listOf("-tun-mtu", config.mtu.toString()))
         }
 
+        // IPv6 inside the tunnel (dual-stack handshake v0x04). Old cores warn
+        // about the unknown flag and continue v4-only; the control response
+        // then simply carries no ip6 and we fall back to the leak blackhole.
+        if (config.tunnelIpv6 == "dual") {
+            args.addAll(listOf("-tun-ipv6", "dual"))
+        }
+
         // Android mode - disables os/exec, ICMP checks (causes SIGSYS)
         args.add("-android")
 
@@ -1616,17 +1629,7 @@ class TiredVpnService : VpnService() {
             FileLogger.d(TAG, "connectToControlSocket: status=$status")
 
             if (status == "waiting_fd") {
-                val config = TunnelConfig(
-                    ip = json.getString("ip"),
-                    serverIp = json.optString("server_ip", "10.8.0.1"),
-                    dns = json.optString("dns", "8.8.8.8"),
-                    // 1280 (IPv6 minimum) matches the core's TUN MTU default and
-                    // leaves headroom for tunnel encapsulation. 1400 let segments
-                    // exceed the real path MTU once framed, causing fragmentation
-                    // / PMTUD blackholes and poor download throughput (issue #27).
-                    mtu = json.optInt("mtu", 1280),
-                    routes = json.optString("routes", "0.0.0.0/0")
-                )
+                val config = TunnelConfig.fromJson(json)
                 FileLogger.d(TAG, "connectToControlSocket: SUCCESS - config=$config")
                 config
             } else {
@@ -2642,7 +2645,12 @@ class TiredVpnService : VpnService() {
                     dns = "8.8.8.8",
                     // Keep in sync with the core TUN MTU default (issue #27).
                     mtu = 1280,
-                    routes = "0.0.0.0/0"
+                    routes = "0.0.0.0/0",
+                    // Preserve a negotiated dual-stack across the interface
+                    // swap: the core re-negotiates the same session v6 on
+                    // reconnect (handshake v0x04), so the addresses stay valid.
+                    ip6 = currentVpnIp6.takeIf { it.isNotEmpty() },
+                    serverIp6 = currentVpnServerIp6.takeIf { it.isNotEmpty() }
                 )
 
                 // CRITICAL FIX: Create new interface FIRST, then swap, then close old
@@ -2959,15 +2967,12 @@ class TiredVpnService : VpnService() {
             // MTU override: use config.mtu if set (>0), otherwise core-provided MTU
             val effectiveMtu = if (config.mtu > 0) config.mtu else tunConfig.mtu
 
-            // DNS override: use config.customDns if set & valid, otherwise core/fallback DNS.
-            // An IPv6 resolver would sit behind the ::/0 blackhole installed below and
-            // never answer, so v6 literals are replaced by the IPv4 fallback.
-            val requestedDns = config.customDns.takeIf { it.isNotBlank() } ?: tunConfig.dns
-            val effectiveDns = if (Ipv6Guard.isIpv6Literal(requestedDns)) {
-                FileLogger.w(TAG, "Ignoring IPv6 DNS $requestedDns - unreachable behind the IPv6 blackhole, using $FALLBACK_DNS")
-                FALLBACK_DNS
-            } else {
-                requestedDns
+            // DNS + IPv6 addressing plan: real dual-stack v6 when the core
+            // negotiated it, otherwise today's v4-only setup with the leak
+            // blackhole. Also decides whether a v6 DNS literal is usable.
+            val plan = DualStackPlan.create(tunConfig, config.customDns, FALLBACK_DNS, effectiveMtu)
+            if (plan.dnsSwappedToFallback) {
+                FileLogger.w(TAG, "Ignoring IPv6 DNS ${plan.requestedDns} - unreachable behind the IPv6 blackhole, using $FALLBACK_DNS")
             }
 
             val builder = Builder()
@@ -2975,16 +2980,24 @@ class TiredVpnService : VpnService() {
                 .setMtu(effectiveMtu)
                 .addAddress(effectiveIp, 24)
                 .addRoute("0.0.0.0", 0)  // Route all IPv4
-                .addDnsServer(effectiveDns)
+                .addDnsServer(plan.dns)
 
-            // Pull IPv6 into the tunnel so it dies here instead of leaking out over
-            // the device's native v6 default route (issue #55)
-            if (!Ipv6Guard.blackholeIpv6(builder, effectiveMtu)) {
-                FileLogger.w(TAG, "MTU $effectiveMtu < ${Ipv6Guard.MIN_IPV6_MTU}: cannot claim ::/0, IPv6 may leak outside the tunnel")
+            if (plan.dualStack) {
+                // Dual-stack negotiated (handshake v0x04): real v6 replaces the
+                // leak blackhole - v6 traffic now exits through the tunnel.
+                builder.addAddress(plan.ip6!!, DualStackPlan.IPV6_PREFIX_LENGTH)
+                builder.addRoute("::", 0)  // Route all IPv6 into the tunnel
+                FileLogger.i(TAG, "Dual-stack active: v6 address ${plan.ip6}/${DualStackPlan.IPV6_PREFIX_LENGTH}, server ${plan.serverIp6}")
+            } else {
+                // Pull IPv6 into the tunnel so it dies here instead of leaking out over
+                // the device's native v6 default route (issue #55)
+                if (!Ipv6Guard.blackholeIpv6(builder, effectiveMtu)) {
+                    FileLogger.w(TAG, "MTU $effectiveMtu < ${Ipv6Guard.MIN_IPV6_MTU}: cannot claim ::/0, IPv6 may leak outside the tunnel")
+                }
             }
 
             // Add backup DNS if different
-            if (effectiveDns != FALLBACK_DNS) {
+            if (plan.dns != FALLBACK_DNS) {
                 builder.addDnsServer(FALLBACK_DNS)
             }
 
@@ -3308,8 +3321,34 @@ class TiredVpnService : VpnService() {
         val serverIp: String,
         val dns: String,
         val mtu: Int,
-        val routes: String
-    )
+        val routes: String,
+        // Dual-stack IPv6 inside the tunnel (handshake v0x04). Null when the
+        // core did not negotiate it: old cores, policy off, or a v4-only exit.
+        val ip6: String? = null,
+        val serverIp6: String? = null
+    ) {
+        companion object {
+            /**
+             * Parse the control-socket "waiting_fd" response. Unknown/absent
+             * fields fall back to defaults, so old cores keep working.
+             */
+            fun fromJson(json: JSONObject): TunnelConfig {
+                return TunnelConfig(
+                    ip = json.getString("ip"),
+                    serverIp = json.optString("server_ip", "10.8.0.1"),
+                    dns = json.optString("dns", "8.8.8.8"),
+                    // 1280 (IPv6 minimum) matches the core's TUN MTU default and
+                    // leaves headroom for tunnel encapsulation. 1400 let segments
+                    // exceed the real path MTU once framed, causing fragmentation
+                    // / PMTUD blackholes and poor download throughput (issue #27).
+                    mtu = json.optInt("mtu", 1280),
+                    routes = json.optString("routes", "0.0.0.0/0"),
+                    ip6 = json.optString("ip6", "").takeIf { it.isNotBlank() },
+                    serverIp6 = json.optString("server_ip6", "").takeIf { it.isNotBlank() }
+                )
+            }
+        }
+    }
 
     /**
      * Parse connection info from log lines.

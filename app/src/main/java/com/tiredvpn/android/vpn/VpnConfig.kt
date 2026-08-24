@@ -40,6 +40,8 @@ data class VpnConfig(
     val serverAddressV6: String = "", // "" = no IPv6 endpoint; format host:port or [v6]:port
     val preferIpv6: Boolean = false,
     val fallbackV4: Boolean = true,
+    // IPv6 inside the tunnel: "off" (v4-only, leak blackhole) or "dual" (dual-stack)
+    val tunnelIpv6: String = "off",
     // QUIC SNI fragmentation
     val quicSniFrag: Boolean = false,
     // Tunnel overrides
@@ -88,6 +90,8 @@ data class VpnConfig(
             put("serverAddressV6", serverAddressV6)
             put("preferIpv6", preferIpv6)
             put("fallbackV4", fallbackV4)
+            // IPv6 inside the tunnel
+            put("tunnelIpv6", tunnelIpv6)
             // QUIC SNI fragmentation
             put("quicSniFrag", quicSniFrag)
             // Tunnel overrides
@@ -124,6 +128,7 @@ data class VpnConfig(
         if (serverAddressV6.isNotEmpty()) params.add("serverV6=" + Uri.encode(serverAddressV6))
         if (preferIpv6) params.add("preferIpv6=true")
         if (!fallbackV4) params.add("fallbackV4=false")
+        if (tunnelIpv6 != "off") params.add("tunIpv6=" + Uri.encode(tunnelIpv6))
         if (quicSniFrag) params.add("quicSniFrag=true")
         if (mtu != 0) params.add("mtu=$mtu")
         if (customDns.isNotEmpty()) params.add("dns=" + Uri.encode(customDns))
@@ -197,6 +202,8 @@ data class VpnConfig(
                 serverAddressV6 = json.optString("serverAddressV6", ""),
                 preferIpv6 = json.optBoolean("preferIpv6", false),
                 fallbackV4 = json.optBoolean("fallbackV4", true),
+                // IPv6 inside the tunnel
+                tunnelIpv6 = json.optString("tunnelIpv6", "off"),
                 // QUIC SNI fragmentation
                 quicSniFrag = json.optBoolean("quicSniFrag", false),
                 // Tunnel overrides
@@ -283,6 +290,7 @@ data class VpnConfig(
                     serverAddressV6 = uri.getQueryParameter("serverV6") ?: "",
                     preferIpv6 = uri.getQueryParameter("preferIpv6")?.toBooleanStrictOrNull() ?: false,
                     fallbackV4 = uri.getQueryParameter("fallbackV4")?.toBooleanStrictOrNull() ?: true,
+                    tunnelIpv6 = uri.getQueryParameter("tunIpv6") ?: "off",
                     quicSniFrag = uri.getQueryParameter("quicSniFrag")?.toBooleanStrictOrNull() ?: false,
                     mtu = uri.getQueryParameter("mtu")?.toIntOrNull() ?: 0,
                     customDns = uri.getQueryParameter("dns") ?: ""

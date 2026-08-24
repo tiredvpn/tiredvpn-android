@@ -219,6 +219,9 @@ class SettingsActivity : BaseActivity() {
         binding.preferIpv6Switch.isChecked = config.preferIpv6
         binding.fallbackV4Switch.isChecked = config.fallbackV4
 
+        // IPv6 inside the tunnel (dual-stack)
+        binding.tunnelIpv6Switch.isChecked = config.tunnelIpv6 == "dual"
+
         // Custom MTU
         binding.mtuValue.text = if (config.mtu > 0) config.mtu.toString() else getString(R.string.auto)
 
@@ -261,6 +264,8 @@ class SettingsActivity : BaseActivity() {
         binding.preferIpv6Row.alpha = alpha
         binding.fallbackV4Switch.isEnabled = enabled
         binding.fallbackV4Row.alpha = alpha
+        binding.tunnelIpv6Switch.isEnabled = enabled
+        binding.tunnelIpv6Row.alpha = alpha
         binding.mtuRow.isEnabled = enabled
         binding.mtuRow.alpha = alpha
         binding.dnsRow.isEnabled = enabled
@@ -376,6 +381,14 @@ class SettingsActivity : BaseActivity() {
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.fallbackV4Switch.isEnabled) {
                 ServerRepository.saveServer(this, config.copy(fallbackV4 = isChecked))
+            }
+        }
+
+        // IPv6 inside the tunnel (dual-stack) toggle
+        binding.tunnelIpv6Switch.setOnCheckedChangeListener { _, isChecked ->
+            val config = ServerRepository.getActiveServer(this)
+            if (config != null && binding.tunnelIpv6Switch.isEnabled) {
+                ServerRepository.saveServer(this, config.copy(tunnelIpv6 = if (isChecked) "dual" else "off"))
             }
         }
 

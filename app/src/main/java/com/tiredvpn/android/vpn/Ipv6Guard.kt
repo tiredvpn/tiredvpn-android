@@ -14,7 +14,10 @@ import android.net.VpnService
  * ::/0 with a ULA address that nothing ever answers on: IPv6 packets are pulled
  * into the TUN and dropped by the core instead of escaping to the carrier.
  *
- * Dual-stack *inside* the tunnel is a separate, later step - this only blocks.
+ * Dual-stack *inside* the tunnel (`-tun-ipv6 dual`, handshake v0x04) replaces
+ * this guard: when the core negotiates real v6 addresses, establishVpn()
+ * installs them and does NOT call [blackholeIpv6]. This guard stays the
+ * default for v4-only sessions (policy off, old cores, v4-only exits).
  */
 object Ipv6Guard {
 
