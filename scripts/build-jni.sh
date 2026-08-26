@@ -19,7 +19,9 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CORE_DIR="/tmp/tiredvpn-core"
 OUTPUT_DIR="app/src/main/jniLibs"
 CORE_REPO="https://github.com/tiredvpn/tiredvpn.git"
-VERSION="1.3.0-android-jni"
+# Empty by default: the real version is read from the core checkout below so it
+# can never drift away from the code that actually gets compiled.
+VERSION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,21 @@ if [[ ! -d "$CORE_DIR" ]]; then
   echo "==> Cloning tiredvpn core into $CORE_DIR"
   git clone --depth 1 "$CORE_REPO" "$CORE_DIR"
 fi
+
+if [[ -z "$VERSION" ]]; then
+  if [[ ! -f "$CORE_DIR/VERSION" ]]; then
+    echo "ERROR: $CORE_DIR/VERSION not found and --version was not given"
+    exit 1
+  fi
+  VERSION="$(tr -d '[:space:]' < "$CORE_DIR/VERSION")-android-jni"
+fi
+
+if [[ -z "$VERSION" || "$VERSION" == "-android-jni" ]]; then
+  echo "ERROR: could not determine core version from $CORE_DIR/VERSION"
+  exit 1
+fi
+
+echo "==> Core version: $VERSION"
 
 ARCHITECTURES="arm64 arm x86_64"
 
