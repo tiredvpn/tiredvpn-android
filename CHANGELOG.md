@@ -7,6 +7,93 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-27
+
+### Added
+
+- **IPv6 inside the tunnel actually works now.** The dual-stack switch in
+  settings has been sending `-tun-ipv6 dual` to the core, but the core it was
+  talking to did not know the flag: the app shipped Go core 1.3.27 and
+  `-tun-ipv6` only arrived in core 1.4.0. The core's argument parser logs an
+  unknown token and carries on, so nothing broke - the option was simply inert,
+  and every session stayed IPv4-only no matter how the switch was set. This
+  release bundles core 1.7.1, where the flag exists. With the switch on and an
+  exit configured with `-ip-pool-v6`, the tunnel negotiates an IPv6 address pair
+  (handshake `0x04`) and IPv6-only destinations are reached through the VPN
+  instead of around it.
+  - **Your exit and any relay in front of it must be on core 1.4.0 or newer.**
+    A relay older than that does not fall back to IPv4 - it forwards the
+    dual-stack extension bytes downstream as tunnel traffic and corrupts the
+    session. Against an up-to-date exit that simply lacks `-ip-pool-v6`, the
+    negotiation declines cleanly and the session stays IPv4-only.
+  - The switch stays off by default. Unlike desktop, where core 1.5.0 made
+    `dual` the default, the Android path treats an absent flag as `off`, so
+    leaving the switch alone keeps the previous behaviour exactly.
+- **IPv6 can no longer leak around the tunnel.** The VPN interface now claims
+  `::/0` even on an IPv4-only session, so an application with a working IPv6
+  default route can no longer reach the internet outside the VPN and hand out
+  the real address (core issue #55). On Android this is `VpnService`'s job
+  rather than the core's - the core's nftables-based `block` policy is Linux
+  only.
+
+### Security
+
+Both of these come from core 1.4.2 and affect every REALITY connection the app
+makes, IPv6 or not.
+
+- **Every REALITY connection made by one client reused a single ChaCha20
+  keystream.** The data key and nonce were derived from inputs that were
+  constant for the life of the process, so each connection started encrypting
+  from counter zero with the same keystream. XORing two captured connections
+  cancelled it and left the XOR of two plaintexts, under which sits smux with
+  fixed header fields - recovering traffic did not require the key. The X25519
+  key pair is now generated per connection.
+- **REALITY data records are authenticated and forward-secret (data layer v2).**
+  Records are sealed with ChaCha20-Poly1305 under a key from a per-connection
+  X25519 exchange with an explicit record counter. Before this an active
+  middlebox could flip bits inside the tunnel unnoticed, and a leaked password
+  decrypted any recorded traffic. An unupgraded exit keeps working; version
+  negotiation rides inside the existing padding block.
+
+### Fixed
+
+Client-visible fixes accumulated in the core between 1.3.27 and 1.7.1.
+
+- **A client given both an IPv4 and an IPv6 endpoint could fail to connect at
+  all.** The connectivity gate probed over one family while waiting on a blocked
+  address of the other, so it never got past the pre-flight check (core 1.4.0).
+- **A fragmented handshake response silently desynced the tunnel.** Only the
+  9-byte prefix was guaranteed to be read, leaving the tail in the stream for
+  the packet loop to parse as a frame header. Responses are now read to
+  completion (core 1.4.0).
+- **A profile with several servers waited on the first one instead of moving
+  on.** An unreachable first server was indistinguishable from a dead network,
+  so the client sat in the wait loop with healthy alternatives configured and
+  untried (core 1.5.1).
+- **Clients sharing one secret shared one tunnel address and evicted each other
+  every thirty seconds**, each eviction landing on a connection that had just
+  carried traffic, until the client gave up on REALITY and fell back to a slower
+  transport (core 1.5.0).
+- **The log claimed a local proxy that Android never runs.** `Listening on
+  <addr> (SOCKS5/HTTP)` was printed at startup before any socket was opened and
+  regardless of mode, so it appeared in every Android session, which uses the
+  control socket instead (core 1.7.0).
+
+### Changed
+
+- **Bundles Go core 1.7.1** (was 1.3.27). Beyond the items above it brings a
+  server pool with the IPv4/IPv6 fallback folded into it, and a transport family
+  that is re-decided at runtime rather than settled once per process - an IPv6
+  path that dies mid-session no longer keeps being dialled until a restart.
+- **QUIC/Salamander changed its wire format and does not negotiate.** Core 1.6.0
+  widened the UDP authenticity tag from 2 bytes to 8, closing a 1-in-65536 false
+  accept that let a packet from a foreign secret through. If you have QUIC
+  enabled in settings, the exit must be on core 1.6.0 or newer or no packet will
+  match and the transport will not carry anything.
+- `scripts/build-jni.sh` reads the core version from the core checkout instead
+  of a hardcoded string, which had been reporting `1.3.0-android-jni` for builds
+  of every version since.
+
 ## [1.4.8] - 2026-08-07
 
 ### Added
