@@ -44,6 +44,18 @@
                 android:textStyle="bold"
                 tools:text="United States - New York" />
 
+            <!-- Failover pool membership; GONE for servers outside the pool -->
+            <TextView
+                android:id="@+id/poolLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/text_secondary_dark"
+                android:textSize="12sp"
+                android:visibility="gone"
+                tools:text="Fails over to 2 other server(s)"
+                tools:visibility="visible" />
+
         </LinearLayout>
 
         <!-- Latency Text -->

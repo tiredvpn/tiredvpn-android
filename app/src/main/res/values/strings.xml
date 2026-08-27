@@ -231,4 +231,7 @@
     <string name="restore_invalid">No valid server configs found in the file</string>
     <string name="restore_found">Found %1$d server(s) in the file. Import them?</string>
     <string name="restore_done">Imported %1$d server(s)</string>
+    <string name="pool_active">Fails over to %1$d other server(s)</string>
+    <string name="pool_alone">No failover: no other server shares this secret</string>
+    <string name="pool_member">In the failover pool</string>
 </resources>
