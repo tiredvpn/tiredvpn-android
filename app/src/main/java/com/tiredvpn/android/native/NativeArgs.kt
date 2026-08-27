@@ -86,13 +86,21 @@ object NativeArgs {
      * the shell will see.
      */
     fun shellWrapperLog(args: List<String>): String =
-        "${joinForShell(redacted(args))}"
+        "$SHELL -c ${joinForShell(redacted(args))}"
 
     /** Join into one shell word list, quoting args that contain spaces. */
     private fun joinForShell(args: List<String>): String =
         args.joinToString(" ") { if (it.contains(" ")) "\"$it\"" else it }
 
-    /** Does this element look like a joined command line with a flag inside it? */
+    /**
+     * Does this element look like a joined command line with a flag inside it?
+     *
+     * The flag on its own cannot match: every pattern here is the flag plus a
+     * following character, so an element equal to the flag is always shorter
+     * than what is being looked for. An explicit `arg !in SECRET_FLAGS` guard
+     * was tried and removed - breaking it changed no test, because it could not
+     * change an outcome.
+     */
     private fun carriesEmbeddedSecret(arg: String): Boolean =
-        arg !in SECRET_FLAGS && SECRET_FLAGS.any { arg.contains("$it ") || arg.contains("$it\"") }
+        SECRET_FLAGS.any { arg.contains("$it ") || arg.contains("$it\"") }
 }
