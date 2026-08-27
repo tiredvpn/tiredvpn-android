@@ -7,6 +7,28 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-27
+
+### Added
+
+- **The app hands the core a pool of servers, so a dead exit no longer means a
+  dead connection.** Until now it dialled one server and stayed there: if that
+  exit went down, nothing switched and the tunnel stayed broken until someone
+  picked another server by hand. The server list is now written out as a config
+  the core reads, and the core does the dialling, the failing over and the
+  cooldown on its own.
+  - The pool is the active server plus every other server that shares its
+    secret, active first. That is not a UI choice but a property of the core: a
+    secret is fixed when a transport strategy is built, so it cannot change on a
+    switch, and a pool with mixed secrets is refused outright. A server with a
+    secret nobody else uses gives a pool of one and behaves exactly as before.
+  - The server list now marks which entries travel together, and says so plainly
+    when a server stands alone, rather than leaving a fallback to be assumed.
+  - No background polling of the other servers. Probing N hosts on a timer is a
+    periodic fan-out with nothing behind it, which is the kind of pattern worth
+    not having on a censorship-resistant client; the core finds out a server is
+    back by dialling it when it needs one.
+
 ## [1.5.0] - 2026-08-27
 
 ### Added
