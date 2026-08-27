@@ -1,6 +1,7 @@
 package com.tiredvpn.android.ui
 
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
@@ -21,9 +22,17 @@ class ServerAdapter(
     private val onServerLongClick: (VpnConfig) -> Unit
 ) : RecyclerView.Adapter<ServerAdapter.ServerViewHolder>() {
 
-    fun updateList(newServers: List<VpnConfig>, newActiveId: String?) {
+    /**
+     * Ids of the servers the core may switch between, active one included.
+     * The core takes one secret for the whole pool, so this is the active
+     * server plus everyone sharing its secret - see ServerPoolConfig.
+     */
+    private var poolIds: Set<String> = emptySet()
+
+    fun updateList(newServers: List<VpnConfig>, newActiveId: String?, newPoolIds: Set<String> = emptySet()) {
         servers = newServers
         activeServerId = newActiveId
+        poolIds = newPoolIds
         notifyDataSetChanged()
     }
 
@@ -45,6 +54,8 @@ class ServerAdapter(
         
         fun bind(server: VpnConfig) {
             binding.serverName.text = server.name.ifEmpty { server.serverAddress }
+
+            bindPoolLabel(server)
 
             // Detect country and set flag
             scope.launch {
@@ -92,10 +103,33 @@ class ServerAdapter(
             }
 
             binding.root.setOnClickListener { onServerClick(server) }
-            binding.root.setOnLongClickListener { 
+            binding.root.setOnLongClickListener {
                 onServerLongClick(server)
                 true
             }
+        }
+
+        /**
+         * Say which servers the connection can move to on its own. Silence here
+         * would read as "failover works everywhere", which it does not: a
+         * server with a secret of its own has nowhere to go.
+         */
+        private fun bindPoolLabel(server: VpnConfig) {
+            val label = binding.poolLabel
+            val context = binding.root.context
+            when {
+                server.id == activeServerId && poolIds.size > 1 ->
+                    label.text = context.getString(R.string.pool_active, poolIds.size - 1)
+                server.id == activeServerId ->
+                    label.text = context.getString(R.string.pool_alone)
+                poolIds.contains(server.id) ->
+                    label.text = context.getString(R.string.pool_member)
+                else -> {
+                    label.visibility = View.GONE
+                    return
+                }
+            }
+            label.visibility = View.VISIBLE
         }
     }
 }

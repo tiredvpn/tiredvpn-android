@@ -11,6 +11,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityServerLocationsBinding
+import com.tiredvpn.android.vpn.ServerPoolConfig
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
 
@@ -124,10 +125,16 @@ class ServerListActivity : BaseActivity() {
     private fun refreshList() {
         val servers = ServerRepository.getServers(this)
         val activeServer = ServerRepository.getActiveServer(this)
-        adapter.updateList(servers, activeServer?.id)
-        
+        adapter.updateList(servers, activeServer?.id, poolIdsFor(servers, activeServer))
+
         // Ping servers in background
         pingServers(servers)
+    }
+
+    /** Ids of the servers the core may fail over between, active one included. */
+    private fun poolIdsFor(servers: List<VpnConfig>, active: VpnConfig?): Set<String> {
+        if (active == null) return emptySet()
+        return ServerPoolConfig.selectPool(servers, active).map { it.id }.toSet()
     }
     
     private fun pingServers(servers: List<VpnConfig>) {
@@ -149,7 +156,11 @@ class ServerListActivity : BaseActivity() {
                     runOnUiThread {
                          val currentServers = ServerRepository.getServers(this@ServerListActivity)
                          val currentActive = ServerRepository.getActiveServer(this@ServerListActivity)
-                         adapter.updateList(currentServers, currentActive?.id)
+                         adapter.updateList(
+                             currentServers,
+                             currentActive?.id,
+                             poolIdsFor(currentServers, currentActive)
+                         )
                     }
                 }
             }
