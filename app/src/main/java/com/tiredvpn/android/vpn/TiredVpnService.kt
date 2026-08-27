@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import com.tiredvpn.android.util.FileLogger
 import com.tiredvpn.android.R
 import com.tiredvpn.android.TiredVpnApp
+import com.tiredvpn.android.native.NativeArgs
 import com.tiredvpn.android.native.NativeProcess
 import com.tiredvpn.android.native.NativeProcessJNI
 import com.tiredvpn.android.native.TiredVpnNative
@@ -968,7 +969,12 @@ class TiredVpnService : VpnService() {
         val pool = ServerPoolConfig.selectPool(ServerRepository.getServers(this), config)
         val poolConfigPath = preparePoolConfig(config, pool, emptyMap())
 
-        // Proxy mode: no -tun, no -control-socket, just -listen
+        // Proxy mode: no -tun, no -control-socket, just -listen.
+        //
+        // -secret is the active server's key and stays here even with a pool
+        // file, where every entry names its own: the core reads it as the
+        // default for entries that name none, so it is inert with a pool and is
+        // the only key on the -server path a one-server pool falls back to.
         val args = mutableListOf(
             binaryFile.absolutePath,
             "client",
@@ -1039,9 +1045,7 @@ class TiredVpnService : VpnService() {
         // Debug logging controlled by settings toggle
         if (config.debugLogging) args.add("-debug")
 
-        FileLogger.d(TAG, "Starting tiredvpn (proxy mode): ${args.joinToString(" ") {
-            if (it == config.secret) "***" else it
-        }}")
+        FileLogger.d(TAG, "Starting tiredvpn (proxy mode): ${NativeArgs.redact(args)}")
 
         // Use JNI mode on all Android versions to avoid SELinux restrictions
         // Android 10+ blocks execution of standalone binaries from app storage
@@ -1422,6 +1426,10 @@ class TiredVpnService : VpnService() {
         // This prevents process leaks during reconnects
         NativeProcess.killAllTiredVpnProcesses(filesDir.absolutePath)
 
+        // -secret is the active server's key. With a pool file every entry names
+        // its own and the core only consults this one as the default for entries
+        // that do not - see ServerPoolConfig.render. It is kept because the
+        // -server path a one-server pool degenerates to has no other key.
         val args = mutableListOf(
             "tiredvpn",
             "client",
@@ -1512,9 +1520,7 @@ class TiredVpnService : VpnService() {
         // Debug logging controlled by settings toggle (significant per-packet overhead)
         if (config.debugLogging) args.add("-debug")
 
-        FileLogger.d(TAG, "Starting tiredvpn: ${args.joinToString(" ") {
-            if (it == config.secret) "***" else it
-        }}")
+        FileLogger.d(TAG, "Starting tiredvpn: ${NativeArgs.redact(args)}")
 
         // Use JNI mode on all Android versions to avoid SELinux restrictions
         // Android 10+ blocks execution of standalone binaries from app storage

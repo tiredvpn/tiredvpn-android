@@ -37,27 +37,38 @@ class ServerPoolConfigTest {
     // --- pool selection ---
 
     @Test
-    fun `pool is the active server first then everyone sharing its secret`() {
+    fun `pool is the active server first then every other configured server`() {
         val a = server("a")
         val b = server("b")
         val other = server("c", secret = "another-secret")
         val pool = ServerPoolConfig.selectPool(listOf(other, a, b), a)
 
+        assertEquals(listOf("a", "c", "b"), pool.map { it.id })
+    }
+
+    @Test
+    fun `a server with a secret of its own is in the pool, not excluded from it`() {
+        val a = server("a", secret = "mine")
+        val pool = ServerPoolConfig.selectPool(listOf(a, server("b", secret = "theirs")), a)
+
         assertEquals(listOf("a", "b"), pool.map { it.id })
     }
 
     @Test
-    fun `a unique secret yields a pool of one`() {
+    fun `a member with a blank secret is left out, it has no key to write`() {
         val a = server("a", secret = "mine")
-        val pool = ServerPoolConfig.selectPool(listOf(a, server("b", secret = "theirs")), a)
+        val pool = ServerPoolConfig.selectPool(
+            listOf(a, server("b", secret = ""), server("c", secret = "theirs")),
+            a
+        )
 
-        assertEquals(listOf("a"), pool.map { it.id })
+        assertEquals(listOf("a", "c"), pool.map { it.id })
     }
 
     @Test
-    fun `a blank secret does not match other blank secrets`() {
+    fun `a blank secret on the active server collapses the pool to one`() {
         val a = server("a", secret = "")
-        val pool = ServerPoolConfig.selectPool(listOf(a, server("b", secret = "")), a)
+        val pool = ServerPoolConfig.selectPool(listOf(a, server("b", secret = "theirs")), a)
 
         assertEquals(listOf("a"), pool.map { it.id })
     }
@@ -169,10 +180,15 @@ class ServerPoolConfigTest {
 
     // --- rendered document ---
 
+    // The whole chain, not render() on hand-built entries: the assertion has to
+    // fail if selectPool drops the second server, if entries() reads the wrong
+    // server's secret, or if render() omits the key. Two DIFFERENT secrets are
+    // the point - with one shared value, an entries() that copied the active
+    // server's key onto every entry would still pass.
     @Test
-    fun `a two server pool renders both entries and the selection block`() {
-        val a = server("a", name = "ams", address = "198.51.100.1", addressV6 = "[2001:db8::1]:995")
-        val b = server("b", name = "fra", address = "198.51.100.2", port = 443)
+    fun `a two server pool renders both entries with their own secrets`() {
+        val a = server("a", name = "ams", address = "198.51.100.1", addressV6 = "[2001:db8::1]:995", secret = "ams-key")
+        val b = server("b", name = "fra", address = "198.51.100.2", port = 443, secret = "fra-key")
         val entries = ServerPoolConfig.entries(ServerPoolConfig.selectPool(listOf(a, b), a))
 
         assertEquals(
@@ -186,11 +202,13 @@ class ServerPoolConfigTest {
             port = 995
             address_v6 = "2001:db8::1"
             port_v6 = 995
+            secret = "ams-key"
 
             [[servers]]
             name = "fra"
             address = "198.51.100.2"
             port = 443
+            secret = "fra-key"
 
             [selection]
             policy = "priority"
@@ -206,13 +224,28 @@ class ServerPoolConfigTest {
     }
 
     @Test
-    fun `the secret never reaches the file`() {
-        val a = server("a", secret = "s3cr3t-value")
+    fun `every entry carries its own secret, never the active server's`() {
+        val a = server("a", name = "ams", secret = "ams-key")
+        val b = server("b", name = "fra", address = "198.51.100.2", secret = "fra-key")
+        val toml = ServerPoolConfig.render(
+            ServerPoolConfig.entries(ServerPoolConfig.selectPool(listOf(a, b), a)),
+            a
+        )
+
+        assertEquals(listOf("""secret = "ams-key"""", """secret = "fra-key""""), secretLines(toml))
+    }
+
+    @Test
+    fun `a secret with a quote is escaped instead of breaking the document`() {
+        val a = server("a", secret = """ke"y\1""")
         val toml = ServerPoolConfig.render(ServerPoolConfig.entries(listOf(a)), a)
 
-        assertTrue(toml, !toml.contains("s3cr3t-value"))
-        assertTrue(toml, !toml.contains("secret"))
+        assertEquals(listOf("""secret = "ke\"y\\1""""), secretLines(toml))
     }
+
+    /** The `secret = ...` lines of a rendered document, in order. */
+    private fun secretLines(toml: String) =
+        toml.lines().map { it.trim() }.filter { it.startsWith("secret") }
 
     @Test
     fun `health_check stays out of the file`() {

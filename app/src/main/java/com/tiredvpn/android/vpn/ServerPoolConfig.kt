@@ -12,11 +12,11 @@ import java.io.File
  *
  * Two facts from the core shape everything here:
  *
- *  - One secret for the whole pool. `internal/client/endpoints.go`
- *    (reconcileSecrets) rejects a list whose entries disagree, because a
- *    strategy bakes the secret in when it is built and cannot swap it on a
- *    switch. Hence [selectPool]: the pool is the active server plus every other
- *    server that shares its secret, and nothing else.
+ *  - A secret per entry. Core 1.8.0 made the key a property of the dial: it
+ *    travels on the context and comes from whichever endpoint is being reached
+ *    (`internal/strategy/secret.go`), so `[[servers]]` entries may disagree
+ *    and `reconcileSecrets` no longer rejects them. Before that the pool had to
+ *    be one secret wide, which is why [selectPool] used to filter.
  *  - `-server` collapses the list. The JNI arg parser sets `sawServerFlag` and
  *    calls `collapseServers(...)`, silently reducing the pool to one entry. A
  *    caller passing this file MUST drop `-server` and `-server-v6`.
@@ -47,23 +47,34 @@ object ServerPoolConfig {
         val port: Int,
         /** Unbracketed IPv6 literal, "" when the entry has no v6 endpoint. */
         val addressV6: String = "",
-        val portV6: Int = 0
+        val portV6: Int = 0,
+        /**
+         * The key this endpoint is dialled with. Blank means the entry falls
+         * back to the process default (`-secret`), which after [selectPool] can
+         * only happen to the active server.
+         */
+        val secret: String = ""
     )
 
     /** A host with its port, after splitting an "address:port" string. */
     data class HostPort(val host: String, val port: Int)
 
     /**
-     * The servers the core is allowed to switch between: [active] first
-     * (the priority policy dials in list order), then every other server
-     * carrying the same secret, in repository order.
+     * The servers the core is allowed to switch between: [active] first (the
+     * priority policy dials in list order), then every other configured server
+     * in repository order. Secrets no longer group anything - each entry
+     * carries its own key into the file, so a switch switches the key with it.
      *
-     * A blank secret is not a match for anything - it means the server is not
-     * configured yet, not that it belongs to every pool.
+     * The one thing still filtered out is a server with a blank secret, and for
+     * a different reason than before: it has no key to write, so it would land
+     * in the file as an entry that silently borrows the process default and
+     * then fails to authenticate. It is a half-filled form, not a destination.
+     * The same test applied to [active] short-circuits the whole pool, which
+     * keeps the file self-sufficient - every entry it contains names its key.
      */
     fun selectPool(servers: List<VpnConfig>, active: VpnConfig): List<VpnConfig> {
         if (active.secret.isBlank()) return listOf(active)
-        val rest = servers.filter { it.id != active.id && it.secret == active.secret }
+        val rest = servers.filter { it.id != active.id && it.secret.isNotBlank() }
         return listOf(active) + rest
     }
 
@@ -132,7 +143,8 @@ object ServerPoolConfig {
                     address = v4?.host ?: "",
                     port = v4?.port ?: 0,
                     addressV6 = v6?.host ?: "",
-                    portV6 = v6?.port ?: 0
+                    portV6 = v6?.port ?: 0,
+                    secret = server.secret
                 )
             )
         }
@@ -212,12 +224,18 @@ object ServerPoolConfig {
     /**
      * Render the config text.
      *
-     * The secret is deliberately absent. The core accepts a per-entry `secret`,
-     * but the pool is single-secret by construction and the value already
-     * reaches the core as `-secret`, which on Android is an in-process argument
-     * array rather than a visible argv. Writing it here would put a second copy
-     * on disk and buy nothing; leaving it out makes reconcileSecrets a no-op
-     * and the client keeps using the flag's value.
+     * Every entry carries its `secret`. There is no other channel: `-secret` is
+     * a single process-wide value, so a pool whose members disagree can only
+     * state its keys here. That makes this file the app's whole keyring rather
+     * than a list of addresses - see [write] for what follows from that.
+     *
+     * `-secret` stays on the command line anyway, set to the active server's
+     * key. The core treats it as the default for entries that name none
+     * (`reconcileSecrets`, `strategy.Manager.defaultSecret`), so with every
+     * entry naming one it is never consulted for a dial; what it does buy is
+     * the degenerate path, where a pool of one falls back to `-server` and the
+     * file is not written at all. Dropping the flag would leave that path with
+     * no key and the core warning "No secret provided - using default".
      *
      * `health_check` is left off for the reason the core's example config gives:
      * polling N servers on a timer is a periodic fan-out pattern with no cover
@@ -241,6 +259,12 @@ object ServerPoolConfig {
             if (e.addressV6.isNotEmpty()) {
                 sb.append("address_v6 = ").append(quote(e.addressV6)).append('\n')
                 sb.append("port_v6 = ").append(e.portV6).append('\n')
+            }
+            // Through the same escaper as the name: a secret is user input too,
+            // and a quote in one would end the string and turn the rest of the
+            // key into TOML the core then rejects.
+            if (e.secret.isNotEmpty()) {
+                sb.append("secret = ").append(quote(e.secret)).append('\n')
             }
         }
 
@@ -280,10 +304,12 @@ object ServerPoolConfig {
      * back the file. Overwrites whatever was there: the pool is rebuilt from
      * the repository on every connect.
      *
-     * The file names every endpoint the user dials, so it is clamped to
-     * owner-only even though the directory is already app-private, and it never
-     * goes to the cache directory - the system may hand that to another
-     * process's cleaner.
+     * The file names every endpoint the user dials AND the key for each, so it
+     * is clamped to owner-only even though the directory is already app-private,
+     * and it never goes to the cache directory - the system may hand that to
+     * another process's cleaner. It is deleted when the core stops
+     * (TiredVpnService cleanup and forceResetCore both call [delete]), so the
+     * keyring exists on disk only while the tunnel it feeds does.
      */
     fun write(dir: File, contents: String): File {
         val file = File(dir, FILE_NAME)

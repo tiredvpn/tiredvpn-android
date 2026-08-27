@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.tiredvpn.android.R
 import com.tiredvpn.android.TiredVpnApp
+import com.tiredvpn.android.native.NativeArgs
 import com.tiredvpn.android.native.TiredVpnNative
 import com.tiredvpn.android.ui.MainActivity
 import com.tiredvpn.android.util.FileLogger
@@ -146,7 +147,7 @@ class TiredVpnServiceJNI : VpnService(), TiredVpnNative.NativeCallback {
                 val serverEndpoint = "${config.serverAddress}:${config.serverPort}"
                 val args = buildArgs(config, serverEndpoint, protectPath)
 
-                FileLogger.i(TAG, "Starting native client with args: ${args.joinToString(" ")}")
+                FileLogger.i(TAG, "Starting native client with args: ${NativeArgs.redact(args)}")
 
                 // Step 4: Start native client (non-blocking)
                 val result = TiredVpnNative.start(args)

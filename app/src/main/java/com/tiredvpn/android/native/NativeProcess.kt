@@ -116,20 +116,22 @@ class NativeProcess(
             }
 
             FileLogger.i(TAG, "=== STARTING NATIVE PROCESS ===")
-            FileLogger.i(TAG, "Command: ${args.joinToString(" ")}")
+            FileLogger.i(TAG, "Command: ${NativeArgs.redact(args)}")
 
             // CRITICAL FIX: Android 10+ prevents direct execution of binaries from app storage
             // Use shell wrapper to bypass this restriction
             // Instead of: /path/to/binary arg1 arg2
             // We do: /system/bin/sh -c "/path/to/binary arg1 arg2"
-            val shellArgs = mutableListOf("/system/bin/sh", "-c")
-            val cmdLine = args.joinToString(" ") { arg ->
-                // Quote arguments that contain spaces
-                if (arg.contains(" ")) "\"$arg\"" else arg
-            }
-            shellArgs.add(cmdLine)
+            //
+            // Both built by NativeArgs. Once the args are joined, `-secret` is no
+            // longer an element of its own and element-wise redaction walks
+            // straight past the key, so the log line has to be rendered from the
+            // flat list and joined after - the opposite order from the command
+            // itself. Keeping both in one place is what stops the line in the log
+            // from describing a different command than the one that ran.
+            val shellArgs = NativeArgs.shellWrapper(args)
 
-            FileLogger.i(TAG, "Shell wrapper command: ${shellArgs.joinToString(" ")}")
+            FileLogger.i(TAG, "Shell wrapper command: ${NativeArgs.shellWrapperLog(args)}")
 
             // Use Runtime.exec() instead of ProcessBuilder
             // This gives us more control over the process lifecycle

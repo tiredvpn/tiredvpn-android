@@ -24,8 +24,9 @@ class ServerAdapter(
 
     /**
      * Ids of the servers the core may switch between, active one included.
-     * The core takes one secret for the whole pool, so this is the active
-     * server plus everyone sharing its secret - see ServerPoolConfig.
+     * Since core 1.8.0 the key travels with the dial, so this is every
+     * configured server rather than the ones sharing a secret - see
+     * ServerPoolConfig.selectPool.
      */
     private var poolIds: Set<String> = emptySet()
 
@@ -110,24 +111,29 @@ class ServerAdapter(
         }
 
         /**
-         * Say which servers the connection can move to on its own. Silence here
-         * would read as "failover works everywhere", which it does not: a
-         * server with a secret of its own has nowhere to go.
+         * Say how far the connection can move on its own, on the active row and
+         * nowhere else.
+         *
+         * The per-row "in the failover pool" badge is gone with the rule that
+         * made it worth saying. It marked the subset sharing the active
+         * server's secret, back when that was the subset the core would switch
+         * between; now every configured server is, so the badge would sit on
+         * every row and tell the user nothing. The one number that still
+         * carries information is how many there are, which belongs on the
+         * active row.
          */
         private fun bindPoolLabel(server: VpnConfig) {
             val label = binding.poolLabel
             val context = binding.root.context
             when {
-                server.id == activeServerId && poolIds.size > 1 ->
-                    label.text = context.getString(R.string.pool_active, poolIds.size - 1)
-                server.id == activeServerId ->
-                    label.text = context.getString(R.string.pool_alone)
-                poolIds.contains(server.id) ->
-                    label.text = context.getString(R.string.pool_member)
-                else -> {
+                server.id != activeServerId -> {
                     label.visibility = View.GONE
                     return
                 }
+                poolIds.size > 1 ->
+                    label.text = context.getString(R.string.pool_active, poolIds.size - 1)
+                else ->
+                    label.text = context.getString(R.string.pool_alone)
             }
             label.visibility = View.VISIBLE
         }
