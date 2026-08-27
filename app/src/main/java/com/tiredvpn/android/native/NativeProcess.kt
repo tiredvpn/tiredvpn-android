@@ -116,7 +116,7 @@ class NativeProcess(
             }
 
             FileLogger.i(TAG, "=== STARTING NATIVE PROCESS ===")
-            FileLogger.i(TAG, "Command: ${args.joinToString(" ")}")
+            FileLogger.i(TAG, "Command: ${NativeArgs.redact(args)}")
 
             // CRITICAL FIX: Android 10+ prevents direct execution of binaries from app storage
             // Use shell wrapper to bypass this restriction
@@ -129,7 +129,7 @@ class NativeProcess(
             }
             shellArgs.add(cmdLine)
 
-            FileLogger.i(TAG, "Shell wrapper command: ${shellArgs.joinToString(" ")}")
+            FileLogger.i(TAG, "Shell wrapper command: ${NativeArgs.redact(shellArgs)}")
 
             // Use Runtime.exec() instead of ProcessBuilder
             // This gives us more control over the process lifecycle

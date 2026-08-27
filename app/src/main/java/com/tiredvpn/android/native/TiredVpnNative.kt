@@ -77,7 +77,7 @@ object TiredVpnNative {
      * @return 0 on success, non-zero on error
      */
     fun start(args: Array<String>): Int {
-        FileLogger.i(TAG, "Starting client with ${args.size} args: ${args.joinToString(" ")}")
+        FileLogger.i(TAG, "Starting client with ${args.size} args: ${NativeArgs.redact(args)}")
         return startClient(args)
     }
 

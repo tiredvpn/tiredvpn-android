@@ -37,7 +37,7 @@ class NativeProcessJNI(
 
         try {
             FileLogger.i(TAG, "=== STARTING NATIVE PROCESS (JNI MODE) ===")
-            FileLogger.i(TAG, "Command: ${args.joinToString(" ")}")
+            FileLogger.i(TAG, "Command: ${NativeArgs.redact(args)}")
             FileLogger.i(TAG, "Android ${Build.VERSION.SDK_INT} - Using JNI to avoid PhantomProcess kill")
 
             // Initialize JNI with this callback
@@ -52,7 +52,7 @@ class NativeProcessJNI(
                 args
             }.toTypedArray()
 
-            FileLogger.i(TAG, "Starting with args: ${argv.joinToString(" ")}")
+            FileLogger.i(TAG, "Starting with args: ${NativeArgs.redact(argv)}")
 
             // Start the client
             val result = TiredVpnNative.start(argv)
