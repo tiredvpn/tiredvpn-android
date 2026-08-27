@@ -31,10 +31,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **The server secret no longer reaches the exported log.** Six places rendered
+- **The server secret no longer reaches the exported log.** Eight places rendered
   the core's argument list into `FileLogger` with the key in plain text, and that
   log is what gets exported and attached to a bug report. The value after
-  `-secret` is now replaced before the line is written.
+  `-secret` is now replaced before the line is written. The shell-wrapper path
+  needed its own handling: it joins every argument into a single string before
+  launching, which leaves nothing for element-wise redaction to match, so its log
+  line is now rendered from the arguments and joined afterwards.
 
 ## [1.6.0] - 2026-08-27
 
