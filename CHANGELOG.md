@@ -7,6 +7,35 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-27
+
+### Changed
+
+- **The failover pool now spans every server you have, not just the ones sharing
+  a key.** 1.6.0 grouped the pool by secret and said so in the server list: a
+  server whose key nobody else used got a pool of one and no fallback. That was
+  never a property of the protocol, only of the core, which fixed the secret when
+  it built a transport and refused a config whose entries disagreed. Core 1.8.0
+  makes the key a property of the dial - it travels with the connection and comes
+  from whichever server is being reached - so the app now writes every configured
+  server into the pool, active one first, each with its own key. Switching server
+  switches the key with it.
+  - The server list drops the per-row "in the failover pool" badge along with the
+    rule that made it worth showing. Every server is in the pool now, so the
+    badge would sit on every row; the count of servers the connection can move to
+    stays on the active row, where it still says something.
+  - A server saved without a secret is left out of the pool. It has no key to
+    write, so it would go into the file borrowing another server's and fail to
+    authenticate when the connection reached it.
+  - Bundles core 1.8.0.
+
+### Fixed
+
+- **The server secret no longer reaches the exported log.** Six places rendered
+  the core's argument list into `FileLogger` with the key in plain text, and that
+  log is what gets exported and attached to a bug report. The value after
+  `-secret` is now replaced before the line is written.
+
 ## [1.6.0] - 2026-08-27
 
 ### Added
