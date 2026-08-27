@@ -976,12 +976,16 @@ class TiredVpnService : VpnService() {
             "-listen", "127.0.0.1:${config.proxyPort}"
         )
 
-        // See startTiredVpnProcess: -server collapses a -config pool to one entry.
-        if (poolConfigPath != null) {
-            args.addAll(listOf("-config", poolConfigPath))
-        } else {
-            args.addAll(listOf("-server", config.serverEndpoint))
-        }
+        // Pool file or single server, never both - see ServerPoolConfig.endpointArgs.
+        args.addAll(
+            ServerPoolConfig.endpointArgs(
+                poolConfigPath = poolConfigPath,
+                serverEndpoint = config.serverEndpoint,
+                serverAddressV6 = config.serverAddressV6,
+                preferIpv6 = config.preferIpv6,
+                fallbackV4 = config.fallbackV4
+            )
+        )
 
         // Strategy
         if (config.strategy != "auto") {
@@ -1025,14 +1029,6 @@ class TiredVpnService : VpnService() {
                 args.addAll(listOf("-ech-config", config.echConfig))
             }
             args.addAll(listOf("-ech-public-name", config.echPublicName))
-        }
-
-        // IPv6 endpoint. With a pool this lives in the config file instead;
-        // -server-v6 sets the same collapse flag as -server.
-        if (poolConfigPath == null && config.serverAddressV6.isNotBlank()) {
-            args.addAll(listOf("-server-v6", config.serverAddressV6))
-            args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
-            args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
         }
 
         // QUIC SNI fragmentation
@@ -1436,15 +1432,18 @@ class TiredVpnService : VpnService() {
             "-tun-ip", "auto"
         )
 
-        // Endpoint pool, or the single server it degenerates to.
-        // -server and -config are mutually exclusive by design: the JNI parser
-        // treats a -server as "collapse the list to this one entry", so passing
-        // both would silently throw the failover away.
-        if (poolConfigPath != null) {
-            args.addAll(listOf("-config", poolConfigPath))
-        } else {
-            args.addAll(listOf("-server", serverEndpoint))  // Use pre-resolved IP:port
-        }
+        // Endpoint pool, or the single (pre-resolved) server it degenerates to.
+        // The mutual exclusion of -config and -server lives in one tested place -
+        // see ServerPoolConfig.endpointArgs for why it cannot live here.
+        args.addAll(
+            ServerPoolConfig.endpointArgs(
+                poolConfigPath = poolConfigPath,
+                serverEndpoint = serverEndpoint,
+                serverAddressV6 = config.serverAddressV6,
+                preferIpv6 = config.preferIpv6,
+                fallbackV4 = config.fallbackV4
+            )
+        )
 
         // Strategy
         if (config.strategy != "auto") {
@@ -1488,15 +1487,6 @@ class TiredVpnService : VpnService() {
                 args.addAll(listOf("-ech-config", config.echConfig))
             }
             args.addAll(listOf("-ech-public-name", config.echPublicName))
-        }
-
-        // IPv6 endpoint. With a pool the addresses and the family policy both
-        // come from the config file - -server-v6 would collapse the list the
-        // same way -server does.
-        if (poolConfigPath == null && config.serverAddressV6.isNotBlank()) {
-            args.addAll(listOf("-server-v6", config.serverAddressV6))
-            args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
-            args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
         }
 
         // QUIC SNI fragmentation

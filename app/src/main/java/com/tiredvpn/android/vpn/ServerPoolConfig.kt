@@ -166,6 +166,50 @@ object ServerPoolConfig {
     }
 
     /**
+     * The endpoint half of the core's argument list: either the pool file or
+     * the single server it degenerates to, never both.
+     *
+     * This is the one rule in the whole feature that fails silently when it is
+     * broken. `-server` and `-server-v6` each set `sawServerFlag` in the JNI arg
+     * parser, which then calls `collapseServers(...)` and reduces a `-config`
+     * pool to one entry - no error, no warning, and a client that looks
+     * perfectly healthy right up until the first exit dies with nowhere to go.
+     * So the decision lives here, as one function two call sites paste in
+     * whole, rather than as an `if` inside a service no unit test can start.
+     *
+     * The family flags travel with `-server-v6` because they are meaningless
+     * without it: with a pool, both the addresses and the family policy come
+     * from `[selection]` in the file.
+     */
+    fun endpointArgs(
+        poolConfigPath: String?,
+        serverEndpoint: String,
+        serverAddressV6: String,
+        preferIpv6: Boolean,
+        fallbackV4: Boolean
+    ): List<String> {
+        val configPath = poolConfigPath?.trim().orEmpty()
+        if (configPath.isNotEmpty()) {
+            return listOf("-config", configPath)
+        }
+
+        val endpoint = serverEndpoint.trim()
+        // A blank address would become -server "", which the JNI parser accepts
+        // happily: it takes the empty value and sets the collapse flag anyway.
+        // Leaving the flag out gets the core's own "-server is required" instead.
+        if (endpoint.isEmpty()) return emptyList()
+
+        val args = mutableListOf("-server", endpoint)
+        val v6 = serverAddressV6.trim()
+        if (v6.isNotEmpty()) {
+            args.addAll(listOf("-server-v6", v6))
+            args.addAll(listOf("-prefer-ipv6", preferIpv6.toString()))
+            args.addAll(listOf("-fallback-v4", fallbackV4.toString()))
+        }
+        return args
+    }
+
+    /**
      * Render the config text.
      *
      * The secret is deliberately absent. The core accepts a per-entry `secret`,

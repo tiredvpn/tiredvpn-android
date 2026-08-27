@@ -239,6 +239,88 @@ class ServerPoolConfigTest {
         assertTrue(toml, toml.contains("""name = "line\nbreak""""))
     }
 
+    // --- endpoint arguments ---
+    //
+    // The one rule here that fails silently: -server next to -config makes the
+    // JNI parser collapse the pool to a single entry, and the client then looks
+    // healthy until the first exit dies. Verified against the real 1.7.1 binary
+    // (3 endpoints -> 1), so these assertions guard a demonstrated failure.
+
+    @Test
+    fun `a pool passes the config file and neither server flag`() {
+        val args = ServerPoolConfig.endpointArgs(
+            poolConfigPath = "/data/app/files/pool.toml",
+            serverEndpoint = "198.51.100.1:995",
+            serverAddressV6 = "[2001:db8::1]:995",
+            preferIpv6 = true,
+            fallbackV4 = true
+        )
+
+        assertEquals(listOf("-config", "/data/app/files/pool.toml"), args)
+        assertTrue(args.toString(), !args.contains("-server"))
+        assertTrue(args.toString(), !args.contains("-server-v6"))
+    }
+
+    @Test
+    fun `no pool falls back to the single server flag`() {
+        val args = ServerPoolConfig.endpointArgs(
+            poolConfigPath = null,
+            serverEndpoint = "198.51.100.1:995",
+            serverAddressV6 = "",
+            preferIpv6 = false,
+            fallbackV4 = true
+        )
+
+        assertEquals(listOf("-server", "198.51.100.1:995"), args)
+        assertTrue(args.toString(), !args.contains("-config"))
+    }
+
+    @Test
+    fun `a v6 address adds the v6 flag and the family pair`() {
+        val args = ServerPoolConfig.endpointArgs(
+            poolConfigPath = null,
+            serverEndpoint = "198.51.100.1:995",
+            serverAddressV6 = "[2001:db8::1]:995",
+            preferIpv6 = true,
+            fallbackV4 = false
+        )
+
+        assertEquals(
+            listOf(
+                "-server", "198.51.100.1:995",
+                "-server-v6", "[2001:db8::1]:995",
+                "-prefer-ipv6", "true",
+                "-fallback-v4", "false"
+            ),
+            args
+        )
+    }
+
+    @Test
+    fun `a blank v6 address produces no flag with an empty value`() {
+        for (blank in listOf("", "   ", "\n")) {
+            val args = ServerPoolConfig.endpointArgs(null, "198.51.100.1:995", blank, true, true)
+
+            assertEquals(blank.length.toString(), listOf("-server", "198.51.100.1:995"), args)
+        }
+    }
+
+    @Test
+    fun `a blank config path is treated as no pool at all`() {
+        for (blank in listOf("", "   ")) {
+            val args = ServerPoolConfig.endpointArgs(blank, "198.51.100.1:995", "", false, true)
+
+            assertEquals(blank.length.toString(), listOf("-server", "198.51.100.1:995"), args)
+        }
+    }
+
+    @Test
+    fun `a blank endpoint with no pool emits nothing rather than an empty flag`() {
+        val args = ServerPoolConfig.endpointArgs(null, "   ", "", false, true)
+
+        assertEquals(emptyList<String>(), args)
+    }
+
     // --- file handling ---
 
     @Test
