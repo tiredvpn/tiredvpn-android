@@ -574,6 +574,10 @@ class TiredVpnService : VpnService() {
         File("${filesDir.absolutePath}/control.sock").delete()
         File("${filesDir.absolutePath}/protect.sock").delete()
 
+        // The endpoint pool lists every server the user dials; it is rebuilt on
+        // the next connect, so nothing needs it once the core has stopped.
+        ServerPoolConfig.delete(filesDir)
+
         // Release WakeLock
         releaseWakeLock()
     }
@@ -644,9 +648,10 @@ class TiredVpnService : VpnService() {
             }
         }.apply { isDaemon = true; start() }
 
-        // 9. Delete socket files
+        // 9. Delete socket files and the generated endpoint pool
         File("${filesDir.absolutePath}/control.sock").delete()
         File("${filesDir.absolutePath}/protect.sock").delete()
+        ServerPoolConfig.delete(filesDir)
 
         // 10. Force-unlock reconnect mutex (tryLock() takes it without an owner token,
         // so unlock() with no token is valid; guard against IllegalStateException).
@@ -688,6 +693,29 @@ class TiredVpnService : VpnService() {
         }
         FileLogger.i(TAG, "STEP 0: Resolved ${config.serverEndpoint} -> $resolvedEndpoint")
 
+        // 0b. Resolve the rest of the failover pool on the same raw network.
+        // A pool member is dialled only after the active one stopped working,
+        // by which time DNS through the tunnel is exactly what is broken - so
+        // the names have to be turned into addresses here or not at all.
+        val pool = ArrayList<VpnConfig>()
+        val resolvedPool = HashMap<String, String>()
+        pool.add(config)
+        resolvedPool[config.id] = resolvedEndpoint
+        for (member in ServerPoolConfig.selectPool(ServerRepository.getServers(this), config)) {
+            if (member.id == config.id) continue
+            val resolved = resolveServerEndpoint(member.serverEndpoint)
+            if (resolved == null) {
+                // Left out rather than passed through as a name: an
+                // unresolvable candidate is a connect cycle the core would
+                // spend before reaching one that works.
+                FileLogger.w(TAG, "Pool member ${member.name} left out: cannot resolve ${member.serverEndpoint}")
+                continue
+            }
+            pool.add(member)
+            resolvedPool[member.id] = resolved
+        }
+        val poolConfigPath = preparePoolConfig(config, pool, resolvedPool)
+
         // 1a. Start protect socket server BEFORE starting native process
         // Native process will use this to call VpnService.protect() on its sockets
         FileLogger.i(TAG, "STEP 1a: Starting protect socket server...")
@@ -697,7 +725,7 @@ class TiredVpnService : VpnService() {
         // 1b. Start tiredvpn with control socket (using resolved IP)
         setPhase(getString(R.string.phase_starting_core))
         FileLogger.i(TAG, "STEP 1b: Starting tiredvpn process...")
-        startTiredVpnProcess(config, resolvedEndpoint, controlPath, protectPath)
+        startTiredVpnProcess(config, resolvedEndpoint, controlPath, protectPath, poolConfigPath)
         FileLogger.i(TAG, "STEP 1b: Process started")
 
         // 2. Wait for socket and connect
@@ -893,6 +921,37 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "=== PROXY MODE CONNECTED ===")
     }
 
+    /**
+     * Write the endpoint pool the core dials through `-config` and return its
+     * path, or null when there is nothing to fail over to.
+     *
+     * A one-element pool deliberately keeps the old `-server` path: the file
+     * would say exactly what the flag already says, and the flag is the
+     * better-travelled route. A failure to write is not fatal for the same
+     * reason - the caller falls back to the single active server.
+     */
+    private fun preparePoolConfig(
+        active: VpnConfig,
+        pool: List<VpnConfig>,
+        resolvedById: Map<String, String>
+    ): String? {
+        try {
+            val entries = if (pool.size < 2) emptyList() else ServerPoolConfig.entries(pool, resolvedById)
+            if (entries.size < 2) {
+                ServerPoolConfig.delete(filesDir)
+                FileLogger.i(TAG, "Endpoint pool: single server, using -server")
+                return null
+            }
+            val file = ServerPoolConfig.write(filesDir, ServerPoolConfig.render(entries, active))
+            FileLogger.i(TAG, "Endpoint pool: ${entries.size} servers [${entries.joinToString(", ") { it.name }}]")
+            return file.absolutePath
+        } catch (e: Exception) {
+            FileLogger.e(TAG, "Failed to write endpoint pool config, falling back to a single server", e)
+            ServerPoolConfig.delete(filesDir)
+            return null
+        }
+    }
+
     private fun startTiredVpnProxyProcess(config: VpnConfig) {
         val binaryPath = "${applicationInfo.nativeLibraryDir}/libtiredvpn.so"
         val binaryFile = File(binaryPath)
@@ -904,14 +963,25 @@ class TiredVpnService : VpnService() {
         // CRITICAL: Kill any orphan tiredvpn processes BEFORE starting new one
         NativeProcess.killAllTiredVpnProcesses(applicationInfo.nativeLibraryDir)
 
+        // Proxy mode has no tunnel, so DNS keeps working and the pool entries
+        // go in as configured - no pre-resolution pass here.
+        val pool = ServerPoolConfig.selectPool(ServerRepository.getServers(this), config)
+        val poolConfigPath = preparePoolConfig(config, pool, emptyMap())
+
         // Proxy mode: no -tun, no -control-socket, just -listen
         val args = mutableListOf(
             binaryFile.absolutePath,
             "client",
-            "-server", config.serverEndpoint,
             "-secret", config.secret,
             "-listen", "127.0.0.1:${config.proxyPort}"
         )
+
+        // See startTiredVpnProcess: -server collapses a -config pool to one entry.
+        if (poolConfigPath != null) {
+            args.addAll(listOf("-config", poolConfigPath))
+        } else {
+            args.addAll(listOf("-server", config.serverEndpoint))
+        }
 
         // Strategy
         if (config.strategy != "auto") {
@@ -957,8 +1027,9 @@ class TiredVpnService : VpnService() {
             args.addAll(listOf("-ech-public-name", config.echPublicName))
         }
 
-        // IPv6 endpoint
-        if (config.serverAddressV6.isNotBlank()) {
+        // IPv6 endpoint. With a pool this lives in the config file instead;
+        // -server-v6 sets the same collapse flag as -server.
+        if (poolConfigPath == null && config.serverAddressV6.isNotBlank()) {
             args.addAll(listOf("-server-v6", config.serverAddressV6))
             args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
             args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
@@ -1337,7 +1408,13 @@ class TiredVpnService : VpnService() {
         }
     }
 
-    private fun startTiredVpnProcess(config: VpnConfig, serverEndpoint: String, controlPath: String, protectPath: String) {
+    private fun startTiredVpnProcess(
+        config: VpnConfig,
+        serverEndpoint: String,
+        controlPath: String,
+        protectPath: String,
+        poolConfigPath: String?
+    ) {
         // The core runs via JNI (NativeProcessJNI) from the embedded libtiredvpn.so,
         // which ships for every ABI in nativeLibraryDir. No standalone binary is
         // extracted or executed here: args[0] below is a cosmetic placeholder that
@@ -1352,13 +1429,22 @@ class TiredVpnService : VpnService() {
         val args = mutableListOf(
             "tiredvpn",
             "client",
-            "-server", serverEndpoint,  // Use pre-resolved IP:port
             "-secret", config.secret,
             "-control-socket", controlPath,
             "-protect-path", protectPath,  // Socket protection for VpnService.protect()
             "-tun",
             "-tun-ip", "auto"
         )
+
+        // Endpoint pool, or the single server it degenerates to.
+        // -server and -config are mutually exclusive by design: the JNI parser
+        // treats a -server as "collapse the list to this one entry", so passing
+        // both would silently throw the failover away.
+        if (poolConfigPath != null) {
+            args.addAll(listOf("-config", poolConfigPath))
+        } else {
+            args.addAll(listOf("-server", serverEndpoint))  // Use pre-resolved IP:port
+        }
 
         // Strategy
         if (config.strategy != "auto") {
@@ -1404,8 +1490,10 @@ class TiredVpnService : VpnService() {
             args.addAll(listOf("-ech-public-name", config.echPublicName))
         }
 
-        // IPv6 endpoint
-        if (config.serverAddressV6.isNotBlank()) {
+        // IPv6 endpoint. With a pool the addresses and the family policy both
+        // come from the config file - -server-v6 would collapse the list the
+        // same way -server does.
+        if (poolConfigPath == null && config.serverAddressV6.isNotBlank()) {
             args.addAll(listOf("-server-v6", config.serverAddressV6))
             args.addAll(listOf("-prefer-ipv6", config.preferIpv6.toString()))
             args.addAll(listOf("-fallback-v4", config.fallbackV4.toString()))
