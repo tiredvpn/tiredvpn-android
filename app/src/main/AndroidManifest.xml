@@ -71,14 +71,42 @@
         <!-- Server Configuration -->
         <activity
             android:name=".ui.ServerConfigActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!-- Import entry point for everything that originates outside the app:
+             tired:// deep links, links shared in from a messenger, and adb.
+
+             Exported on purpose. It cannot change anything on its own: it only
+             opens a confirmation dialog listing the servers that would be added
+             or replaced, and writes nothing until the user taps Import. The ADB
+             receiver below keeps its signature permission for silent automation;
+             this activity is the path that works from `adb shell`, which holds no
+             signature permissions and never received those broadcasts at all. -->
+        <activity
+            android:name=".ui.ImportActivity"
             android:exported="true"
-            android:parentActivityName=".ui.MainActivity">
-            <!-- Handle tired:// deep links -->
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.TiredVPN.Transparent">
+            <!-- tired:// from a browser or messenger -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="tired" />
+            </intent-filter>
+            <!-- "Share to TiredVPN" from any app holding the link as text -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- adb: am start -a com.tiredvpn.IMPORT_CONFIG with a "payload" string extra -->
+            <intent-filter>
+                <action android:name="com.tiredvpn.IMPORT_CONFIG" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
 

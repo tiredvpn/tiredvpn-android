@@ -1,21 +1,17 @@
 package com.tiredvpn.android.ui
 
-import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import android.view.View
-import android.widget.EditText
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityServerConfigBinding
+import com.tiredvpn.android.importer.ConfigCodec
+import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.util.TvUtils
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
@@ -47,9 +43,6 @@ class ServerConfigActivity : BaseActivity() {
         loadConfig()
         setupListeners()
         setupTvMode()
-
-        // Check if launched with tired:// intent
-        handleIntent()
     }
 
     private fun setupTvMode() {
@@ -59,14 +52,6 @@ class ServerConfigActivity : BaseActivity() {
             binding.qrDivider.visibility = View.GONE
             // Set initial focus to first import option
             binding.importClipboardButton.requestFocus()
-        }
-    }
-
-    private fun handleIntent() {
-        intent?.data?.let { uri ->
-            if (uri.scheme == "tired") {
-                parseAndApplyUrl(uri.toString(), fromExternalSource = true)
-            }
         }
     }
 
@@ -112,29 +97,28 @@ class ServerConfigActivity : BaseActivity() {
         }
     }
 
+    /**
+     * Free-text import. Deliberately not restricted to tired:// - the same box
+     * takes a pasted JSON config or a base64 subscription blob, because the user
+     * should not have to know which of those they were handed.
+     */
     private fun showUrlInputDialog() {
         val inputLayout = TextInputLayout(this).apply {
-            hint = getString(R.string.enter_url_hint)
+            hint = getString(R.string.import_paste_hint)
             boxBackgroundMode = TextInputLayout.BOX_BACKGROUND_OUTLINE
             setPadding(48, 24, 48, 24)
         }
         val input = TextInputEditText(inputLayout.context).apply {
-            inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
         }
         inputLayout.addView(input)
 
         MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.enter_url_title)
+            .setTitle(R.string.import_paste_title)
             .setView(inputLayout)
-            .setPositiveButton(R.string.save) { _, _ ->
-                val url = input.text?.toString()?.trim() ?: ""
-                if (url.isNotEmpty()) {
-                    if (url.startsWith("tired://")) {
-                        parseAndApplyUrl(url, fromExternalSource = false)
-                    } else {
-                        Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
-                    }
-                }
+            .setPositiveButton(R.string.restore_import) { _, _ ->
+                importText(input.text?.toString(), fromExternalSource = false)
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -152,88 +136,32 @@ class ServerConfigActivity : BaseActivity() {
             return
         }
 
-        // Concatenate all clip items so we don't miss the link if it lands in a second item.
+        // Concatenate all clip items so we don't miss anything that landed in a
+        // second item, and so a multi-item copy of several links imports as a set.
         val text = (0 until clipData.itemCount)
             .joinToString("\n") { clipData.getItemAt(it).coerceToText(this).toString() }
-            .trim()
 
-        if (text.isEmpty()) {
+        if (text.isBlank()) {
             Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
             return
         }
 
-        // Try tired:// link (tolerant: handles whitespace and links embedded in text).
-        val link = VpnConfig.extractTiredUrl(text)
-        if (link != null) {
-            parseAndApplyUrl(link, fromExternalSource = false)
-            return
-        }
-
-        // Fall back to JSON config exported via backup.
-        val jsonConfig = tryParseJsonConfig(text)
-        if (jsonConfig != null) {
-            confirmAndSave(jsonConfig, fromExternalSource = false)
-            return
-        }
-
-        Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show()
-    }
-
-    private fun tryParseJsonConfig(text: String): VpnConfig? {
-        return try {
-            val trimmed = text.trim()
-            when {
-                trimmed.startsWith("{") -> VpnConfig.fromJson(org.json.JSONObject(trimmed))
-                trimmed.startsWith("[") -> {
-                    val arr = org.json.JSONArray(trimmed)
-                    if (arr.length() > 0) VpnConfig.fromJson(arr.getJSONObject(0)) else null
-                }
-                else -> null
-            }?.takeIf { it.isValid }
-        } catch (e: Exception) {
-            null
-        }
+        importText(text, fromExternalSource = false)
     }
 
     /**
-     * Parse tired:// URL format:
-     * tired://SERVER:PORT?secret=SECRET&strategy=auto&quic=true&quicPort=443&cover=host&rtt=false&rttProfile=moscow-yandex&fallback=true
-     *
-     * Minimal format:
-     * tired://SERVER:PORT?secret=SECRET
+     * The single import funnel for this screen. The whole text goes to the
+     * codec: no pre-filtering to a single link, no format guess by the caller.
      */
-    private fun parseAndApplyUrl(url: String, fromExternalSource: Boolean = false): Boolean {
-        val config = VpnConfig.fromUrl(url)
-        if (config == null) {
-            Toast.makeText(this, R.string.invalid_url, Toast.LENGTH_SHORT).show()
-            return false
+    private fun importText(text: String?, fromExternalSource: Boolean) {
+        if (text.isNullOrBlank()) {
+            Toast.makeText(this, R.string.import_clipboard_nothing, Toast.LENGTH_SHORT).show()
+            return
         }
-        confirmAndSave(config, fromExternalSource)
-        return true
-    }
-
-    private fun confirmAndSave(config: VpnConfig, fromExternalSource: Boolean) {
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Import Configuration")
-            .setMessage(buildString {
-                if (fromExternalSource) {
-                    appendLine("⚠️ This configuration was opened from an external link (browser or another app). Make sure you trust the source.")
-                    appendLine()
-                }
-                appendLine("Server: ${config.serverAddress}:${config.serverPort}")
-                appendLine("Strategy: ${config.strategy}")
-                appendLine("QUIC: ${if (config.enableQuic) "Enabled (port ${config.quicPort})" else "Disabled"}")
-                appendLine("Cover Host: ${config.coverHost}")
-                appendLine("RTT Masking: ${if (config.rttMasking) config.rttProfile else "Disabled"}")
-                appendLine("Fallback: ${if (config.fallbackEnabled) "Enabled" else "Disabled"}")
-            })
-            .setPositiveButton("Import") { _, _ ->
-                ServerRepository.saveServer(this, config)
-                Toast.makeText(this, R.string.config_imported, Toast.LENGTH_SHORT).show()
-                finish()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+        val parsed = ConfigCodec.parse(text)
+        ImportPreview.show(this, parsed, fromExternalSource) { result ->
+            if (result != null && result.added + result.updated > 0) finish()
+        }
     }
 
     private fun saveConfig() {

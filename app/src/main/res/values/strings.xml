@@ -231,6 +231,18 @@
     <string name="restore_invalid">No valid server configs found in the file</string>
     <string name="restore_found">Found %1$d server(s) in the file. Import them?</string>
     <string name="restore_done">Imported %1$d server(s)</string>
+    <!-- Import -->
+    <string name="import_title">Import Configuration</string>
+    <string name="import_paste_title">Paste configuration</string>
+    <string name="import_paste_hint">tired:// link(s), JSON or base64</string>
+    <string name="import_plan_counts">Add %1$d, update %2$d, skip %3$d.</string>
+    <string name="import_summary">Added %1$d, updated %2$d, skipped %3$d</string>
+    <string name="import_and_more">\u2026and %1$d more</string>
+    <string name="import_nothing_found">Nothing to import.</string>
+    <string name="import_nothing_usable">Nothing usable in this configuration.</string>
+    <string name="import_accepted_formats">Accepted: one or more tired:// links, a server JSON, a JSON array of servers, or base64 of any of those.</string>
+    <string name="import_external_warning">\u26a0 This configuration came from outside the app (a link, another app, or adb). Import it only if you trust the source.</string>
+    <string name="import_clipboard_nothing">Clipboard has no tired:// link or config</string>
     <string name="pool_active">Fails over to %1$d other server(s)</string>
     <string name="pool_alone">No failover: this is the only configured server</string>
 </resources>

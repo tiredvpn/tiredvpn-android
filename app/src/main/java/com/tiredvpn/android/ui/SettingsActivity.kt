@@ -23,6 +23,8 @@ import com.google.android.material.textfield.TextInputLayout
 import android.content.pm.PackageManager
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivitySettingsBinding
+import com.tiredvpn.android.importer.ConfigCodec
+import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnState
@@ -498,58 +500,9 @@ class SettingsActivity : BaseActivity() {
             return
         }
 
-        val configs = parseBackup(text)
-        if (configs.isEmpty()) {
-            Toast.makeText(this, R.string.restore_invalid, Toast.LENGTH_LONG).show()
-            return
-        }
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.restore_configs)
-            .setMessage(getString(R.string.restore_found, configs.size))
-            .setPositiveButton(R.string.restore_import) { _, _ ->
-                configs.forEach { ServerRepository.saveServer(this, it) }
-                Toast.makeText(
-                    this,
-                    getString(R.string.restore_done, configs.size),
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    /**
-     * Parse a backup payload into valid configs. Accepts a JSON array of servers
-     * (the backup format), a single JSON object, or text containing tired:// links.
-     */
-    private fun parseBackup(text: String): List<VpnConfig> {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return emptyList()
-
-        // JSON array (backup file) or single object.
-        try {
-            when {
-                trimmed.startsWith("[") -> {
-                    val arr = JSONArray(trimmed)
-                    return (0 until arr.length())
-                        .map { VpnConfig.fromJson(arr.getJSONObject(it)) }
-                        .filter { it.isValid }
-                }
-                trimmed.startsWith("{") -> {
-                    val config = VpnConfig.fromJson(org.json.JSONObject(trimmed))
-                    return if (config.isValid) listOf(config) else emptyList()
-                }
-            }
-        } catch (e: Exception) {
-            // fall through to link parsing
-        }
-
-        // Fallback: one tired:// link per line.
-        return trimmed.lineSequence()
-            .mapNotNull { VpnConfig.fromUrl(it) }
-            .filter { it.isValid }
-            .toList()
+        // The picked file goes through the same codec as every other import, so a
+        // backup, a link list and a subscription blob all restore identically.
+        ImportPreview.show(this, ConfigCodec.parse(text), fromExternalSource = false)
     }
 
     private fun showProtocolDialog() {

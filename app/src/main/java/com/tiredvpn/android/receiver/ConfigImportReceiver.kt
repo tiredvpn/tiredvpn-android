@@ -5,183 +5,103 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import android.widget.Toast
-import com.tiredvpn.android.vpn.ServerRepository
-import com.tiredvpn.android.vpn.SplitTunnelSettings
-import com.tiredvpn.android.vpn.VpnConfig
-import org.json.JSONObject
+import com.tiredvpn.android.importer.ConfigCodec
+import com.tiredvpn.android.importer.ConfigImporter
 import java.io.File
 
 /**
- * BroadcastReceiver for importing VPN configuration via ADB.
+ * Silent config import for automation that is signed with the app's own key.
  *
- * Usage examples:
+ * ## This is NOT the adb path
  *
- * 1. Import from JSON file:
- *    adb push config.json /sdcard/Download/
- *    adb shell am broadcast -a com.tiredvpn.IMPORT_CONFIG \
- *      -n com.tiredvpn.android/.receiver.ConfigImportReceiver \
- *      --es file "/sdcard/Download/config.json"
+ * The receiver is declared with `android:permission=
+ * "com.tiredvpn.android.permission.VPN_CONTROL"`, a signature-level permission.
+ * `adb shell` runs as uid 2000, holds no signature permissions, and cannot be
+ * granted one with `pm grant` - so the platform drops the broadcast before it is
+ * delivered while `am broadcast` cheerfully prints `Broadcast completed:
+ * result=0`. The adb examples this file used to carry never worked.
  *
- * 2. Import inline JSON:
- *    adb shell am broadcast -a com.tiredvpn.IMPORT_CONFIG \
- *      -n com.tiredvpn.android/.receiver.ConfigImportReceiver \
- *      --es json '{"server":"1.2.3.4","port":443,"secret":"xxx"}'
+ * For adb, use [com.tiredvpn.android.ui.ImportActivity], which is reachable with
+ * `am start` and asks the user to confirm.
  *
- * Config JSON format:
- * {
- *   "name": "My Server",
- *   "server": "vpn.example.com",
- *   "port": 443,
- *   "secret": "my-secret",
- *   "strategy": "auto",
- *   "quic": true,
- *   "quic_port": 443,
- *   "cover_host": "api.googleapis.com",
- *   "rtt_masking": false,
- *   "rtt_profile": "moscow-yandex",
- *   "fallback": true,
- *   "debug": false,
- *   "server_v6": "[2001:db8::1]:995",
- *   "prefer_ipv6": true,
- *   "fallback_v4": true,
- *   "tun_ipv6": "off",
- *   "split_tunneling": {
- *     "mode": "exclude",
- *     "apps": ["com.google.android.youtube", "com.netflix.mediaclient"]
- *   }
- * }
+ * ## What this receiver still does
  *
- * IPv6 endpoint fields:
- *  - "server_v6" is the second address of the SAME server, written as host:port
- *    ("[2001:db8::1]:995" for a literal, "v6.example.com:995" for a name). An
- *    empty string, or the field being absent, means the server has no IPv6
- *    endpoint. Entry nodes whose IPv4 address is blocked are reachable only
- *    through this field, so a config that omits it is half-configured and looks
- *    fine until the first connection attempt.
- *  - "prefer_ipv6" dials the IPv6 endpoint first.
- *  - "fallback_v4" allows falling back to the IPv4 endpoint.
- *  - "tun_ipv6" is IPv6 INSIDE the tunnel: "off" (v4-only, leaks blackholed) or
- *    "dual" (dual-stack). Unrelated to how the server is reached.
+ * A companion app signed with the same key (a provisioning tool, a test harness)
+ * can import without any UI:
  *
- * Every key also accepts the camelCase spelling used by VpnConfig.toJson()
- * ("serverAddressV6", "preferIpv6", "fallbackV4", "tunnelIpv6"), so a config
- * exported by the app can be fed straight back in.
+ *     Intent("com.tiredvpn.IMPORT_CONFIG")
+ *         .setPackage("com.tiredvpn.android")
+ *         .putExtra("payload", "tired://1.2.3.4:995?secret=xxx")
+ *
+ * ## Payload
+ *
+ * `payload` (or the legacy `json` / `url`) takes anything [ConfigCodec]
+ * understands: one tired:// link, several links separated by newlines, a server
+ * JSON object, a JSON array of servers, a `{"servers":[...]}` bundle, or base64
+ * of any of those. `file` names a file to read instead.
+ *
+ * Field names follow one vocabulary across links, JSON and this receiver; see
+ * [ConfigCodec] for the accepted spellings.
  */
 class ConfigImportReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_IMPORT_CONFIG = "com.tiredvpn.IMPORT_CONFIG"
+        private const val EXTRA_PAYLOAD = "payload"
         private const val EXTRA_JSON = "json"
+        private const val EXTRA_URL = "url"
         private const val EXTRA_FILE = "file"
         private const val TAG = "ConfigImportReceiver"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        Log.d(TAG, "onReceive: action=${intent.action}")
         if (intent.action != ACTION_IMPORT_CONFIG) return
 
-        try {
-            val jsonString = when {
-                intent.hasExtra(EXTRA_JSON) -> {
-                    Log.d(TAG, "Reading from EXTRA_JSON")
-                    intent.getStringExtra(EXTRA_JSON)
-                }
-                intent.hasExtra(EXTRA_FILE) -> {
-                    Log.d(TAG, "Reading from file: ${intent.getStringExtra(EXTRA_FILE)}")
-                    readConfigFile(intent.getStringExtra(EXTRA_FILE))
-                }
-                else -> {
-                    showToast(context, "Error: No config provided. Use --es json or --es file")
-                    return
-                }
-            }
-
-            if (jsonString.isNullOrBlank()) {
-                showToast(context, "Error: Empty config")
-                return
-            }
-
-            Log.d(TAG, "JSON received, length=${jsonString.length}")
-            val json = JSONObject(jsonString)
-            importConfig(context, json)
-            showToast(context, "Config imported successfully!")
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Import error", e)
-            showToast(context, "Import error: ${e.message}")
-            e.printStackTrace()
+        val payload = extractPayload(intent)
+        if (payload.isNullOrBlank()) {
+            showToast(context, "Import error: no config provided (payload or file extra)")
+            return
         }
-    }
 
-    private fun readConfigFile(filePath: String?): String? {
-        if (filePath.isNullOrBlank()) return null
-        val file = File(filePath)
-        if (!file.exists() || !file.canRead()) {
-            throw IllegalArgumentException("Cannot read file: $filePath")
-        }
-        return file.readText()
-    }
-
-    private fun importConfig(context: Context, json: JSONObject) {
-        // Parse server config
-        val config = VpnConfig(
-            name = json.optString("name", "Imported Server"),
-            serverAddress = json.optString("server", json.optString("serverAddress", "")),
-            serverPort = json.optInt("port", json.optInt("serverPort", 443)),
-            secret = json.optString("secret", ""),
-            strategy = json.optString("strategy", "auto"),
-            enableQuic = json.optBoolean("quic", json.optBoolean("enableQuic", true)),
-            quicPort = json.optInt("quic_port", json.optInt("quicPort", 443)),
-            coverHost = json.optString("cover_host", json.optString("coverHost", "api.googleapis.com")),
-            rttMasking = json.optBoolean("rtt_masking", json.optBoolean("rttMasking", false)),
-            rttProfile = json.optString("rtt_profile", json.optString("rttProfile", "moscow-yandex")),
-            fallbackEnabled = json.optBoolean("fallback", json.optBoolean("fallbackEnabled", true)),
-            debugLogging = json.optBoolean("debug", json.optBoolean("debugLogging", false)),
-            // IPv6 endpoint. Without these an imported server carries only its v4
-            // address, which is useless where that address is blocked.
-            serverAddressV6 = json.optString("server_v6", json.optString("serverAddressV6", "")),
-            preferIpv6 = json.optBoolean("prefer_ipv6", json.optBoolean("preferIpv6", false)),
-            fallbackV4 = json.optBoolean("fallback_v4", json.optBoolean("fallbackV4", true)),
-            // IPv6 inside the tunnel: "off" or "dual"
-            tunnelIpv6 = json.optString("tun_ipv6", json.optString("tunnelIpv6", "off"))
+        val parsed = ConfigCodec.parse(payload)
+        val plan = ConfigImporter.plan(context, parsed)
+        Log.i(
+            TAG,
+            "import: format=${parsed.format} add=${plan.toAdd.size} " +
+                "update=${plan.toUpdate.size} skip=${plan.skipped.size}"
         )
 
-        if (!config.isValid) {
-            throw IllegalArgumentException("Invalid config: server, port and secret are required")
+        if (!plan.hasWork) {
+            val why = plan.skipped.firstOrNull()?.reason ?: "no server config recognised"
+            showToast(context, "Import error: $why")
+            return
         }
 
-        // Save server
-        ServerRepository.saveServer(context, config)
-        ServerRepository.setActiveServerId(context, config.id)
-
-        // Import split tunneling if present
-        Log.d(TAG, "Checking for split_tunneling: has=${json.has("split_tunneling")}")
-        if (json.has("split_tunneling")) {
-            val splitObj = json.getJSONObject("split_tunneling")
-            Log.d(TAG, "split_tunneling object: $splitObj")
-            importSplitTunneling(context, splitObj, config.id)
-        } else {
-            Log.d(TAG, "No split_tunneling in JSON. Keys: ${json.keys().asSequence().toList()}")
-        }
+        val result = ConfigImporter.apply(context, plan)
+        showToast(
+            context,
+            "Imported: ${result.added} added, ${result.updated} updated, ${result.skipped} skipped"
+        )
     }
 
-    private fun importSplitTunneling(context: Context, splitJson: JSONObject, profileId: String) {
-        val mode = splitJson.optString("mode", "exclude")
-        val appsArray = splitJson.optJSONArray("apps")
-
-        Log.d(TAG, "importSplitTunneling: profile=$profileId, mode=$mode, appsArray=$appsArray")
-
-        val apps = mutableSetOf<String>()
-        if (appsArray != null) {
-            for (i in 0 until appsArray.length()) {
-                apps.add(appsArray.getString(i))
-            }
+    private fun extractPayload(intent: Intent): String? {
+        for (key in listOf(EXTRA_PAYLOAD, EXTRA_JSON, EXTRA_URL)) {
+            intent.getStringExtra(key)?.takeIf { it.isNotBlank() }?.let { return it }
         }
-
-        Log.d(TAG, "Saving split tunneling: mode=$mode, apps=$apps")
-        // Bind imported split settings to the profile they arrived with.
-        SplitTunnelSettings.save(context, profileId, mode, apps)
-        Log.d(TAG, "Split tunneling saved successfully")
+        val path = intent.getStringExtra(EXTRA_FILE)?.takeIf { it.isNotBlank() } ?: return null
+        return try {
+            val file = File(path)
+            if (!file.isFile || !file.canRead()) {
+                Log.w(TAG, "config file is not readable")
+                null
+            } else {
+                file.readText()
+            }
+        } catch (e: Exception) {
+            // The content can be anything; keep it and the message out of the log.
+            Log.w(TAG, "could not read config file: ${e.javaClass.simpleName}")
+            null
+        }
     }
 
     private fun showToast(context: Context, message: String) {

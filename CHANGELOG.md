@@ -7,6 +7,88 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-28
+
+### Added
+
+- **Import takes several servers at once, in whatever shape they arrive.** There
+  was no way to add more than one server per gesture. Setting up a four-node pool
+  meant opening "enter URL" four times and typing a `tired://` link into it four
+  times, and every one of those links had to be a link: a pasted JSON config, an
+  exported backup or a base64 subscription blob was rejected by the box that only
+  accepted `tired://`. Now one input accepts all of it and works out which it is
+  by itself - one link, several links separated by newlines or spaces, a link
+  quoted inside a chat message or a JSON string, a server JSON object in either
+  spelling of its field names, a JSON array of servers, a `{"servers":[...]}`
+  export bundle, and base64 of any of those, in the standard or URL-safe alphabet
+  with or without padding. The clipboard button, the paste box, the add button on
+  the server list and Restore in settings all go through it.
+- **A preview before anything is written, for a batch as well as for one link.**
+  It names each server that would be added or replaced, counts them, and lists
+  what was skipped with the reason: a link with no secret, an entry that repeats
+  an endpoint already in the same paste. Nothing is stored until you tap Import.
+- **`tired://` links can be shared into the app.** TiredVPN now appears in the
+  share sheet for plain text, so a link in a messenger reaches the import without
+  a copy-paste round trip.
+
+### Fixed
+
+- **Config import over adb works.** It never has. The receiver was declared with
+  `android:permission="com.tiredvpn.android.permission.VPN_CONTROL"`, which is
+  signature-level; `adb shell` runs as uid 2000, holds no signature permission
+  and cannot be granted one, so Android dropped every one of those broadcasts
+  before delivery - while `am broadcast` printed `Broadcast completed: result=0`
+  and looked like success. The documented usage examples in the source described
+  a command that had never once imported anything. Checking the caller inside the
+  receiver instead is not possible either: a `BroadcastReceiver` cannot learn who
+  sent a broadcast. Import now has an exported activity, `ImportActivity`, which
+  `am start` can reach:
+
+      adb shell am start -n com.tiredvpn.android/.ui.ImportActivity \
+        -a com.tiredvpn.IMPORT_CONFIG --es payload 'tired://1.2.3.4:995?secret=xxx'
+      adb shell am start -n com.tiredvpn.android/.ui.ImportActivity \
+        -a com.tiredvpn.IMPORT_CONFIG --es file /sdcard/Download/pool.json
+
+  The signature permission stays where it was, because it is what stops another
+  installed app from replacing your credentials silently, and the receiver still
+  serves same-key automation. The new activity is exported, but reaching it is
+  not the same as changing anything: it can only put the confirmation dialog on
+  screen, and that dialog names every server it would touch. A `file` path inside
+  the app's own private storage is refused, so the activity cannot be aimed at
+  our own stored configs.
+- **Re-importing a server no longer creates a duplicate of it.** A `tired://`
+  link carries no id, so each parse minted a fresh one and the store treated it
+  as a new server; importing the same pool twice left eight entries. Servers are
+  now matched on the address and port they dial, which is the thing that makes
+  two configs the same server. A different secret on a known endpoint is a
+  rotated credential and updates it - with core 1.8.0 every pool node has its own
+  key, so this is the normal case, not an oddity. A backup still round-trips by
+  id, so a server that was moved to a new address is recognised. An update keeps
+  the id (split-tunnel rules stay attached), keeps the measured latency, and does
+  not overwrite a name you chose with the hostname a bare link defaults to.
+- **A `tired://` link and a JSON config now describe the same server.** They
+  understood different field sets: the link parser knew about `serverV6`,
+  `preferIpv6`, `fallbackV4`, `tunIpv6`, ECH and the traffic shaper, and the JSON
+  importer did not; JSON knew about debug logging, connection mode and port
+  hopping, and the link did not. The same server therefore imported differently
+  depending on which way it was sent. Both now carry every field, under one
+  vocabulary that accepts the snake_case spelling from the ADB docs, the
+  camelCase spelling `toJson()` writes, and the query-parameter name `toUrl()`
+  writes.
+- **The clipboard button imported one server no matter how many were on the
+  clipboard.** It pulled the first `tired://` link out of the text and discarded
+  the rest.
+- **The add button on the server list looked for the literal text
+  `serverAddress` to decide whether the clipboard held a config.** A list of
+  links, a base64 subscription and a snake_case JSON config all failed that test
+  and dropped the user into manual entry.
+
+### Changed
+
+- `ServerConfigActivity` is no longer exported. `tired://` deep links now open
+  `ImportActivity`, which is the single entry point for anything arriving from
+  outside the app.
+
 ## [1.7.1] - 2026-08-28
 
 ### Fixed
