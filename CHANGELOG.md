@@ -7,6 +7,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-08-28
+
+### Fixed
+
+- **A server imported over ADB can now carry its IPv6 endpoint.** The import
+  receiver understood thirteen keys, all of them IPv4, and silently dropped the
+  four that decide how the server is reached over v6: `server_v6`,
+  `prefer_ipv6`, `fallback_v4` and `tun_ipv6`. The settings screen has always
+  been able to set them, and only for the active server, which made a scripted
+  setup impossible to complete. It mattered because an entry node whose IPv4
+  address has been blocked is reachable over IPv6 only, so an imported server
+  pointed at a dead address and looked correctly configured right up to the
+  first connection attempt. Each key also accepts the camelCase spelling
+  `VpnConfig.toJson()` writes (`serverAddressV6`, `preferIpv6`, `fallbackV4`,
+  `tunnelIpv6`), so a config exported by the app can be fed back in unedited. An
+  empty `server_v6` stays a legal value and means the server has no v6 endpoint;
+  a config that omits the keys entirely is imported exactly as before.
+
 ## [1.7.0] - 2026-08-27
 
 ### Changed
