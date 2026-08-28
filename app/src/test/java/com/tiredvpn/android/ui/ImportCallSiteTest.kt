@@ -59,10 +59,25 @@ class ImportCallSiteTest {
 
     private fun stored() = ServerRepository.getServers(context)
 
-    private fun setClipboard(text: String) {
+    private fun setClipboard(text: String) = setClipboardItems(text)
+
+    /**
+     * A clip is a LIST of items. Copying four links can land as four items, and
+     * a screen that reads item 0 alone loses three servers while still looking
+     * like a successful import of one - which no single-item fixture can see.
+     */
+    private fun setClipboardItems(vararg items: String) {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("config", text))
+        val clip = ClipData.newPlainText("config", items.first())
+        items.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
+        clipboard.setPrimaryClip(clip)
     }
+
+    private fun serverConfigActivity() =
+        Robolectric.buildActivity(ServerConfigActivity::class.java).setup().get()
+
+    private fun serverListActivity() =
+        Robolectric.buildActivity(ServerListActivity::class.java).setup().get()
 
     private fun latestDialog(): AlertDialog {
         val dialog = ShadowDialog.getLatestDialog()
@@ -163,12 +178,9 @@ class ImportCallSiteTest {
 
     @Test
     fun `a JSON file pushed to the device is imported`() {
-        val file = tempFolder.newFile("pool.json")
-        file.writeText(
-            (1..3).joinToString(",", "[", "]") {
-                """{"server":"n$it.example","port":995,"secret":"key-$it"}"""
-            }
-        )
+        // Several LINES, so a read that stops at the first line is visible.
+        val file = tempFolder.newFile("pool.txt")
+        file.writeText((1..3).joinToString("\n") { link("n$it.example", "key-$it") })
 
         startImportActivity(adbIntent(ImportActivity.EXTRA_FILE, file.absolutePath))
         confirm()
@@ -274,6 +286,59 @@ class ImportCallSiteTest {
         assertFalse(message.contains(context.getString(R.string.import_external_warning)))
     }
 
+    @Test
+    fun `the clipboard button reads every item of a multi-item clip`() {
+        // The clipboard holds four items here, not one string with newlines.
+        setClipboardItems(*(1..4).map { link("m$it.example", "key-$it") }.toTypedArray())
+
+        serverConfigActivity()
+            .findViewById<android.view.View>(R.id.importClipboardButton).performClick()
+        ShadowLooper.idleMainLooper()
+        confirm()
+
+        assertEquals(4, stored().size)
+        assertEquals(
+            listOf("key-1", "key-2", "key-3", "key-4"),
+            stored().sortedBy { it.serverAddress }.map { it.secret },
+        )
+    }
+
+    // --- ServerConfigActivity: the paste box ---
+
+    @Test
+    fun `the paste box imports every link that was typed into it`() {
+        // It used to reject anything not starting with tired:// and, once that
+        // was lifted, still had to hand the whole box to the codec.
+        val activity = serverConfigActivity()
+        activity.findViewById<android.view.View>(R.id.enterUrlButton).performClick()
+        ShadowLooper.idleMainLooper()
+
+        val input = latestDialog().window!!.decorView.findEditText()
+        input!!.setText(fourLinks)
+        confirm() // dismiss the paste box; the preview opens on top of it
+        confirm() // and confirm the preview
+
+        assertEquals(4, stored().size)
+    }
+
+    @Test
+    fun `the paste box takes a JSON array, not only links`() {
+        val activity = serverConfigActivity()
+        activity.findViewById<android.view.View>(R.id.enterUrlButton).performClick()
+        ShadowLooper.idleMainLooper()
+
+        val input = latestDialog().window!!.decorView.findEditText()
+        input!!.setText(
+            (1..2).joinToString(",", "[", "]") {
+                """{"server":"j$it.example","port":995,"secret":"key-$it"}"""
+            }
+        )
+        confirm() // the paste box
+        confirm() // the preview
+
+        assertEquals(2, stored().size)
+    }
+
     // --- ServerListActivity: the add button ---
 
     @Test
@@ -286,6 +351,17 @@ class ImportCallSiteTest {
         confirm()
 
         assertEquals(4, stored().size)
+    }
+
+    @Test
+    fun `the add button reads every item of a multi-item clip`() {
+        setClipboardItems(*(1..3).map { link("m$it.example", "key-$it") }.toTypedArray())
+
+        serverListActivity().findViewById<android.view.View>(R.id.addServerButton).performClick()
+        ShadowLooper.idleMainLooper()
+        confirm()
+
+        assertEquals(3, stored().size)
     }
 
     @Test
@@ -323,6 +399,19 @@ class ImportCallSiteTest {
     }
 
     @Test
+    fun `the receiver reads a multi-line file whole`() {
+        val file = tempFolder.newFile("pool.txt")
+        file.writeText((1..4).joinToString("\n") { link("r$it.example", "key-$it") })
+
+        ConfigImportReceiver().onReceive(
+            context,
+            Intent(ConfigImportReceiver.ACTION_IMPORT_CONFIG).putExtra("file", file.absolutePath),
+        )
+
+        assertEquals(4, stored().size)
+    }
+
+    @Test
     fun `the receiver ignores a broadcast with another action`() {
         ConfigImportReceiver().onReceive(
             context,
@@ -331,4 +420,15 @@ class ImportCallSiteTest {
 
         assertTrue(stored().isEmpty())
     }
+}
+
+/** Depth-first search for the first EditText inside a dialog's view tree. */
+private fun android.view.View.findEditText(): android.widget.EditText? {
+    if (this is android.widget.EditText) return this
+    if (this is android.view.ViewGroup) {
+        for (i in 0 until childCount) {
+            getChildAt(i).findEditText()?.let { return it }
+        }
+    }
+    return null
 }
