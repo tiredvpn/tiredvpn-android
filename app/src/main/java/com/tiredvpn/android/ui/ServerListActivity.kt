@@ -11,6 +11,8 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityServerLocationsBinding
+import com.tiredvpn.android.importer.ConfigCodec
+import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.vpn.ServerPoolConfig
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
@@ -67,6 +69,12 @@ class ServerListActivity : BaseActivity() {
         }
     }
 
+    /**
+     * The add button offers the clipboard only when the clipboard actually holds
+     * something importable - which is decided by parsing it, not by looking for
+     * a substring. The previous heuristic ("contains serverAddress") missed
+     * every link list and every base64 subscription.
+     */
     private fun checkClipboardAndAdd() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clipData = clipboard.primaryClip
@@ -74,52 +82,21 @@ class ServerListActivity : BaseActivity() {
         if (clipData != null && clipData.itemCount > 0) {
             val clipText = (0 until clipData.itemCount)
                 .joinToString("\n") { clipData.getItemAt(it).coerceToText(this).toString() }
-                .trim()
 
-            // Check if clipboard contains server config (tired:// URL anywhere in text, or JSON)
-            val hasLink = VpnConfig.extractTiredUrl(clipText) != null
-            val hasJson = clipText.contains("serverAddress")
-            if (hasLink || hasJson) {
-                MaterialAlertDialogBuilder(this)
-                    .setTitle("Import from Clipboard")
-                    .setMessage("Found server config in clipboard. Import it?")
-                    .setPositiveButton("Import") { _, _ ->
-                        importServerFromClipboard(clipText)
-                    }
-                    .setNegativeButton("Add Manually") { _, _ ->
-                        openServerConfig()
-                    }
-                    .show()
+            val parsed = ConfigCodec.parse(clipText)
+            if (parsed.servers.isNotEmpty()) {
+                ImportPreview.show(this, parsed, fromExternalSource = false) { refreshList() }
                 return
             }
         }
 
-        // No config in clipboard, open manual add
+        // Nothing importable in the clipboard, open manual add
         openServerConfig()
     }
 
     private fun openServerConfig() {
         val intent = Intent(this, ServerConfigActivity::class.java)
         startActivity(intent)
-    }
-
-    private fun importServerFromClipboard(clipText: String) {
-        try {
-            // tired:// link takes priority (tolerant parser handles embedded/whitespace).
-            val config = VpnConfig.fromUrl(clipText)
-                ?: runCatching { VpnConfig.fromJson(org.json.JSONObject(clipText.trim())) }.getOrNull()
-
-            if (config != null && config.isValid) {
-                ServerRepository.saveServer(this, config)
-                ServerRepository.setActiveServerId(this, config.id)
-                refreshList()
-                Toast.makeText(this, "Server imported: ${config.name}", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Invalid server config", Toast.LENGTH_LONG).show()
-            }
-        } catch (e: Exception) {
-            Toast.makeText(this, "Failed to import: ${e.message}", Toast.LENGTH_LONG).show()
-        }
     }
 
     private fun refreshList() {
