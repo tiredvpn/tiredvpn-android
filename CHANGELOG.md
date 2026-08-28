@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-08-29
+
+### Fixed
+
+- **Endpoint rotation now actually happens on a phone.** With several servers
+  configured, a handset that lost its network would re-dial the first one
+  forever and never reach the rest - reproduced on a Pixel 9 dropped onto LTE:
+  sixty dials, one address, five servers untouched. Two core defects were behind
+  it, both fixed in core 1.8.1 and 1.8.2 which this build carries: endpoint
+  health was discarded every time the service rebuilt the client, and a
+  successful pre-flight probe lifted the cooldown that a failed scan had just
+  applied. An address that only times out is also given up on quickly now,
+  instead of being walked through all 21 strategies twice.
+
 ## [1.8.0] - 2026-08-28
 
 ### Added
