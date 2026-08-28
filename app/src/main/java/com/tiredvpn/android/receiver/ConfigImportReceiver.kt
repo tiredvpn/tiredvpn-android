@@ -41,11 +41,31 @@ import java.io.File
  *   "rtt_profile": "moscow-yandex",
  *   "fallback": true,
  *   "debug": false,
+ *   "server_v6": "[2001:db8::1]:995",
+ *   "prefer_ipv6": true,
+ *   "fallback_v4": true,
+ *   "tun_ipv6": "off",
  *   "split_tunneling": {
  *     "mode": "exclude",
  *     "apps": ["com.google.android.youtube", "com.netflix.mediaclient"]
  *   }
  * }
+ *
+ * IPv6 endpoint fields:
+ *  - "server_v6" is the second address of the SAME server, written as host:port
+ *    ("[2001:db8::1]:995" for a literal, "v6.example.com:995" for a name). An
+ *    empty string, or the field being absent, means the server has no IPv6
+ *    endpoint. Entry nodes whose IPv4 address is blocked are reachable only
+ *    through this field, so a config that omits it is half-configured and looks
+ *    fine until the first connection attempt.
+ *  - "prefer_ipv6" dials the IPv6 endpoint first.
+ *  - "fallback_v4" allows falling back to the IPv4 endpoint.
+ *  - "tun_ipv6" is IPv6 INSIDE the tunnel: "off" (v4-only, leaks blackholed) or
+ *    "dual" (dual-stack). Unrelated to how the server is reached.
+ *
+ * Every key also accepts the camelCase spelling used by VpnConfig.toJson()
+ * ("serverAddressV6", "preferIpv6", "fallbackV4", "tunnelIpv6"), so a config
+ * exported by the app can be fed straight back in.
  */
 class ConfigImportReceiver : BroadcastReceiver() {
 
@@ -116,7 +136,14 @@ class ConfigImportReceiver : BroadcastReceiver() {
             rttMasking = json.optBoolean("rtt_masking", json.optBoolean("rttMasking", false)),
             rttProfile = json.optString("rtt_profile", json.optString("rttProfile", "moscow-yandex")),
             fallbackEnabled = json.optBoolean("fallback", json.optBoolean("fallbackEnabled", true)),
-            debugLogging = json.optBoolean("debug", json.optBoolean("debugLogging", false))
+            debugLogging = json.optBoolean("debug", json.optBoolean("debugLogging", false)),
+            // IPv6 endpoint. Without these an imported server carries only its v4
+            // address, which is useless where that address is blocked.
+            serverAddressV6 = json.optString("server_v6", json.optString("serverAddressV6", "")),
+            preferIpv6 = json.optBoolean("prefer_ipv6", json.optBoolean("preferIpv6", false)),
+            fallbackV4 = json.optBoolean("fallback_v4", json.optBoolean("fallbackV4", true)),
+            // IPv6 inside the tunnel: "off" or "dual"
+            tunnelIpv6 = json.optString("tun_ipv6", json.optString("tunnelIpv6", "off"))
         )
 
         if (!config.isValid) {
