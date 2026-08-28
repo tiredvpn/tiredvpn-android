@@ -118,6 +118,17 @@ data class VpnConfig(
             if (rttProfile != "moscow-yandex") params.add("rttProfile=" + Uri.encode(rttProfile))
         }
         if (!fallbackEnabled) params.add("fallback=false")
+        if (debugLogging) params.add("debug=true")
+        if (connectionMode != "tun") params.add("mode=" + Uri.encode(connectionMode))
+        if (proxyPort != 8080) params.add("proxyPort=$proxyPort")
+        if (portHoppingEnabled) {
+            params.add("hop=true")
+            if (portHopRangeStart != 47000) params.add("hopStart=$portHopRangeStart")
+            if (portHopRangeEnd != 65535) params.add("hopEnd=$portHopRangeEnd")
+            if (portHopIntervalMs != 60_000L) params.add("hopInterval=$portHopIntervalMs")
+            if (portHopStrategy != "random") params.add("hopStrategy=" + Uri.encode(portHopStrategy))
+            portHopSeed?.takeIf { it.isNotEmpty() }?.let { params.add("hopSeed=" + Uri.encode(it)) }
+        }
         if (shaperPreset.isNotEmpty()) params.add("shaper=" + Uri.encode(shaperPreset))
         if (shaperSeed != 0L) params.add("shaperSeed=$shaperSeed")
         if (echEnabled) {
@@ -219,23 +230,33 @@ data class VpnConfig(
             "fibonacci" to "Fibonacci"
         )
 
-        // Matches a tired:// link possibly embedded in surrounding text (share messages, etc.)
-        private val TIRED_URL_REGEX = Regex("""tired://[^\s]+""", RegexOption.IGNORE_CASE)
+        // Matches a tired:// link embedded in surrounding text: a chat message, a
+        // JSON string, a shell here-doc.
+        //
+        // A link ends at whitespace or at one of the characters that can only be
+        // structure around it. Square brackets are NOT in that set - an IPv6
+        // authority is written [2001:db8::1]:995 - and neither are a comma, an
+        // apostrophe or a closing parenthesis, which Android's Uri.encode leaves
+        // literal inside a name or a secret.
+        private val TIRED_URL_REGEX =
+            Regex("""tired://[^\s"<>\\`|^{}]+""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Extract every tired:// link from arbitrary clipboard/shared text, in the
+         * order they appear. A link ends at the first delimiter, so a
+         * newline-separated list, a single link, a link inside a JSON string and a
+         * link wrapped in a chat message all come out the same way.
+         */
+        fun extractTiredUrls(text: String?): List<String> {
+            if (text.isNullOrBlank()) return emptyList()
+            return TIRED_URL_REGEX.findAll(text).map { it.value }.toList()
+        }
 
         /**
          * Extract a tired:// link from arbitrary clipboard/shared text.
-         * Handles leading/trailing whitespace, newlines, and links wrapped in a message.
          * Returns null if no tired:// link is present.
          */
-        fun extractTiredUrl(text: String?): String? {
-            if (text.isNullOrBlank()) return null
-            val trimmed = text.trim()
-            if (trimmed.startsWith("tired://", ignoreCase = true)) {
-                // Whole text is the link; strip any trailing whitespace/newlines only
-                return trimmed.substringBefore('\n').trim().ifEmpty { null }
-            }
-            return TIRED_URL_REGEX.find(trimmed)?.value
-        }
+        fun extractTiredUrl(text: String?): String? = extractTiredUrls(text).firstOrNull()
 
         /**
          * Parse a tired:// URL into a VpnConfig. Tolerant of surrounding text via [extractTiredUrl].
@@ -282,6 +303,15 @@ data class VpnConfig(
                     rttMasking = uri.getQueryParameter("rtt")?.toBooleanStrictOrNull() ?: false,
                     rttProfile = uri.getQueryParameter("rttProfile") ?: "moscow-yandex",
                     fallbackEnabled = uri.getQueryParameter("fallback")?.toBooleanStrictOrNull() ?: true,
+                    debugLogging = uri.getQueryParameter("debug")?.toBooleanStrictOrNull() ?: false,
+                    connectionMode = uri.getQueryParameter("mode") ?: "tun",
+                    proxyPort = uri.getQueryParameter("proxyPort")?.toIntOrNull() ?: 8080,
+                    portHoppingEnabled = uri.getQueryParameter("hop")?.toBooleanStrictOrNull() ?: false,
+                    portHopRangeStart = uri.getQueryParameter("hopStart")?.toIntOrNull() ?: 47000,
+                    portHopRangeEnd = uri.getQueryParameter("hopEnd")?.toIntOrNull() ?: 65535,
+                    portHopIntervalMs = uri.getQueryParameter("hopInterval")?.toLongOrNull() ?: 60_000L,
+                    portHopStrategy = uri.getQueryParameter("hopStrategy") ?: "random",
+                    portHopSeed = uri.getQueryParameter("hopSeed")?.takeIf { it.isNotEmpty() },
                     shaperPreset = uri.getQueryParameter("shaper") ?: "",
                     shaperSeed = uri.getQueryParameter("shaperSeed")?.toLongOrNull() ?: 0L,
                     echEnabled = uri.getQueryParameter("ech")?.toBooleanStrictOrNull() ?: false,
