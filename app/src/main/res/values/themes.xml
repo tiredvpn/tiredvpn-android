@@ -32,6 +32,16 @@
         <item name="colorControlHighlight">@color/ripple</item>
     </style>
 
+    <!-- Chromeless host for the import confirmation dialog: the activity itself
+         draws nothing, only the dialog is visible. -->
+    <style name="Theme.TiredVPN.Transparent" parent="Theme.TiredVPN">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+
     <!-- Button styles -->
     <style name="Theme.TiredVPN.Button.Primary" parent="Widget.Material3.Button">
         <item name="backgroundTint">@color/primary</item>
