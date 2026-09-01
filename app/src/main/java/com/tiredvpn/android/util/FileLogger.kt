@@ -25,7 +25,13 @@ object FileLogger {
     private val dateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
     fun init(context: Context) {
-        logFile = File(context.filesDir, LOG_FILE_NAME)
+        init(File(context.filesDir, LOG_FILE_NAME))
+    }
+
+    /** Target file as an explicit parameter, so the writer can be tested without a Context. */
+    internal fun init(file: File) {
+        logFile = file
+        closeWriter()
         startWriterThread()
         log("I", TAG, "=== FileLogger initialized ===")
     }
@@ -87,27 +93,64 @@ object FileLogger {
         }
     }
 
+    /**
+     * The writer is held open across flushes instead of being reopened on each
+     * pass. The old code built a FileOutputStream ten times a second, which
+     * made this thread by far the most frequent caller of open() in the
+     * process — and therefore the one that inherited any descriptor number
+     * freed behind its owner's back, aborting on the fdsan ownership check.
+     * The double close it tripped over lived in the TUN cleanup, not here, but
+     * opening two orders of magnitude less often removes this thread as the
+     * standing target and cuts the wakeup cost of idle logging.
+     */
+    private var writer: OutputStreamWriter? = null
+
+    private fun openWriter(file: File): OutputStreamWriter? =
+        writer ?: try {
+            OutputStreamWriter(FileOutputStream(file, true), Charsets.UTF_8).also { writer = it }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open log file", e)
+            null
+        }
+
+    private fun closeWriter() {
+        try {
+            writer?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close log file", e)
+        }
+        writer = null
+    }
+
     private fun writeQueuedLogs() {
         val file = logFile ?: return
         if (logQueue.isEmpty()) return
 
         try {
             if (file.exists() && file.length() > MAX_FILE_SIZE) {
+                // Dropped before rotation on purpose, but not because the held
+                // handle would corrupt anything: the stream is opened in append
+                // mode, so each write lands at the current end even after
+                // rotateLog truncates. Breaking this on purpose does not turn
+                // any test red, and it should not be read as load-bearing — it
+                // only keeps the invariant if the open mode ever changes.
+                closeWriter()
                 rotateLog(file)
             }
 
-            FileOutputStream(file, true).use { fos ->
-                OutputStreamWriter(fos, Charsets.UTF_8).use { writer ->
-                    var line: String?
-                    var count = 0
-                    while (logQueue.poll().also { line = it } != null && count < 100) {
-                        writer.appendLine(line)
-                        count++
-                    }
-                }
+            val out = openWriter(file) ?: return
+            var line: String?
+            var count = 0
+            while (logQueue.poll().also { line = it } != null && count < 100) {
+                out.appendLine(line)
+                count++
             }
+            out.flush()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write logs", e)
+            // A broken handle must not be reused: the file may have been
+            // rotated or deleted from under us.
+            closeWriter()
         }
     }
 
@@ -133,6 +176,9 @@ object FileLogger {
     }
 
     fun clear() {
+        // Close before deleting, or the open handle keeps writing to an
+        // unlinked inode and the UI shows an empty log that never fills.
+        closeWriter()
         logFile?.let { file ->
             if (file.exists()) {
                 file.delete()
@@ -144,5 +190,6 @@ object FileLogger {
         isRunning.set(false)
         writerThread?.interrupt()
         writeQueuedLogs()
+        closeWriter()
     }
 }

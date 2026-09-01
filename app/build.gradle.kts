@@ -111,6 +111,10 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            // Lets plain JUnit tests exercise classes that call android.util.Log
+            // without stubbing it. Robolectric cannot stand in here: 4.16.1 caps
+            // at SDK 36 and this module targets 37.
+            isReturnDefaultValues = true
         }
     }
 

@@ -148,6 +148,14 @@ class TiredVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+
+    /**
+     * Every TUN descriptor this service established, so cleanup can close our
+     * orphans without touching descriptors owned by someone else. See
+     * TunHandleRegistry for why closing by number aborted the process.
+     */
+    private val tunHandles = TunHandleRegistry<ParcelFileDescriptor> { it.close() }
+
     private var tiredvpnProcess: TiredVpnProcess? = null  // Can be NativeProcess or NativeProcessJNI
     private var controlSocket: LocalSocket? = null
     private var statusMonitorJob: Job? = null
@@ -567,9 +575,9 @@ class TiredVpnService : VpnService() {
         // Stop protect server
         stopProtectServer()
 
-        // Close VPN interface
-        try { vpnInterface?.close() } catch (_: Exception) {}
+        // Close VPN interface (through the ledger, so it is closed exactly once)
         vpnInterface = null
+        tunHandles.releaseAll()
 
         // Clean up socket files
         File("${filesDir.absolutePath}/control.sock").delete()
@@ -629,25 +637,15 @@ class TiredVpnService : VpnService() {
         // 6. Kill any leaked native processes
         NativeProcess.killAllTiredVpnProcesses(applicationInfo.nativeLibraryDir)
 
-        // 7. Close VPN interface
-        try { vpnInterface?.close() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: close vpnInterface", e) }
+        // 7. Drop the current interface; step 8 closes it along with our orphans.
         vpnInterface = null
 
-        // 8. Force-close any remaining /dev/tun fds Go didn't release yet.
-        // Guarded by vpnInterface == null: a new connect() may already be
-        // establishing a fresh TUN interface while this delayed sweep runs, and
-        // blindly adopting that live fd races with its owning ParcelFileDescriptor,
-        // aborting the process via fdsan ("expected to be unowned"). Once a new
-        // vpnInterface is assigned, the fd is no longer an orphan — stop sweeping.
+        // 8. Close the TUN descriptors we still own. One pass is enough now:
+        // the ledger already holds every descriptor this service established,
+        // so there is nothing to wait for. The old delayed sweep existed only
+        // to catch descriptors appearing later in /proc/self/fd, which is the
+        // scan that could reach the core's dup and abort the process.
         forceCloseTunFds()
-        Thread {
-            repeat(10) {
-                Thread.sleep(100)
-                if (vpnInterface == null) {
-                    forceCloseTunFds()
-                }
-            }
-        }.apply { isDaemon = true; start() }
 
         // 9. Delete socket files and the generated endpoint pool
         File("${filesDir.absolutePath}/control.sock").delete()
@@ -787,7 +785,18 @@ class TiredVpnService : VpnService() {
             if (newVpnFd == null) {
                 FileLogger.e(TAG, "Failed to recreate VPN interface with new IP")
             } else {
+                // Close the interface we are superseding. Leaving it open was
+                // how /dev/tun descriptors accumulated across reconnects (tun0,
+                // tun1, tun2 alive at once with frozen counters), which is what
+                // the by-number sweep was later invented to mop up.
+                val superseded = vpnInterface
                 vpnInterface = newVpnFd
+                if (superseded != null && superseded !== newVpnFd) {
+                    tunHandles.forget(superseded)
+                    try { superseded.close() } catch (e: Exception) {
+                        FileLogger.w(TAG, "Failed to close superseded VPN interface: ${e.message}")
+                    }
+                }
                 tunFd = newVpnFd.fd
 
                 val newFinalIp = sendTunFd(tunFd)
@@ -876,6 +885,7 @@ class TiredVpnService : VpnService() {
             throw RuntimeException("Failed to establish VPN interface for proxy")
         }
         vpnInterface = vpnFd
+        tunHandles.track(vpnFd)
 
         // 4. Update state
         val proxyAddress = "127.0.0.1:${config.proxyPort}"
@@ -2105,11 +2115,12 @@ class TiredVpnService : VpnService() {
                     val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
                     val linkProps = connectivityManager.getLinkProperties(network)
                     linkProps?.let { props ->
-                        val addresses = props.linkAddresses
-                            .filter { it.address is java.net.Inet4Address }
-                            .map { it.address.hostAddress }
-                            .sorted()
-                            .joinToString(",")
+                        // Same fingerprint as onLinkPropertiesChanged below: both write
+                        // lastLinkProperties, so they must agree on the format or each
+                        // would read the other's value as a change.
+                        val addresses = NetworkFingerprint.of(
+                            props.linkAddresses.map { it.address to it.prefixLength }
+                        )
 
                         // Check if IP addresses actually changed
                         if (lastLinkProperties.isNotEmpty() && addresses != lastLinkProperties) {
@@ -2205,11 +2216,16 @@ class TiredVpnService : VpnService() {
             override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) {
                 // BUG FIX 1: Only trigger reconnect if IP addresses actually changed
                 // On some devices (Pixel 6) this fires constantly even when nothing changed
-                val addresses = linkProperties.linkAddresses
-                    .filter { it.address is java.net.Inet4Address } // Only IPv4
-                    .map { it.address.hostAddress }
-                    .sorted()
-                    .joinToString(",")
+                //
+                // Both families count now. The old filter kept IPv4 only, so a network
+                // that moved to a different IPv6 prefix while holding its v4 address
+                // looked unchanged and never triggered a reconnect — the common case on
+                // a home router handing out a short IPv6 lifetime. IPv6 is compared by
+                // prefix so RFC 4941 temporary-address rotation inside one prefix does
+                // not turn into a reconnect storm; see NetworkFingerprint.
+                val addresses = NetworkFingerprint.of(
+                    linkProperties.linkAddresses.map { it.address to it.prefixLength }
+                )
 
                 FileLogger.i(TAG, "Network link properties changed: $network, addresses: [$addresses]")
 
@@ -2779,6 +2795,9 @@ class TiredVpnService : VpnService() {
                 // NOW close old interface AFTER new one is active
                 oldVpnFd?.let { oldVpn ->
                     FileLogger.d(TAG, "Closing old VPN interface fd=${oldVpn.fd}")
+                    // Drop it from the ledger first: once closed, its number can
+                    // be reused by anyone, and a later sweep must not reach it.
+                    tunHandles.forget(oldVpn)
                     try { oldVpn.close() } catch (e: Exception) {
                         FileLogger.w(TAG, "Error closing old VPN interface: ${e.message}")
                     }
@@ -2969,9 +2988,9 @@ class TiredVpnService : VpnService() {
                 }
 
                 FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Close VPN interface")
-                // 5. Close VPN interface
-                try { vpnInterface?.close() } catch (_: Exception) {}
+                // 5. Close VPN interface (through the ledger: closed once, ours only)
                 vpnInterface = null
+                tunHandles.releaseAll()
 
                 FileLogger.d(TAG, "executeReconnectSequence: Critical cleanup completed, exiting NonCancellable context")
             }
@@ -3039,7 +3058,15 @@ class TiredVpnService : VpnService() {
         }
     }
 
-    private fun establishVpn(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {
+    /**
+     * Establish a TUN interface and record it as ours. Tracking happens here,
+     * at the single point where a descriptor comes into existence, so no call
+     * site can create one that cleanup does not know about.
+     */
+    private fun establishVpn(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? =
+        establishVpnInterface(config, tunConfig)?.also { tunHandles.track(it) }
+
+    private fun establishVpnInterface(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {
         return try {
             // FIX: Use default IP if "auto" or "0.0.0.0" to avoid VPN interface creation failure
             val effectiveIp = when {
@@ -3251,26 +3278,14 @@ class TiredVpnService : VpnService() {
         // Kill any orphan tiredvpn processes that might have leaked
         NativeProcess.killAllTiredVpnProcesses(applicationInfo.nativeLibraryDir)
 
-        // Close VPN interface
-        try {
-            vpnInterface?.close()
-            FileLogger.d(TAG, "VPN interface closed")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "Error closing VPN interface", e)
-        }
+        // Close the VPN interface and every other descriptor we established.
+        // Going through the ledger means each one is closed exactly once and
+        // nothing outside it is touched; the previous delayed /proc/self/fd
+        // sweep ran unguarded here and could close the core's dup, which is
+        // what turned a disconnect into a fdsan SIGABRT.
         vpnInterface = null
-
-        // Force-close any remaining /dev/tun fds that Go goroutines didn't release.
-        // cleanupNative() is async — goroutines may not have closed their dup'd fds yet.
-        // We run an immediate pass plus a background thread that keeps closing new dups
-        // as Go finishes shutting down (typically takes <500ms).
-        forceCloseTunFds()
-        Thread {
-            repeat(10) {
-                Thread.sleep(100)
-                forceCloseTunFds()
-            }
-        }.apply { isDaemon = true; start() }
+        val closedOnDisconnect = tunHandles.releaseAll()
+        FileLogger.d(TAG, "VPN interface closed ($closedOnDisconnect TUN fd(s))")
 
         // Release WakeLock
         releaseWakeLock()
@@ -3357,28 +3372,26 @@ class TiredVpnService : VpnService() {
         _connectingPhase.value = ""
     }
 
+    /**
+     * Close the TUN descriptors we established and no longer use.
+     *
+     * This used to walk /proc/self/fd and close by number every entry whose
+     * readlink target was /dev/tun. That reached descriptors we do not own —
+     * the interface a concurrent connect() had just established, and the dup
+     * the Go core holds after receiving the fd over SCM_RIGHTS. Freeing a
+     * number behind its owner's back gets it handed to the next open() in the
+     * process, and fdsan aborts on the ownership mismatch; the process died
+     * with SIGABRT on a network change and nothing brought the VPN back. The
+     * `vpnInterface == null` guard around the delayed sweep narrowed the race
+     * but could not close it: the check and the close were not atomic, and it
+     * never protected the core's dup at all.
+     *
+     * The ledger cannot name a descriptor by number, so a foreign fd is now
+     * unreachable by construction rather than by timing.
+     */
     private fun forceCloseTunFds() {
-        try {
-            val entries = File("/proc/self/fd").list() ?: return
-            var closed = 0
-            for (entry in entries) {
-                val fdNum = entry.toIntOrNull() ?: continue
-                try {
-                    val target = Os.readlink("/proc/self/fd/$entry")
-                    if (target == "/dev/tun") {
-                        ParcelFileDescriptor.adoptFd(fdNum).close()
-                        closed++
-                    }
-                } catch (_: android.system.ErrnoException) {
-                    // ENOENT = fd closed between list() and readlink() — normal race, ignore
-                } catch (e: Exception) {
-                    FileLogger.w(TAG, "forceCloseTunFds: fd=$entry: ${e.message}")
-                }
-            }
-            if (closed > 0) FileLogger.i(TAG, "Force-closed $closed orphan TUN fd(s)")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "forceCloseTunFds failed: ${e.message}")
-        }
+        val closed = tunHandles.releaseAllExcept(vpnInterface)
+        if (closed > 0) FileLogger.i(TAG, "Closed $closed orphan TUN fd(s) we owned")
     }
 
     override fun onDestroy() {
