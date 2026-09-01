@@ -46,8 +46,13 @@ class TiredVpnService : VpnService() {
     companion object {
         private const val TAG = "TiredVpnService"
         private const val NOTIFICATION_ID = 1
-        private const val CONTROL_SOCKET_TIMEOUT = 30_000 // 30 sec for connection
-        private const val CONNECTION_TIMEOUT = 30_000L // 30 sec max for full connection
+        private const val CONTROL_SOCKET_TIMEOUT = 30_000 // 30 sec for the socket file to appear
+
+        // Connect budget derived from the core's Android profile; see ConnectBudget
+        // for where each factor comes from and why 30s was short.
+        private const val CONTROL_SOCKET_READ_TIMEOUT =
+            ConnectBudget.CONTROL_SOCKET_READ_TIMEOUT_MS.toInt()
+        private const val CONNECTION_TIMEOUT = ConnectBudget.CONNECT_TIMEOUT_MS
 
         // IPv4 resolver used as backup, and as replacement for a configured IPv6
         // resolver, which is unreachable behind the IPv6 blackhole (see Ipv6Guard)
@@ -1694,9 +1699,10 @@ class TiredVpnService : VpnService() {
             FileLogger.d(TAG, "connectToControlSocket: connecting to LocalSocket...")
             controlSocket = LocalSocket().apply {
                 connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
-                // Set read timeout to prevent indefinite blocking
-                // Increased to 60s to allow all strategies to be tried (can take up to 40s)
-                setSoTimeout(25_000)  // 25 second timeout (must be < CONNECTION_TIMEOUT=30s)
+                // Read timeout, so a wedged core cannot block us forever. Sized to
+                // outlast one full Connect in the core and to stay below
+                // CONNECTION_TIMEOUT, which is the outer fence.
+                setSoTimeout(CONTROL_SOCKET_READ_TIMEOUT)
             }
             FileLogger.d(TAG, "connectToControlSocket: LocalSocket connected!")
 
@@ -1714,8 +1720,20 @@ class TiredVpnService : VpnService() {
             writer.flush()
             FileLogger.d(TAG, "connectToControlSocket: 'connect' sent, waiting for response...")
 
-            // Read response with tunnel config
-            val response = reader.readLine() ?: throw Exception("No response from control socket")
+            // Read the response, stepping over any asynchronous event that got
+            // in front of it. The core registers this connection as its event
+            // sink before it starts reading commands, so a keepalive can arrive
+            // between our write and its answer; treating that line as the
+            // response failed the connect on a healthy core.
+            var response: String? = null
+            while (response == null) {
+                val line = reader.readLine() ?: throw Exception("No response from control socket")
+                if (ControlSocketProtocol.isEvent(line)) {
+                    FileLogger.d(TAG, "connectToControlSocket: skipping event line: $line")
+                    continue
+                }
+                response = line
+            }
             FileLogger.d(TAG, "connectToControlSocket: got response: $response")
             val json = JSONObject(response)
 
