@@ -7,6 +7,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-02
+
+### Fixed
+
+- **The VPN no longer dies when the network changes.** On a Pixel dropped between
+  Wi-Fi and LTE the service could abort with a native `fdsan` crash and never come
+  back - the tunnel was simply gone until the app was reopened, and often not even
+  then. The cause was not the logger that showed up in every stack trace: the
+  teardown path closed TUN file descriptors by number, walking `/proc/self/fd`,
+  and so reclaimed descriptors that the core (or a parallel connect) still owned.
+  The next `open()` in the process inherited a number fdsan believed was free, and
+  the kernel killed the process. Descriptors are now tracked by handle and only
+  the ones we actually own are ever closed. Verified on device across eighteen
+  network transitions with no crash and a single stable process.
+
+- **Connecting no longer gives up in the middle of a scan.** The service capped a
+  whole connection attempt at ~25 seconds, but a full strategy scan on the core
+  can run to about 46 seconds in the worst case, so a healthy connect was cut off
+  partway through and reported as a failure. The socket read and overall timeouts
+  are now derived from the core's own limits (50 s read, 60 s overall) instead of
+  a round number, with the socket giving up before the outer deadline.
+
+- **IPv6-only network changes are now noticed.** The link-properties watcher only
+  compared IPv4 addresses, so a network that changed only its IPv6 prefix - common
+  behind routers that hand out short-lived prefixes - never triggered a reconnect.
+  IPv6 is now compared by prefix (not by full address, which would storm on
+  RFC 4941 temporary-address rotation), and link-local addresses are ignored for
+  both families.
+
+### Changed
+
+- Bundled core updated to 1.10.0.
+
 ## [1.8.1] - 2026-08-29
 
 ### Fixed
