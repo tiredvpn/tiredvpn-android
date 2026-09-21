@@ -31,6 +31,7 @@ import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivitySettingsBinding
 import com.tiredvpn.android.importer.ConfigCodec
 import com.tiredvpn.android.importer.ImportPreview
+import com.tiredvpn.android.util.SharedFiles
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnState
@@ -493,7 +494,9 @@ class SettingsActivity : BaseActivity() {
     private fun exportAndShare(servers: List<VpnConfig>) {
         try {
             val json = JSONArray().apply { servers.forEach { put(it.toJson()) } }
-            val file = File(cacheDir, "tiredvpn-backup.json")
+            // SharedFiles and not cacheDir: FileProvider only grants the two
+            // subdirectories declared in file_paths.xml.
+            val file = SharedFiles.file(this, "tiredvpn-backup.json")
             file.writeText(json.toString(2))
 
             val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)

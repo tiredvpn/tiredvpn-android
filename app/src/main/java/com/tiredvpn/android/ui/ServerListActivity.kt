@@ -145,18 +145,16 @@ class ServerListActivity : BaseActivity() {
                 launch {
                     val latency = latencyProbe(server)
 
-                    // Re-read before writing. The captured `server` is a whole
-                    // record from up to three seconds ago; saving a copy of it
-                    // would resurrect a server deleted meanwhile and would roll
-                    // back any edit or import that landed while we waited.
-                    val current = ServerRepository.getServer(this@ServerListActivity, server.id)
-                        ?: return@launch
-                    if (current.lastLatencyMs != latency) {
-                        ServerRepository.saveServer(
-                            this@ServerListActivity,
-                            current.copy(lastLatencyMs = latency)
-                        )
-                    }
+                    // updateLatency and not a read-then-save pair: the captured
+                    // `server` is a whole record from up to three seconds ago,
+                    // and re-reading it here narrows the window without closing
+                    // it — getServer and saveServer take the repository's lock
+                    // separately, so a delete or an edit can still land between
+                    // them. updateLatency exists to do the whole read, check
+                    // and write inside one critical section, and is the only
+                    // caller-visible way to write a latency without rewriting
+                    // the record around it.
+                    ServerRepository.updateLatency(this@ServerListActivity, server.id, latency)
 
                     // Already on the main dispatcher here (lifecycleScope).
                     repaintList()

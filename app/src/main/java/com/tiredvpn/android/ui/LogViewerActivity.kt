@@ -13,6 +13,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityLogViewerBinding
 import com.tiredvpn.android.util.FileLogger
+import com.tiredvpn.android.util.SharedFiles
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -168,7 +169,12 @@ class LogViewerActivity : BaseActivity() {
     private fun doShareLogs() {
         lifecycleScope.launch {
             val file = withContext(Dispatchers.IO) {
-                val shareFile = File(cacheDir, "tiredvpn_logs.txt")
+                // SharedFiles and not cacheDir: FileProvider only grants the
+                // two subdirectories declared in file_paths.xml, and the
+                // fallback below is silent — a file written outside them turns
+                // "share the log file" into "paste the log as a message" with
+                // nothing said about it.
+                val shareFile = SharedFiles.file(this@LogViewerActivity, "tiredvpn_logs.txt")
                 shareFile.writeText(currentLogs)
                 shareFile
             }

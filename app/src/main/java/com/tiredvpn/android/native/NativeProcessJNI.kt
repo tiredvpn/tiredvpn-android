@@ -192,10 +192,20 @@ class NativeProcessJNI(
     /**
      * Record that the core has gone, once.
      *
-     * The `isStarted` guard also filters cross-talk: a superseded core's
-     * terminal callback can still be in flight when a new instance registers
-     * itself, and acting on it would mark a freshly started core dead.
-     * [TiredVpnNative.reset] closes the common case; this closes the rest.
+     * The `isStarted` guard makes this idempotent for *this* instance, and
+     * that is all it does. It is not a filter against cross-talk, whatever it
+     * said here before: there is one global callback object on the JNI side
+     * (`g_callback_obj`), so a superseded core's terminal callback arriving
+     * after a new instance has registered is delivered to the new instance,
+     * where `isStarted` is true and the message goes straight through —
+     * marking a healthy core dead.
+     *
+     * Closing that needs an instance number carried through `initNative` and
+     * handed back with the callback, i.e. a change on the Go side. Until then
+     * the mitigation is ordering: [TiredVpnNative.reset] and the `cleanup()`
+     * on every teardown path drop the bridge before the next `initialize`,
+     * which leaves a late callback with nowhere to land as long as the two do
+     * not overlap.
      */
     private fun markExited(code: Int) {
         if (!isStarted) {

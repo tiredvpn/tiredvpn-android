@@ -181,17 +181,31 @@ class VpnWatchdogWorker(
             FileLogger.i(TAG, "=== WATCHDOG RESTARTING VPN ===")
             FileLogger.i(TAG, "State: $currentState, Network: available, Config: valid")
 
-            // Result.retry() and not success: on Android 12+ a background
-            // process is not allowed to start a foreground service, so this is
-            // the normal outcome rather than an exotic one. The old code caught
-            // the exception inside restartVpn and returned success anyway, so
-            // the watchdog looked healthy in every log while never once
-            // restarting the tunnel.
-            return if (restartVpn()) Result.success() else Result.retry()
+            // Result.success() even when the start was refused, and the log
+            // line carries the bad news instead.
+            //
+            // Not for want of honesty — Result.retry() on a *periodic* worker
+            // is not "run again next period". WorkSpec.calculateNextRunTime()
+            // checks isBackedOff() before isPeriodic(), so a retry replaces the
+            // 15-minute period with the backoff policy: exponential from 30s,
+            // doubling, capped at WorkRequest.MAX_BACKOFF_MILLIS = 5 hours,
+            // and runAttemptCount only resets on success. On Android 12+ a
+            // background process is flatly not allowed to start a foreground
+            // service, so the refusal is systematic rather than transient: ten
+            // refusals in a row and the only thing that brings the tunnel back
+            // on its own is checking once every five hours.
+            if (!restartVpn()) {
+                FileLogger.e(TAG, "=== WATCHDOG COULD NOT RESTART THE VPN === the system refused the service start; retrying in ${CHECK_INTERVAL_MINUTES}min")
+            }
+            return Result.success()
 
         } catch (e: Exception) {
-            FileLogger.e(TAG, "Watchdog check failed", e)
-            return Result.failure()
+            // Also success, and for a sharper reason: Result.failure() is
+            // terminal for periodic work. One exception here — a Keystore
+            // hiccup inside getActiveServer, say — and the watchdog is not
+            // rescheduled at all, ever, for the lifetime of the install.
+            FileLogger.e(TAG, "Watchdog check failed; keeping the ${CHECK_INTERVAL_MINUTES}min period", e)
+            return Result.success()
         }
     }
 

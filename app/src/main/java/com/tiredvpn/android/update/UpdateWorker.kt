@@ -307,7 +307,7 @@ class UpdateWorker(
     private fun buildProgressNotification(progress: Int) =
         NotificationCompat.Builder(applicationContext, PROGRESS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_cloud_upload)
-            .setContentTitle("Загрузка обновления")
+            .setContentTitle(applicationContext.getString(R.string.update_download_title))
             .setProgress(100, progress, progress == 0)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -328,10 +328,10 @@ class UpdateWorker(
         notificationManager.createNotificationChannel(
             NotificationChannel(
                 PROGRESS_CHANNEL_ID,
-                "Загрузка обновлений",
+                applicationContext.getString(R.string.update_download_channel),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Ход загрузки новой версии"
+                description = applicationContext.getString(R.string.update_download_channel_desc)
                 setShowBadge(false)
             }
         )

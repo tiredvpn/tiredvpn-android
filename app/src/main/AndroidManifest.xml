@@ -212,15 +212,22 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <!-- Direct boot (before unlock) - requires directBootAware="true" -->
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-                <!-- Quick boot on some devices.
+                <!-- No QUICKBOOT_POWERON, in either spelling.
 
-                     com.htc.intent.action.QUICKBOOT_POWERON used to be here too.
-                     It is a vendor action and is not in the platform's protected
-                     broadcast list, so any installed app could send it straight
-                     to this exported receiver and have the VPN brought up. The
-                     three actions left are all protected: only the system can
-                     send them. -->
-                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                     Both com.htc.intent.action.QUICKBOOT_POWERON and the
+                     android.intent.action.* one used to be here. Dropping only
+                     the vendor-prefixed one and calling the rest protected was
+                     wrong: neither spelling appears in the platform's
+                     <protected-broadcast> list in
+                     frameworks/base/core/res/AndroidManifest.xml, so any
+                     installed app could send either straight to this exported,
+                     permission-less receiver and have handleBootEvent start the
+                     VPN at a moment of its choosing.
+
+                     Every action below is protected - only the system can send
+                     BOOT_COMPLETED, LOCKED_BOOT_COMPLETED, REBOOT and
+                     MY_PACKAGE_REPLACED - and between them they cover booting
+                     on anything current. -->
                 <action android:name="android.intent.action.REBOOT" />
                 <!-- App updated - restart VPN if was running -->
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />

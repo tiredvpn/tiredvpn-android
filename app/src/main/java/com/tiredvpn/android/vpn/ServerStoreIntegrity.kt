@@ -84,3 +84,189 @@ internal object ServerStoreIntegrity {
     /** True when [raw] may be destroyed because a good copy was made from it. */
     fun isSafeToClearSource(raw: String?): Boolean = classify(raw) !is Verdict.Corrupt
 }
+
+/**
+ * What to do with a plaintext server list that is sitting next to an encrypted
+ * one.
+ *
+ * The plaintext store is a fallback: when the Keystore cannot be opened,
+ * [ServerRepository] keeps working by reading and writing plain preferences, and
+ * whatever the user does during that spell lands there. Folding that back in
+ * used to be a copy — plaintext payload over encrypted payload, plaintext active
+ * id over encrypted active id, source cleared — on the theory that the plaintext
+ * copy is by definition the newer one.
+ *
+ * It is not. During a degraded spell the *reads* come from plaintext too, so it
+ * starts from whatever was there (usually nothing) rather than from the real
+ * list; and a plaintext copy left behind by a Keystore failure on some older
+ * build is not newer than anything. The copy therefore replaced a full list with
+ * a stale or empty one, and `putString(active_id, null)` removed the active
+ * server on the way past. Secrets live in exactly one place, so that was
+ * unrecoverable.
+ *
+ * What this does instead: union by id. Every server present on either side
+ * survives. Where an id is on both sides the encrypted record wins, because the
+ * realistic way to get a conflicting id is a stale snapshot of the same server,
+ * while the realistic way to get a *new* server during a degraded spell is an
+ * import, which mints a fresh id. The active id is only ever set, never cleared,
+ * and only when the encrypted store does not name one already.
+ */
+internal object StoreReconciliation {
+
+    sealed class Plan {
+        /** No plaintext list at all. Touch nothing. */
+        data object Nothing : Plan()
+
+        /**
+         * One of the two payloads is not a closed JSON array. Migrate nothing
+         * and — this is the point — clear nothing either.
+         */
+        data class Refuse(val reason: String) : Plan()
+
+        /**
+         * Write [payload] into the encrypted store, confirm it reads back with
+         * every id in [expectedIds], and only then clear the plaintext source.
+         *
+         * [activeId] is null when the encrypted store's active id must be left
+         * exactly as it is.
+         */
+        data class Fold(
+            val payload: String,
+            val activeId: String?,
+            val expectedIds: List<String>,
+        ) : Plan()
+    }
+
+    fun plan(
+        encryptedPayload: String?,
+        encryptedActiveId: String?,
+        plainPayload: String?,
+        plainActiveId: String?,
+        plainHasList: Boolean,
+    ): Plan {
+        if (!plainHasList) return Plan.Nothing
+
+        val plain = ServerStoreIntegrity.classify(plainPayload)
+        if (plain is ServerStoreIntegrity.Verdict.Corrupt) {
+            return Plan.Refuse("the plaintext server list is damaged")
+        }
+        val encrypted = ServerStoreIntegrity.classify(encryptedPayload)
+        if (encrypted is ServerStoreIntegrity.Verdict.Corrupt) {
+            // Merging would mean parsing what we just called unparseable, i.e.
+            // dropping it. Leave both copies alone and let the loader shout.
+            return Plan.Refuse("the encrypted server list is damaged")
+        }
+
+        val encryptedElements = elementsOf(encrypted)
+        val plainElements = elementsOf(plain)
+
+        val merged = mutableListOf<String>()
+        val ids = mutableListOf<String?>()
+        for (element in encryptedElements) {
+            merged.add(element)
+            ids.add(idOf(element))
+        }
+        val known = ids.filterNotNull().toMutableSet()
+        for (element in plainElements) {
+            val id = idOf(element)
+            // A record with no readable id cannot be deduplicated, so it is
+            // kept: a duplicate is repairable, a dropped server is not.
+            if (id != null && !known.add(id)) continue
+            merged.add(element)
+            ids.add(id)
+        }
+
+        val activeId = plainActiveId
+            ?.takeIf { encryptedActiveId == null }
+            ?.takeIf { candidate -> ids.any { it == candidate } }
+
+        return Plan.Fold(
+            payload = merged.joinToString(prefix = "[", separator = ",", postfix = "]"),
+            activeId = activeId,
+            expectedIds = ids.filterNotNull(),
+        )
+    }
+
+    private fun elementsOf(verdict: ServerStoreIntegrity.Verdict): List<String> = when (verdict) {
+        is ServerStoreIntegrity.Verdict.Intact -> verdict.elements
+        else -> emptyList()
+    }
+
+    /** True when [payload] contains a top-level record for every id in [ids]. */
+    fun containsAll(payload: String?, ids: List<String>): Boolean {
+        val elements = when (val verdict = ServerStoreIntegrity.classify(payload)) {
+            is ServerStoreIntegrity.Verdict.Intact -> verdict.elements
+            is ServerStoreIntegrity.Verdict.Empty -> emptyList()
+            is ServerStoreIntegrity.Verdict.Corrupt -> return false
+        }
+        val present = elements.mapNotNull { idOf(it) }.toSet()
+        return ids.all { it in present }
+    }
+
+    /**
+     * The `id` of one stored record.
+     *
+     * Hand-rolled for the reason given on [JsonArraySplitter]: everything in
+     * this file has to be answerable without org.json so that it can be tested
+     * at all. Only top-level keys count — a nested `"id"` belongs to something
+     * else.
+     */
+    fun idOf(element: String): String? {
+        val text = element.trim()
+        if (!text.startsWith("{")) return null
+
+        var i = 1
+        var depth = 0
+        var expectKey = true
+        var pendingKey: String? = null
+
+        while (i < text.length) {
+            when (val c = text[i]) {
+                '"' -> {
+                    val read = readString(text, i) ?: return null
+                    if (depth == 0) {
+                        if (expectKey) pendingKey = read.first
+                        else if (pendingKey == "id") return read.first
+                    }
+                    i = read.second
+                }
+                ':' -> { if (depth == 0) expectKey = false; i++ }
+                ',' -> { if (depth == 0) { expectKey = true; pendingKey = null }; i++ }
+                '{', '[' -> { depth++; i++ }
+                '}', ']' -> { if (depth == 0) return null; depth--; i++ }
+                else -> i++
+            }
+        }
+        return null
+    }
+
+    /** @return the decoded string starting at [start], and the index after it. */
+    private fun readString(text: String, start: Int): Pair<String, Int>? {
+        val out = StringBuilder()
+        var i = start + 1
+        while (i < text.length) {
+            when (val c = text[i]) {
+                '"' -> return out.toString() to (i + 1)
+                '\\' -> {
+                    if (i + 1 >= text.length) return null
+                    when (val esc = text[i + 1]) {
+                        '"', '\\', '/' -> { out.append(esc); i += 2 }
+                        'b' -> { out.append('\b'); i += 2 }
+                        'f' -> { out.append('\u000C'); i += 2 }
+                        'n' -> { out.append('\n'); i += 2 }
+                        'r' -> { out.append('\r'); i += 2 }
+                        't' -> { out.append('\t'); i += 2 }
+                        'u' -> {
+                            if (i + 5 >= text.length) return null
+                            val code = text.substring(i + 2, i + 6).toIntOrNull(16) ?: return null
+                            out.append(code.toChar()); i += 6
+                        }
+                        else -> return null
+                    }
+                }
+                else -> { out.append(c); i++ }
+            }
+        }
+        return null
+    }
+}

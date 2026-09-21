@@ -259,4 +259,9 @@
     <string name="logs_privacy_title">The log names your servers</string>
     <string name="logs_copy_privacy_message">It holds the addresses of your servers and the output of the core. On Android 9 and older any app running in the background can read the clipboard. Copy it anyway?</string>
     <string name="logs_share_privacy_message">It holds the addresses of your servers and the output of the core. Send it only where you would send the server addresses themselves.</string>
+
+    <!-- Update download notification -->
+    <string name="update_download_title">Downloading update</string>
+    <string name="update_download_channel">Update downloads</string>
+    <string name="update_download_channel_desc">Progress of a new version being downloaded</string>
 </resources>

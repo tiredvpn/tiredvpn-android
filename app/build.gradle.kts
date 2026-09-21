@@ -232,10 +232,16 @@ abstract class StripSelfUpdatePermissions : DefaultTask() {
 // fails deep inside the packaging task with an unreadable message. So the
 // credentials are validated at configuration time, but only when the invoked
 // tasks actually package a release.
+// "build" is in the list on its own: it is an aggregate whose literal name
+// mentions neither assemble nor Release, and it pulls assembleRelease in as a
+// dependency all the same. Without it the one command a developer is most
+// likely to type by hand is the one command that skips the check.
 val buildingReleaseArtifact = gradle.startParameter.taskNames.any { requested ->
     val task = requested.substringAfterLast(':')
-    task.contains("Release") &&
-        listOf("assemble", "bundle", "install", "package", "publish").any { task.startsWith(it) }
+    task == "build" || (
+        task.contains("Release") &&
+            listOf("assemble", "bundle", "install", "package", "publish").any { task.startsWith(it) }
+        )
 }
 
 android {

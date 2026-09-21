@@ -502,19 +502,9 @@ class VpnCoreCallSiteTest {
         assertTrue(service.contains("""const val DEFAULT_TUN_IP = "10.8.0.2""""))
     }
 
-    @Test
-    fun `the wakelock is bounded`() {
-        val service = source("TiredVpnService.kt")
-        assertFalse(
-            "an untimed PARTIAL_WAKE_LOCK held for the life of the tunnel keeps the device out of deep sleep",
-            Regex("""\bit\.acquire\(\)""").containsMatchIn(service)
-        )
-        assertTrue(service.contains("it.acquire(CONNECT_WAKELOCK_TIMEOUT_MS)"))
-        assertTrue(
-            "and released once the connect window closes",
-            occurrences(service, "releaseWakeLock()") >= 4
-        )
-    }
+    // The wake lock's own rule moved to `the wake lock is held for the tunnel,
+    // not only for the connect` below, when bounding it turned out to cost the
+    // session rather than save battery.
 
     @Test
     fun `the notification hides addresses on the lock screen`() {
@@ -584,12 +574,23 @@ class VpnCoreCallSiteTest {
         )
     }
 
+    /**
+     * A refused start still has to be legible — the original defect was that
+     * `restartVpn` swallowed the exception and the watchdog looked healthy in
+     * every log while never once restarting the tunnel. It is the *result* that
+     * may not carry the bad news, because on a periodic worker the only results
+     * that differ from success change the schedule; see `the periodic watchdog
+     * never trades its period for a backoff`.
+     */
     @Test
-    fun `the watchdog does not report success over a refused start`() {
+    fun `a refused restart is visible in the log`() {
         val worker = source("VpnWatchdogWorker.kt")
-        assertTrue("a blocked restart must be visible in the result", worker.contains("Result.retry()"))
         assertTrue(worker.contains("private fun restartVpn(): Boolean"))
         assertTrue(worker.contains("ForegroundServiceStartNotAllowedException"))
+        assertTrue(
+            "the refusal must reach the log at error level",
+            Regex("""if \(!restartVpn\(\)\) \{[\s\S]{0,300}?FileLogger\.e\(""").containsMatchIn(worker)
+        )
     }
 
     // --- 7.12 / 7.13 dead code ----------------------------------------------
@@ -756,14 +757,358 @@ class VpnCoreCallSiteTest {
         val repo = source("ServerRepository.kt")
         assertTrue(repo.contains("ServerStoreIntegrity.classify("))
         assertTrue(
-            "the migration must verify the payload before clearing the only copy",
-            repo.substringAfter("private fun migratePlaintextToEncryptedLocked(").substringBefore("private fun migrateLegacyConfigLocked(")
-                .contains("ServerStoreIntegrity.isSafeToClearSource(")
-        )
-        assertTrue(
             "one bad entry must cost one entry, not the rest of the list",
             repo.contains("skipped++")
         )
         assertFalse("printStackTrace is not diagnostics", repo.contains("printStackTrace()"))
+    }
+
+    /**
+     * The fold is a decision plus an act, and the act has rules of its own that
+     * [StoreReconciliationTest] and [ServerStoreMigrationTest] can only cover if
+     * the repository still routes through them.
+     */
+    @Test
+    fun `the plaintext fold goes through the planner and confirms before it destroys`() {
+        val repo = source("ServerRepository.kt")
+        val fold = bodyAfter(repo, "internal fun migratePlaintextToEncryptedLocked(")
+
+        assertTrue("the decision belongs to StoreReconciliation", fold.contains("StoreReconciliation.plan("))
+        assertFalse(
+            "putString(KEY_ACTIVE_SERVER_ID, <nullable>) removes the key; that is how the " +
+                "active server disappeared during the migration",
+            fold.contains("putString(KEY_ACTIVE_SERVER_ID, plain.getString(")
+        )
+        assertTrue(
+            "the write has to be visible to the read-back, so commit and not apply",
+            fold.contains("editor.commit()")
+        )
+        assertTrue(
+            "the source may only be cleared once the copy is confirmed present",
+            Regex("""StoreReconciliation\.containsAll\([\s\S]{0,400}?plain\.edit\(\)\.clear\(\)""").containsMatchIn(fold)
+        )
+    }
+
+    /**
+     * The reconcile used to hang off the two read paths only, so a write that
+     * happened to be the first call in a healed window read the encrypted store
+     * while the plaintext copy still held records, and wrote back a list they
+     * were missing from.
+     */
+    @Test
+    fun `every public entry point reconciles the two stores first`() {
+        val repo = source("ServerRepository.kt")
+        val entryPoints = listOf(
+            "fun getServers(context: Context): List<VpnConfig> = synchronized(lock) {",
+            "fun getActiveServer(context: Context): VpnConfig? = synchronized(lock) {",
+            "fun saveServer(context: Context, config: VpnConfig) = synchronized(lock) {",
+            "fun deleteServer(context: Context, id: String) = synchronized(lock) {",
+            "fun updateLatency(context: Context, id: String, latencyMs: Long): Boolean = synchronized(lock) {",
+            "fun setActiveServerId(context: Context, id: String) = synchronized(lock) {",
+        )
+        for (header in entryPoints) {
+            assertTrue(
+                "unreconciled entry point: ${header.substringBefore('(')}",
+                bodyAfter(repo, header).contains("reconcileStoresLocked(context)")
+            )
+        }
+    }
+
+    // --- 7 the wake lock and the clock the health check runs on --------------
+
+    /**
+     * Letting the CPU sleep with the tunnel up does not save battery, it ends
+     * the session: the keepalive frames are generated on this side by a 10s
+     * ticker that does not run while the process is suspended, and the server's
+     * read deadline is 30s. Every sleep longer than that came back to a full
+     * reconnect with a fresh strategy scan.
+     */
+    @Test
+    fun `the wake lock is held for the tunnel, not only for the connect`() {
+        val service = source("TiredVpnService.kt")
+
+        assertTrue(
+            "a timeout on the acquire is a promise that the tunnel outlives the lock",
+            bodyAfter(service, "private fun acquireWakeLock() {").contains("it.acquire()")
+        )
+        assertFalse(service.contains("CONNECT_WAKELOCK_TIMEOUT_MS"))
+
+        val releaseSites = service.lines().withIndex()
+            .filter { (_, line) -> line.contains("releaseWakeLock()") && !line.contains("private fun") }
+            .map { (i, _) -> i }
+        assertEquals("exactly two releases: the failed connect and the teardown", 2, releaseSites.size)
+
+        // Both of them must sit in the two functions that end a tunnel, and
+        // neither may sit in a connect that succeeded.
+        for (name in listOf("private fun cleanupFailedConnection(generation: Int) {", "private fun disconnect(intent: StopIntent) {")) {
+            assertTrue(
+                "no releaseWakeLock in $name",
+                bodyAfter(service, name).contains("releaseWakeLock()")
+            )
+        }
+        for (name in listOf("private suspend fun connectTunMode(config: VpnConfig) {", "private suspend fun connectProxyMode(config: VpnConfig) {")) {
+            assertFalse(
+                "$name must not hand the CPU back while its tunnel is up",
+                bodyAfter(service, name).contains("releaseWakeLock()")
+            )
+        }
+    }
+
+    @Test
+    fun `the silence the health check measures is measured on a clock that stops with the device`() {
+        val service = source("TiredVpnService.kt")
+
+        val writes = Regex("""lastKeepaliveTime\s*=\s*([A-Za-z.]+)\(""").findAll(service)
+            .map { it.groupValues[1] }.toList()
+        assertTrue("no assignments found - the scan is broken", writes.isNotEmpty())
+        for (clock in writes) {
+            assertEquals(
+                "System.currentTimeMillis advances through suspend and the core does not; " +
+                    "every wake then looked like a dead tunnel",
+                "SystemClock.uptimeMillis", clock
+            )
+        }
+        assertTrue(
+            "and the reader has to agree with the writers",
+            bodyAfter(service, "fun checkTunnelHealth(): Boolean {")
+                .contains("SystemClock.uptimeMillis() - lastKeepaliveTime")
+        )
+    }
+
+    // --- 8 the watchdog is the only thing that brings the tunnel back --------
+
+    /**
+     * WorkSpec.calculateNextRunTime checks isBackedOff() before isPeriodic(),
+     * so Result.retry() on a periodic worker replaces the period with the
+     * backoff policy — exponential from 30s up to a five-hour cap, reset only
+     * on success. Result.failure() is worse: it is terminal, and the periodic
+     * work is never rescheduled at all.
+     */
+    @Test
+    fun `the periodic watchdog never trades its period for a backoff`() {
+        val watchdog = callSites("VpnWatchdogWorker.kt")
+        assertTrue("scanner cannot see the worker", watchdog.contains("override fun doWork(): Result"))
+        assertFalse(
+            "Result.retry() on PeriodicWorkRequest means 30s doubling to 5 hours, not 'next period'",
+            watchdog.contains("Result.retry()")
+        )
+        assertFalse(
+            "Result.failure() on PeriodicWorkRequest is terminal - one exception and the " +
+                "watchdog never runs again",
+            watchdog.contains("Result.failure()")
+        )
+        assertTrue(
+            "a refused start still has to be readable in the log",
+            watchdog.contains("if (!restartVpn())")
+        )
+    }
+
+    // --- 9 the protect socket ------------------------------------------------
+
+    /**
+     * One fixed path, several generations. The superseded job's `finally` ran
+     * after the new server had bound, deleted `protect.sock` by name, and the
+     * core's InitAndroidProtector then got ENOENT — every socket it opened
+     * afterwards went unprotected, straight back into our own tunnel.
+     *
+     * "Does the file exist" is the wrong question — it does exist, it is just
+     * not ours by then. The name is claimed before the unlink in
+     * startProtectServer, so a predecessor woken by that same call cannot pass
+     * the check in its own teardown.
+     */
+    @Test
+    fun `the protect socket is unlinked by its owner and nobody else`() {
+        val service = source("TiredVpnService.kt")
+        val body = bodyAfter(service, "private fun startProtectServer(socketPath: String) {")
+        assertTrue("scanner cannot see the protect server", body.contains("LocalSocketAddress.Namespace.FILESYSTEM"))
+
+        val head = body.substringBefore("protectServerJob = scope.launch")
+        assertTrue("the successor must claim the name before it unlinks it", head.contains("protectGeneration.begin()"))
+        assertTrue(
+            "and the claim has to come first, or the predecessor still looks current",
+            head.indexOf("protectGeneration.begin()") in 0 until head.indexOf("File(socketPath).delete()")
+        )
+
+        val finallyBlock = body.substringAfterLast("} finally {")
+        assertTrue("the teardown still unlinks when it is entitled to", finallyBlock.contains("File(socketPath).delete()"))
+        assertTrue(
+            "but only behind an ownership check, not an existence check",
+            Regex("""protectGeneration\.isCurrent\(generation\)[\s\S]{0,120}?File\(socketPath\)\.delete\(\)""")
+                .containsMatchIn(finallyBlock)
+        )
+        assertFalse(
+            "File.exists() answers the wrong question here",
+            finallyBlock.contains("File(socketPath).exists()")
+        )
+    }
+
+    /**
+     * The generation used to be checked on entry and once more before the TUN
+     * descriptor. Everything between — the connect job, the monitors, the
+     * control channel, the core itself, `control.sock` — was torn out from
+     * under whatever had started meanwhile, and step 3 alone parks here for up
+     * to five seconds.
+     */
+    @Test
+    fun `every destructive step of a reconnect is gated on its generation`() {
+        val service = source("TiredVpnService.kt")
+        val body = bodyAfter(service, "private suspend fun executeReconnectSequence(generation: Int): Boolean {")
+        assertTrue("scanner cannot see the sequence", body.contains("NonCancellable"))
+
+        val steps = listOf("step 0", "step 1", "step 2", "step 3", "step 3b", "step 4", "step 5")
+        for (step in steps) {
+            assertTrue("$step is not gated", body.contains("""if (!stillOurs("$step")) return@withContext"""))
+        }
+        assertEquals(
+            "every gate must belong to a named step, and every step must have one",
+            steps.size, occurrences(body, "if (!stillOurs(")
+        )
+
+        // The two long-lived objects are taken once and acted on by identity:
+        // re-reading the fields after the wait can hand back a newer core.
+        assertTrue(body.contains("val ownedProcess = tiredvpnProcess"))
+        assertTrue(body.contains("val ownedChannel = controlChannel"))
+        assertTrue("the core stopped must be the one we came in with", body.contains("ownedProcess?.stopAndWait()"))
+        assertFalse(
+            "stopping whatever the field holds is the bug, not the fix",
+            body.contains("tiredvpnProcess?.stopAndWait()")
+        )
+        assertTrue(
+            "and the field is only cleared when it still holds that core",
+            body.contains("if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null")
+        )
+        assertFalse(
+            "closeControlChannel() acts on the field, which by then may be a newer channel",
+            body.contains("closeControlChannel()")
+        )
+    }
+
+    @Test
+    fun `stopping the protect server wakes the accept before closing it`() {
+        val body = bodyAfter(source("TiredVpnService.kt"), "private fun stopProtectServer() {")
+        assertTrue(
+            "close() does not wake a thread already blocked in accept(); shutdown() does",
+            body.contains("Os.shutdown(")
+        )
+        assertTrue(
+            "shutdown has to come first or it is shutting down a closed descriptor",
+            body.indexOf("Os.shutdown(") in 0 until body.indexOf("socket?.close()")
+        )
+    }
+
+    /**
+     * Every other `start*` in the service cancels its predecessor first;
+     * `startStatusMonitoring` relied on its callers having done it. Two event
+     * listeners over one channel means `connection_dead` and `ipv6_changed`
+     * handled twice.
+     */
+    @Test
+    fun `every monitor cancels its predecessor rather than trusting its caller`() {
+        val service = source("TiredVpnService.kt")
+        val starters = mapOf(
+            "private fun startStatusMonitoring() {" to "statusMonitorJob?.cancel()",
+            "private fun startHealthCheck() {" to "stopHealthCheck()",
+            "private fun startProcessWatchdog() {" to "processWatchdogJob?.cancel()",
+            "private fun startProtectServer(socketPath: String) {" to "stopProtectServer()",
+        )
+        for ((header, cancel) in starters) {
+            assertTrue(
+                "${header.substringBefore('(')} must start by cancelling the previous one",
+                bodyAfter(service, header).substringBefore("scope.launch").contains(cancel)
+            )
+        }
+    }
+
+    // --- 10 comments that describe the core ----------------------------------
+
+    /**
+     * cleanupNative is DeleteGlobalRef plus two method-id assignments
+     * (cmd/tiredvpn/jni_android.go, jni_cleanup). Four comments claimed it
+     * killed goroutines and closed the dup'd TUN descriptor; a reader who
+     * believes that stops looking for the descriptor that is still open.
+     */
+    @Test
+    fun `no comment claims the native cleanup kills goroutines`() {
+        val service = rawSource("TiredVpnService.kt")
+        val claims = service.lines().filter { line ->
+            val text = line.trim()
+            text.startsWith("//") &&
+                (text.contains("orphan goroutine", ignoreCase = true) ||
+                    text.contains("Kill orphan", ignoreCase = true) ||
+                    text.contains("goroutines killed", ignoreCase = true))
+        }
+        assertEquals(
+            "cleanupNative cancels nothing and waits for nothing: $claims",
+            emptyList<String>(), claims
+        )
+    }
+
+    // --- 11 the ping wave ----------------------------------------------------
+
+    @Test
+    fun `the ping wave writes through the primitive written for it`() {
+        val list = source("ServerListActivity.kt")
+        val body = bodyAfter(list, "private fun pingServers(servers: List<VpnConfig>) {")
+        assertTrue("scanner cannot see the wave", body.contains("latencyProbe(server)"))
+        assertTrue(
+            "getServer + saveServer is two acquisitions of the repository lock, " +
+                "and the delete that updateLatency exists to survive fits between them",
+            body.contains("ServerRepository.updateLatency(")
+        )
+        assertFalse("no read-then-write pair here", body.contains("ServerRepository.saveServer("))
+    }
+
+    // --- 12 what FileProvider is allowed to hand out -------------------------
+
+    @Test
+    fun `everything shared through FileProvider is written where the grant reaches`() {
+        for (name in listOf("SettingsActivity.kt", "LogViewerActivity.kt")) {
+            val text = source(name)
+            assertTrue("$name no longer shares anything", text.contains("FileProvider.getUriForFile("))
+            assertTrue(
+                "$name must build its shared file through SharedFiles, which is the only " +
+                    "place that knows what file_paths.xml grants",
+                text.contains("SharedFiles.file(")
+            )
+            assertFalse(
+                "$name: the root of cacheDir is outside both declared roots and " +
+                    "getUriForFile answers that with IllegalArgumentException",
+                Regex("""File\(\s*cacheDir\s*,""").containsMatchIn(text)
+            )
+        }
+    }
+
+    /**
+     * The download notification is the one piece of UI the update flow puts on
+     * screen, and its three strings were Russian literals in a codebase whose
+     * only `values/strings.xml` is English. Four more literals are still in
+     * this file (the "update available" notification and its channel); they are
+     * named here so that extracting them is a decision rather than an
+     * oversight.
+     */
+    @Test
+    fun `the download notification takes its text from resources`() {
+        val worker = source("UpdateWorker.kt")
+        for (key in listOf("update_download_title", "update_download_channel", "update_download_channel_desc")) {
+            assertTrue("$key is not used", worker.contains("R.string.$key"))
+        }
+        for (literal in listOf("Загрузка обновления", "Загрузка обновлений", "Ход загрузки новой версии")) {
+            assertFalse("hardcoded string still in UpdateWorker: $literal", worker.contains(literal))
+        }
+
+        val strings = File(sourceRoot().parentFile, "res/values/strings.xml").readText()
+        for (key in listOf("update_download_title", "update_download_channel", "update_download_channel_desc")) {
+            assertTrue("$key is referenced but not declared", strings.contains("""<string name="$key">"""))
+        }
+    }
+
+    @Test
+    fun `everything shared through FileProvider is written where the grant reaches - resources`() {
+        val paths = File(sourceRoot().parentFile, "res/xml/file_paths.xml").readText()
+        assertTrue(
+            "the directory SharedFiles writes to must be the one file_paths.xml grants",
+            paths.contains("""path="share/"""")
+        )
+        assertTrue(source("SharedFiles.kt").contains("""const val DIR_NAME = "share""""))
     }
 }

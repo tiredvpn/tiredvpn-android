@@ -159,6 +159,7 @@ object ServerRepository {
         getServers(context).find { it.id == id }
 
     fun saveServer(context: Context, config: VpnConfig) = synchronized(lock) {
+        reconcileStoresLocked(context)
         saveServerLocked(context, config)
     }
 
@@ -173,6 +174,7 @@ object ServerRepository {
      * @return true when a server with [id] existed and its value changed.
      */
     fun updateLatency(context: Context, id: String, latencyMs: Long): Boolean = synchronized(lock) {
+        reconcileStoresLocked(context)
         val updated = LatencyUpdate.apply(loadServersLocked(context).servers, id, latencyMs)
         if (updated == null) {
             // Either nothing changed, or the server was deleted while the probe
@@ -186,6 +188,7 @@ object ServerRepository {
     }
 
     fun deleteServer(context: Context, id: String) = synchronized(lock) {
+        reconcileStoresLocked(context)
         val servers = loadServersLocked(context).servers.toMutableList()
         val wasActive = activeServerIdLocked(context) == id
 
@@ -215,6 +218,7 @@ object ServerRepository {
     }
 
     fun setActiveServerId(context: Context, id: String) = synchronized(lock) {
+        reconcileStoresLocked(context)
         setActiveServerIdLocked(context, id)
     }
 
@@ -313,9 +317,14 @@ object ServerRepository {
      * Fold anything left in the plaintext stores into the encrypted one.
      *
      * Two callers in one rule: the original one-off migration off
-     * `tiredvpn_servers`, and recovery from a degraded spell — while the
-     * encrypted store was unavailable the writes went to plaintext, so that
-     * copy is by definition the newer one and has to win.
+     * `tiredvpn_servers`, and recovery from a degraded spell, where the writes
+     * that happened while the Keystore was unavailable went to plaintext.
+     *
+     * Called from every public entry point, not only from the two read paths.
+     * A `saveServer` or `deleteServer` that runs in a healed window without a
+     * `getServers` before it would otherwise read the encrypted store while the
+     * plaintext copy still held records, and write back a list those records
+     * were missing from.
      */
     private fun reconcileStoresLocked(context: Context) {
         val encrypted = encryptedPrefsOrNull(context) ?: return // still degraded, nothing to fold into
@@ -323,33 +332,65 @@ object ServerRepository {
         migrateLegacyConfigLocked(context)
     }
 
-    private fun migratePlaintextToEncryptedLocked(
+    /**
+     * Merge the plaintext copy into [encrypted] and only then destroy it.
+     *
+     * Internal rather than private so the fold can be tested against two real
+     * preference stores. Standing in an ordinary `SharedPreferences` for the
+     * encrypted one is the whole trick: [EncryptedSharedPreferences] needs a
+     * Keystore, which a unit test does not have, and the defect being guarded
+     * against here is about what gets written, not about the cipher.
+     *
+     * See [StoreReconciliation] for why this is a union and not a copy.
+     */
+    internal fun migratePlaintextToEncryptedLocked(
         encrypted: SharedPreferences,
         plain: SharedPreferences,
     ) {
-        if (!plain.contains(KEY_SERVERS)) return
+        val plan = StoreReconciliation.plan(
+            encryptedPayload = encrypted.getString(KEY_SERVERS, null),
+            encryptedActiveId = encrypted.getString(KEY_ACTIVE_SERVER_ID, null),
+            plainPayload = plain.getString(KEY_SERVERS, null),
+            plainActiveId = plain.getString(KEY_ACTIVE_SERVER_ID, null),
+            plainHasList = plain.contains(KEY_SERVERS),
+        )
 
-        val payload = plain.getString(KEY_SERVERS, null)
+        when (plan) {
+            is StoreReconciliation.Plan.Nothing -> return
 
-        // Check the payload is readable BEFORE destroying the only copy. The
-        // old code copied the string over blind and cleared the source in the
-        // same step, so a damaged payload took its last copy with it.
-        if (!ServerStoreIntegrity.isSafeToClearSource(payload)) {
-            FileLogger.e(TAG, "=== PLAINTEXT SERVER LIST IS DAMAGED === not migrating and NOT clearing it; the copy is kept for recovery")
-            return
-        }
+            is StoreReconciliation.Plan.Refuse -> {
+                FileLogger.e(TAG, "=== NOT MIGRATING THE PLAINTEXT SERVER LIST === ${plan.reason}; both copies are kept for recovery")
+                return
+            }
 
-        try {
-            encrypted.edit()
-                .putString(KEY_SERVERS, payload ?: "[]")
-                .putString(KEY_ACTIVE_SERVER_ID, plain.getString(KEY_ACTIVE_SERVER_ID, null))
-                .apply()
-            plain.edit().clear().apply()
-            FileLogger.i(TAG, "Migrated the plaintext server list into encrypted storage")
-        } catch (e: Exception) {
-            // Source untouched: a half-done migration must not be able to lose
-            // the data it failed to copy.
-            FileLogger.e(TAG, "Migration to encrypted storage failed, keeping the plaintext copy", e)
+            is StoreReconciliation.Plan.Fold -> {
+                try {
+                    // commit() and not apply(): the read-back below has to see
+                    // the write, and the source is cleared on the strength of
+                    // what it finds.
+                    val editor = encrypted.edit().putString(KEY_SERVERS, plan.payload)
+                    // Never putString(…, null) here — that removes the key. The
+                    // active server is set, or left alone, and nothing else.
+                    if (plan.activeId != null) editor.putString(KEY_ACTIVE_SERVER_ID, plan.activeId)
+                    if (!editor.commit()) {
+                        FileLogger.e(TAG, "Migration to encrypted storage was not committed, keeping the plaintext copy")
+                        return
+                    }
+
+                    val readBack = encrypted.getString(KEY_SERVERS, null)
+                    if (!StoreReconciliation.containsAll(readBack, plan.expectedIds)) {
+                        FileLogger.e(TAG, "Encrypted storage did not read back the ${plan.expectedIds.size} record(s) just written; keeping the plaintext copy")
+                        return
+                    }
+
+                    plain.edit().clear().apply()
+                    FileLogger.i(TAG, "Folded the plaintext server list into encrypted storage (${plan.expectedIds.size} record(s))")
+                } catch (e: Exception) {
+                    // Source untouched: a half-done migration must not be able
+                    // to lose the data it failed to copy.
+                    FileLogger.e(TAG, "Migration to encrypted storage failed, keeping the plaintext copy", e)
+                }
+            }
         }
     }
 

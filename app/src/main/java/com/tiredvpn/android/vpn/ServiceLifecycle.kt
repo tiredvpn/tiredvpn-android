@@ -5,10 +5,16 @@ package com.tiredvpn.android.vpn
  *
  * The distinction exists because [DisconnectPolicy] turns it into writes to
  * persistent flags that outlive the process — `vpn_should_be_connected` and
- * `vpn_was_connected`. Everything that can bring the tunnel back reads them:
- * VpnWatchdogWorker.doWork, BootReceiver, AirplaneModeReceiver. One teardown
- * that clears them on a path the user never touched turns a transient failure
- * into "the VPN never comes back until the user taps connect again".
+ * `vpn_was_connected`. VpnWatchdogWorker.doWork and AirplaneModeReceiver gate
+ * on them, and one teardown that clears them on a path the user never touched
+ * turns a transient failure into "the VPN never comes back until the user taps
+ * connect again".
+ *
+ * BootReceiver is the exception and is deliberately not in that list: it logs
+ * both flags and then gates only on the `connect_on_boot` setting, so a reboot
+ * starts the VPN whenever that setting is on, whatever the last teardown was.
+ * Whether a reboot should honour the last session's state or the setting is a
+ * product question, not a bug in this table — but the table does not cover it.
  */
 internal enum class StopIntent {
     /** The user asked for it: ACTION_DISCONNECT, ACTION_FORCE_RESET. */

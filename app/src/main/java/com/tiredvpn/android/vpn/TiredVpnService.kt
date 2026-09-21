@@ -14,6 +14,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.tiredvpn.android.util.FileLogger
@@ -75,13 +76,6 @@ class TiredVpnService : VpnService() {
 
         /** Ceiling on simultaneously live protect handlers. */
         private const val MAX_PROTECT_CLIENTS = 32
-
-        /**
-         * Upper bound on the connect wakelock: the outer connect fence plus
-         * slack for TUN setup, so a connect that neither succeeds nor reports
-         * failure still lets the device sleep.
-         */
-        private const val CONNECT_WAKELOCK_TIMEOUT_MS = CONNECTION_TIMEOUT + 15_000L
 
         /** requestCode for the VPN notification's content intent. */
         private const val NOTIFICATION_REQUEST_CODE = 0
@@ -244,6 +238,23 @@ class TiredVpnService : VpnService() {
     /** Live protect-client descriptors, so a stop can wake their readers. */
     private val protectClientFds =
         java.util.Collections.synchronizedList(mutableListOf<java.io.FileDescriptor>())
+
+    /**
+     * Which protect server owns `protect.sock` right now.
+     *
+     * The path is one fixed name shared by every generation, and a superseded
+     * server's teardown runs asynchronously — it is woken by the next server's
+     * [stopProtectServer], which happens *before* that server binds. So by the
+     * time the old coroutine reaches its `finally`, the name it is holding a
+     * string for can already belong to somebody else. Unlinking it there left
+     * the core's InitAndroidProtector with ENOENT, which means every socket the
+     * core opens afterwards goes unprotected and routes into our own tunnel.
+     *
+     * Checking that the file exists would not help: it does exist, it is simply
+     * not ours. Ownership is what has to be checked, so each server carries a
+     * generation and only the current one may unlink.
+     */
+    private val protectGeneration = ConnectGeneration()
     private var connectionJob: Job? = null  // Current connection attempt - can be cancelled
     private var connectAttemptsSinceBodyEntered = 0  // Track if coroutine body ever starts
     @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
@@ -308,12 +319,23 @@ class TiredVpnService : VpnService() {
     @Volatile private var isReconnecting = false // Atomic flag to prevent parallel reconnects
     private var lastNetworkSignalSentTime: Long = 0 // Debounce for network_available signals to Go
 
-    // Control-channel liveness, for dead tunnel detection. Updated on EVERY
-    // line the core sends, not only on "keepalive" events: the server stops
-    // emitting keepalive frames while traffic is flowing (internal/tun/vpn.go
-    // gates them on idleness), so a keepalive-only timer would fire under load
-    // on a perfectly healthy tunnel. Our own `status` poll every 30s is the
-    // other source, which is what makes the timeout below sound.
+    // When the core last said anything down the control channel, on the clock
+    // that stops while the device is suspended.
+    //
+    // uptimeMillis and not currentTimeMillis, and that is the whole point: the
+    // core's goroutines are frozen alongside the rest of the process during
+    // suspend, so wall-clock time spent asleep is time the core was not given
+    // to speak in. Measured against the wall clock, every wake from a sleep
+    // longer than the timeout below read as a dead tunnel and queued a
+    // reconnect on top of whatever else the wake had already triggered.
+    //
+    // Updated on EVERY line the core sends, not only on keepalive events. Note
+    // what that does and does not measure: the keepalive frames in
+    // internal/tun/vpn.go travel over the network socket to the server, not up
+    // this channel, so in practice the thing being timed is our own `status`
+    // poll getting an answer — i.e. the control goroutine is alive. A wedged
+    // relay behind a healthy control goroutine is not visible from here and
+    // needs a field in the core's status response to become so.
     @Volatile private var lastKeepaliveTime: Long = 0
 
     /**
@@ -321,8 +343,7 @@ class TiredVpnService : VpnService() {
      *
      * Arithmetic: the `status` poll runs every 30s and the core answers it, so
      * a healthy channel speaks at least that often; 75s is two missed polls
-     * plus slack. When the tunnel is idle the server's keepalives arrive every
-     * ~10s and this fires far sooner in practice.
+     * plus slack.
      */
     private val keepaliveTimeoutMs = 75_000L
 
@@ -393,8 +414,9 @@ class TiredVpnService : VpnService() {
                         FileLogger.w(TAG, "onStartCommand: already connecting with live job, ignoring duplicate CONNECT")
                         return START_STICKY
                     }
-                    // Authoritative clean slate on every tap: kills orphan goroutines /
-                    // TUN fds, frees a stuck reconnect mutex and blocked IO threads, so the
+                    // Authoritative clean slate on every tap: stops the core, drops
+                    // its callback bridge, closes every TUN descriptor in the ledger,
+                    // frees a stuck reconnect mutex and blocked IO threads, so the
                     // core ALWAYS starts cleanly without needing a force-stop. Internal
                     // auto-reconnects call connect() directly (bypassing onStartCommand),
                     // so they are not affected by this.
@@ -528,7 +550,9 @@ class TiredVpnService : VpnService() {
         // Ensure coroutine scope is alive
         ensureScopeActive()
 
-        // Acquire WakeLock to prevent Android from killing the service
+        // Keep the CPU awake for the connect and for the tunnel it produces.
+        // Released on the two paths that end a tunnel: cleanupFailedConnection
+        // and disconnect.
         acquireWakeLock()
 
         // Initialize ConnectionManager with port hopping if enabled
@@ -731,12 +755,16 @@ class TiredVpnService : VpnService() {
         tiredvpnProcess?.stop()
         tiredvpnProcess = null
 
-        // Kill the Go runtime's leftovers. stopClient() only signals the main
-        // goroutine; parallel strategy attempts survive it and keep the dup'd
-        // TUN fd open. This path never called cleanup(), so after a failed
-        // connect the next start() ran initialize() on top of a live core with
-        // the previous callback still wired up — and the auto-reconnect path
-        // goes straight here, never through forceResetCore.
+        // Unwire the callback bridge to the core. Read cleanupNative before
+        // relying on this for anything else: on the Go side it is
+        // DeleteGlobalRef on the callback object plus two method-id
+        // assignments (cmd/tiredvpn/jni_android.go, jni_cleanup). It does not
+        // cancel the client context, does not wait for any goroutine and does
+        // not close the dup'd TUN descriptor — four comments here used to say
+        // it did. What it does buy is worth having on this path: a strategy
+        // attempt that outlives stopClient() can no longer report its own death
+        // to us, and this path never called it at all, so the next start()
+        // ran initialize() on top of a core still holding the old callback.
         try { TiredVpnNative.cleanup() } catch (e: Throwable) {
             FileLogger.w(TAG, "cleanupFailedConnection: native cleanup failed: ${e.message}")
         }
@@ -802,7 +830,9 @@ class TiredVpnService : VpnService() {
         try { tiredvpnProcess?.stop() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: stop process", e) }
         tiredvpnProcess = null
 
-        // 5. Kill orphan Go goroutines holding the TUN fd (synchronous)
+        // 5. Drop the JNI callback bridge, so nothing the previous core still
+        // has running can report state to the next one. Not a goroutine killer
+        // — see cleanupFailedConnection.
         try { TiredVpnNative.cleanup() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: native cleanup", e) }
 
         // 6. Kill processes left over from a build that ran the core as a
@@ -1008,12 +1038,11 @@ class TiredVpnService : VpnService() {
         currentVpnServerIp6 = tunConfig.serverIp6 ?: ""
         FileLogger.i(TAG, "=== VPN CONNECTED === strategy=$connectedStrategy, latency=${connectedLatencyMs}ms, ip=$finalIp")
 
-        // The connect window is over; let the device sleep again.
-        releaseWakeLock()
-
-        // Record connection time and reset reconnect counter
+        // Record connection time and reset reconnect counter. The wake lock
+        // stays held: see acquireWakeLock for why letting the CPU suspend here
+        // ends the session rather than saving battery.
         connectionTime = System.currentTimeMillis()
-        lastKeepaliveTime = System.currentTimeMillis() // Initialize for health check
+        lastKeepaliveTime = SystemClock.uptimeMillis() // Initialize for health check
         reconnectAttempts = 0
 
         // Mark VPN as connected for boot recovery (Direct Boot support)
@@ -1090,12 +1119,10 @@ class TiredVpnService : VpnService() {
         )
         updateNotification("Proxy • $proxyAddress")
 
-        // The connect window is over; let the device sleep again.
-        releaseWakeLock()
-
-        // Record connection time
+        // Record connection time. The wake lock stays held for the lifetime of
+        // the tunnel — see acquireWakeLock.
         connectionTime = System.currentTimeMillis()
-        lastKeepaliveTime = System.currentTimeMillis()
+        lastKeepaliveTime = SystemClock.uptimeMillis()
         reconnectAttempts = 0
 
         // Mark VPN as connected for boot recovery (Direct Boot support)
@@ -1376,6 +1403,11 @@ class TiredVpnService : VpnService() {
         // Close and cancel any existing protect server, in that order
         stopProtectServer()
 
+        // From here on the socket name is ours. Claimed before the unlink, so
+        // a predecessor woken by the stop above can no longer pass the
+        // ownership check in its own teardown.
+        val generation = protectGeneration.begin()
+
         // Remove old socket file
         File(socketPath).delete()
 
@@ -1410,9 +1442,10 @@ class TiredVpnService : VpnService() {
                         android.system.Os.accept(fd, null)
                     } catch (e: android.system.ErrnoException) {
                         if (e.errno == android.system.OsConstants.EINTR) continue
-                        // EBADF is the normal exit: stopProtectServer closed
-                        // the listening socket under us on purpose.
-                        if (isActive) FileLogger.w(TAG, "Protect accept error: ${e.message}")
+                        // EINVAL (shutdown) and EBADF (close) are the normal
+                        // exits: stopProtectServer took the listening socket
+                        // out from under us on purpose, in that order.
+                        if (isActive) FileLogger.d(TAG, "Protect accept stopped: ${e.message}")
                         break
                     }
 
@@ -1480,7 +1513,14 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "Protect server failed", e)
             } finally {
                 try { serverSocket?.close() } catch (_: Exception) {}
-                File(socketPath).delete()
+                // Unlink only what is still ours. See [protectGeneration]: this
+                // block usually runs *after* a successor has claimed the name,
+                // because what wakes it is that successor's stopProtectServer.
+                if (protectGeneration.isCurrent(generation)) {
+                    File(socketPath).delete()
+                } else {
+                    FileLogger.d(TAG, "Protect: generation $generation superseded, leaving $socketPath to its owner")
+                }
             }
         }
     }
@@ -1529,20 +1569,28 @@ class TiredVpnService : VpnService() {
     /**
      * Stop the protect server.
      *
-     * Order matters and is the whole fix: closing the listening descriptor is
-     * what makes the blocking `Os.accept` return (EBADF). Cancelling the Job
-     * first, as the old code did, cancels nothing a syscall can see — the
-     * coroutine stayed parked in accept, its `finally` never ran, and both the
-     * IO thread and the descriptor leaked once per reconnect.
+     * Order matters and is the whole fix: the blocking `Os.accept` has to be
+     * woken before anything else can proceed. Cancelling the Job first, as the
+     * old code did, cancels nothing a syscall can see — the coroutine stayed
+     * parked in accept, its `finally` never ran, and both the IO thread and the
+     * descriptor leaked once per reconnect.
+     *
+     * `shutdown` and then `close`, in that order, because on Linux `close()`
+     * alone does not wake a thread already blocked in `accept()` on that
+     * descriptor: the fd number goes away, the sleeping thread does not.
+     * `shutdown(SHUT_RDWR)` on a listening socket is what Linux answers with
+     * EINVAL out of accept. Closing afterwards releases the descriptor.
      *
      * No join: every caller runs on the service's main thread, and waiting for
-     * an IO coroutine there trades a descriptor leak for an ANR. Closing the
-     * descriptors is what actually unblocks the loop; the coroutine then
-     * unwinds on its own.
+     * an IO coroutine there trades a descriptor leak for an ANR. Waking the
+     * loop is what matters; the coroutine then unwinds on its own.
      */
     private fun stopProtectServer() {
         val socket = protectServerSocket
         protectServerSocket = null
+        try {
+            socket?.fileDescriptor?.let { Os.shutdown(it, android.system.OsConstants.SHUT_RDWR) }
+        } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
 
         // Client handlers are parked in Os.read; closing their descriptors is
@@ -2073,6 +2121,13 @@ class TiredVpnService : VpnService() {
     }
 
     private fun startStatusMonitoring() {
+        // Cancel first, like every other start* here. Today the callers happen
+        // to have cancelled it already, but that is an agreement between call
+        // sites rather than a property of this function; a second event
+        // listener over a fresh channel would double-handle connection_dead
+        // and ipv6_changed.
+        statusMonitorJob?.cancel()
+
         // Start event listener that handles both periodic status checks and Go events
         statusMonitorJob = scope.launch {
             // The channel's reader, not a third BufferedReader over the same
@@ -2111,7 +2166,7 @@ class TiredVpnService : VpnService() {
                     // tunnel as dead: the server suppresses keepalive frames
                     // while traffic is flowing, so under load the only regular
                     // traffic here is the answer to our own `status` poll.
-                    lastKeepaliveTime = System.currentTimeMillis()
+                    lastKeepaliveTime = SystemClock.uptimeMillis()
 
                     // Parse response/event
                     try {
@@ -2127,7 +2182,7 @@ class TiredVpnService : VpnService() {
                                 when (eventType) {
                                     "keepalive" -> {
                                         // Update keepalive time for health check
-                                        lastKeepaliveTime = System.currentTimeMillis()
+                                        lastKeepaliveTime = SystemClock.uptimeMillis()
                                         FileLogger.d(TAG, "Keepalive received from server")
                                     }
                                     "connection_dead" -> {
@@ -2143,7 +2198,7 @@ class TiredVpnService : VpnService() {
                                     "connected" -> {
                                         FileLogger.i(TAG, "Reconnect successful")
                                         clearPhase()
-                                        lastKeepaliveTime = System.currentTimeMillis()
+                                        lastKeepaliveTime = SystemClock.uptimeMillis()
                                         // Parse reconnect metadata from event data (JSON)
                                         if (data.startsWith("{")) {
                                             try {
@@ -2204,7 +2259,7 @@ class TiredVpnService : VpnService() {
                                 "connected" -> {
                                     // Response to network_changed or reconnect
                                     FileLogger.d(TAG, "Reconnect confirmed: $line")
-                                    lastKeepaliveTime = System.currentTimeMillis()
+                                    lastKeepaliveTime = SystemClock.uptimeMillis()
 
                                     // The dual-stack pair the reconnect settled
                                     // on. ip6/server_ip6 are omitempty, so an
@@ -3302,16 +3357,37 @@ class TiredVpnService : VpnService() {
             withContext(NonCancellable) {
                 FileLogger.d(TAG, "executeReconnectSequence: Entered NonCancellable context for cleanup")
 
-                if (!connectGeneration.isCurrent(generation)) {
-                    FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded, skipping cleanup")
-                    return@withContext
+                /**
+                 * Every step below destroys something shared, and a fresh
+                 * connect() can start at any point in between — `forceResetCore`
+                 * cancels the job this runs in, but the body is NonCancellable
+                 * and keeps going. Checking once on entry only protected the
+                 * steps that happen to come first; the one check that used to
+                 * exist further down covered the TUN descriptor and nothing
+                 * else, while the core, the control channel and `control.sock`
+                 * were torn out from under the new attempt.
+                 */
+                fun stillOurs(step: String): Boolean {
+                    if (connectGeneration.isCurrent(generation)) return true
+                    FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded before $step, leaving the newer attempt alone")
+                    return false
                 }
+
+                if (!stillOurs("step 0")) return@withContext
+
+                // The objects this reconnect is entitled to destroy, taken now.
+                // Step 3 blocks for up to five seconds, so re-reading the
+                // fields afterwards can hand us a core and a channel that a
+                // newer connect has just installed.
+                val ownedProcess = tiredvpnProcess
+                val ownedChannel = controlChannel
 
                 // Step 0: Cancel active connectionJob to prevent race with resource cleanup
                 FileLogger.d(TAG, "executeReconnectSequence: Step 0 - Cancel active connectionJob")
                 connectionJob?.cancel()
                 connectionJob = null
 
+                if (!stillOurs("step 1")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 1 - Stop monitoring")
                 // 1. Stop monitoring
                 stopNetworkMonitoring()
@@ -3321,35 +3397,61 @@ class TiredVpnService : VpnService() {
                 stopProcessWatchdog()
                 stopHealthCheck()
 
+                if (!stillOurs("step 2")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 2 - Close control socket")
-                // 2. Close control socket FIRST (before stopping process)
-                closeControlChannel()
-
-                FileLogger.d(TAG, "executeReconnectSequence: Step 3 - Stop process and WAIT")
-                // 3. WAIT for process to actually die (sync!)
-                // Bound the wait: a hung stopAndWait() inside NonCancellable would
-                // otherwise block this coroutine forever and leave the reconnect lock
-                // held, silently killing all future reconnects. killAll below
-                // still force-kills whatever survives the timeout.
-                try {
-                    withTimeout(3000L) { tiredvpnProcess?.stopAndWait() }
-                } catch (e: TimeoutCancellationException) {
-                    FileLogger.w(TAG, "executeReconnectSequence: stopAndWait timed out, force-killing")
+                // 2. Close the channel we came in with, not whatever the field
+                // holds. FIRST, before stopping the process.
+                if (ownedChannel != null) {
+                    if (controlChannel === ownedChannel) controlChannel = null
+                    try { ownedChannel.close() } catch (e: Exception) {
+                        FileLogger.w(TAG, "executeReconnectSequence: closing control channel: ${e.message}")
+                    }
                 }
-                tiredvpnProcess = null
 
-                // 3b. Kill orphan goroutines holding the dup'd TUN fd.
-                // stopAndWait() above only signals the core's main goroutine;
-                // parallel strategy attempts outlive it. This path never called
-                // cleanup(), so the next start() ran initialize() on top of a
-                // live core with the previous callback still attached.
+                if (!stillOurs("step 3")) return@withContext
+                FileLogger.d(TAG, "executeReconnectSequence: Step 3 - Stop process and WAIT")
+                // 3. WAIT for the core to actually stop.
+                //
+                // The bound is Go's, not ours, and there used to be a
+                // withTimeout(3000) here pretending otherwise. stopAndWait() is
+                // a blocking JNI call with no suspension point inside it, and
+                // cancelling a coroutine does not touch a thread parked in a
+                // syscall — the same thing this diff fixes for the control
+                // socket read. The timeout could only fire after the call had
+                // already returned, so it bounded nothing and logged
+                // "force-killing" for an event that had not happened.
+                //
+                // What does bound it: stopClient() in jni_android.go waits on
+                // clientWg through a select with time.After(5 * time.Second)
+                // and returns either way. Five seconds, held here, once.
+                ownedProcess?.stopAndWait()
+                // Null the field only if it is still the core we just stopped.
+                if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
+
+                // 3b. Drop the JNI callback bridge. stopAndWait() above only
+                // signals the core's main goroutine; parallel strategy attempts
+                // outlive it, and this path never unwired them, so the next
+                // start() ran initialize() on top of a live core still holding
+                // the previous callback. Unwiring is all this does — see
+                // cleanupFailedConnection for what cleanupNative is.
+                //
+                // Gated, and this is the first check that can actually fire:
+                // the wait above is the long one. The bridge is global JNI
+                // state, so dropping it after a new core has registered would
+                // cut that core's callback rather than the dead one's.
+                if (!stillOurs("step 3b")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 3b - Native cleanup")
                 try { TiredVpnNative.cleanup() } catch (e: Throwable) {
                     FileLogger.w(TAG, "executeReconnectSequence: native cleanup failed: ${e.message}")
                 }
 
+                // 4. DELETE control socket file to avoid conflicts.
+                // Same ownership question as protect.sock: one fixed name, and
+                // after the wait above a new core may have bound it. Unlinking
+                // it then leaves connectToControlSocket waiting 30s for a file
+                // that will never reappear.
+                if (!stillOurs("step 4")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 4 - Delete control socket file")
-                // 4. DELETE control socket file to avoid conflicts
                 val controlPath = "${filesDir.absolutePath}/control.sock"
                 val socketFile = File(controlPath)
                 if (socketFile.exists()) {
@@ -3357,16 +3459,9 @@ class TiredVpnService : VpnService() {
                     FileLogger.d(TAG, "executeReconnectSequence: Control socket file deleted: $deleted")
                 }
 
-                FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Close VPN interface")
                 // 5. Close VPN interface (through the ledger: closed once, ours only).
-                // Re-checked here and not only on entry: the wait in step 3 is
-                // up to three seconds, which is ample room for forceResetCore
-                // plus a fresh connect() to have established the interface this
-                // line would otherwise close.
-                if (!connectGeneration.isCurrent(generation)) {
-                    FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded during cleanup, leaving the new interface alone")
-                    return@withContext
-                }
+                if (!stillOurs("step 5")) return@withContext
+                FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Close VPN interface")
                 vpnInterface = null
                 tunHandles.releaseAll()
 
@@ -3661,13 +3756,14 @@ class TiredVpnService : VpnService() {
         }
         tiredvpnProcess = null
 
-        // Force-cleanup native Go runtime to kill orphan goroutines holding dup'd TUN fds.
-        // stopClient() only signals the main goroutine; parallel strategy attempts from
-        // multi-attempt connections survive otherwise and keep the TUN fd open, leaving
-        // the system VPN icon visible even after the Android side has disconnected.
+        // Drop the JNI callback bridge. What actually stops the core is the
+        // stop() above (stopClient cancels the client context and waits up to
+        // five seconds on clientWg); this only makes sure that whatever
+        // survived that wait has no way left to call back into us. Descriptors
+        // are closed below, through the ledger.
         try {
             TiredVpnNative.cleanup()
-            FileLogger.d(TAG, "Native library cleaned up (orphan goroutines killed)")
+            FileLogger.d(TAG, "Native callback bridge dropped")
         } catch (e: Exception) {
             FileLogger.w(TAG, "Error cleaning up native library", e)
         }
@@ -3706,19 +3802,29 @@ class TiredVpnService : VpnService() {
     }
 
     /**
-     * Hold the CPU awake for the duration of one connect attempt, and no
-     * longer.
+     * Hold the CPU awake for as long as there is a tunnel to keep alive.
      *
-     * The lock used to be taken without a timeout and released only on
-     * disconnect, so the device could not enter deep sleep for as long as the
-     * VPN was up. Nothing needs that: a foreground service with a VPN
-     * notification is already exempt from being killed, and an arriving packet
-     * wakes the CPU on its own. What genuinely must not be suspended is the
-     * connect itself — a handshake half-way through a strategy scan.
+     * Releasing it on a successful connect — which is what this did for one
+     * revision — looks like an obvious battery win and is not one, because the
+     * session does not survive the sleep that follows. The keepalive frames
+     * that hold a session open are generated by the client side
+     * (`runKeepaliveSender` in internal/tun/vpn.go, a 10s ticker), so while
+     * this process is suspended nobody sends them; the server's read deadline
+     * is 30s and its dead-connection monitor 45s. Any sleep longer than half a
+     * minute therefore comes back to a torn-down session, and the way back is a
+     * full reconnect with a fresh strategy scan — up to 46s of no network on
+     * every screen unlock.
      *
-     * The timeout is the outer connect fence plus slack, so a connect that
-     * dies without reaching either the success or the failure path still
-     * releases it.
+     * So: taken on entry to connect, released on the two paths that end a
+     * tunnel — [cleanupFailedConnection] and [disconnect]. No timeout, because
+     * there is no honest number: the lock is wanted exactly as long as the
+     * tunnel is.
+     *
+     * This is not free and is not the last word on it. Deep sleep with the
+     * tunnel up needs the session to survive a wall-clock gap, which is a core
+     * change (re-arm the deadline on a detected clock jump, hot-swap instead of
+     * a full reconnect), not a Kotlin one. Doze already ignores partial wake
+     * locks, so the long-idle case behaves as if this were absent either way.
      */
     private fun acquireWakeLock() {
         if (wakeLock == null) {
@@ -3730,8 +3836,8 @@ class TiredVpnService : VpnService() {
         }
         wakeLock?.let {
             if (!it.isHeld) {
-                it.acquire(CONNECT_WAKELOCK_TIMEOUT_MS)
-                FileLogger.d(TAG, "WakeLock acquired for the connect window (${CONNECT_WAKELOCK_TIMEOUT_MS}ms)")
+                it.acquire()
+                FileLogger.d(TAG, "WakeLock acquired for the lifetime of the tunnel")
             }
         }
     }
@@ -3993,12 +4099,20 @@ class TiredVpnService : VpnService() {
     }
 
     /**
-     * Is the tunnel still carrying traffic, as opposed to merely started?
+     * Has the core gone silent on the control channel?
      *
-     * [coreStarted] cannot answer this: the core runs in our own process, so a
-     * wedged goroutine or a dead relay leaves it true forever. This asks the
-     * only question the Kotlin side can actually observe — when the core last
-     * said anything down the control channel.
+     * Narrower than the name suggests, and deliberately stated that way: what
+     * this observes is the core's control goroutine answering, which
+     * [coreStarted] cannot see (that flag is set when we start the client and
+     * cleared only when the core announces it left, so a wedged goroutine
+     * leaves it true forever). It is *not* a measure of the relay: the core's
+     * `status` response is assembled from bookkeeping fields and never asks the
+     * relay anything, so a dead relay behind a live control goroutine still
+     * answers. Making this a real tunnel-health check means adding an idle
+     * counter to that response in internal/tun/control.go.
+     *
+     * Measured on [SystemClock.uptimeMillis] — the clock the core was also
+     * frozen on. See [lastKeepaliveTime].
      *
      * Deliberately true in proxy mode: there is no control channel there, so
      * `lastKeepaliveTime` would freeze at connect time and this would declare a
@@ -4009,7 +4123,7 @@ class TiredVpnService : VpnService() {
         if (controlChannel == null) return true // proxy mode: no event channel to measure
         if (lastKeepaliveTime == 0L) return true // Not initialized yet
 
-        val timeSinceKeepalive = System.currentTimeMillis() - lastKeepaliveTime
+        val timeSinceKeepalive = SystemClock.uptimeMillis() - lastKeepaliveTime
         if (timeSinceKeepalive > keepaliveTimeoutMs) {
             FileLogger.e(TAG, "Tunnel appears dead - core silent for ${timeSinceKeepalive}ms (limit ${keepaliveTimeoutMs}ms)")
             return false
