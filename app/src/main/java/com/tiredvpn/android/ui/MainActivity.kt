@@ -611,20 +611,20 @@ class MainActivity : BaseActivity() {
 
     private fun showUpdateDialog(config: UpdateConfig) {
         val builder = AlertDialog.Builder(this)
-            .setTitle("Доступно обновление ${config.versionName}")
-            .setMessage(config.releaseNotes.ifEmpty { "Доступна новая версия приложения" })
-            .setPositiveButton("Обновить") { _, _ ->
+            .setTitle(getString(R.string.update_available_title, config.versionName))
+            .setMessage(config.releaseNotes.ifEmpty { getString(R.string.update_available_message) })
+            .setPositiveButton(R.string.update_action_install) { _, _ ->
                 startUpdate(config)
             }
 
         // If force update - no "Later" button and non-cancelable
         if (config.forceUpdate) {
             builder.setCancelable(false)
-            builder.setNegativeButton("Выход") { _, _ ->
+            builder.setNegativeButton(R.string.update_action_exit) { _, _ ->
                 finish()
             }
         } else {
-            builder.setNegativeButton("Позже", null)
+            builder.setNegativeButton(R.string.update_action_later, null)
         }
 
         builder.show()
@@ -650,7 +650,7 @@ class MainActivity : BaseActivity() {
 
         // Show progress dialog
         val dialog = AlertDialog.Builder(this)
-            .setTitle("Загрузка обновления")
+            .setTitle(R.string.update_download_title)
             .setView(ProgressBar(this).apply {
                 isIndeterminate = false
                 max = 100
@@ -668,7 +668,7 @@ class MainActivity : BaseActivity() {
 
             when (result) {
                 is com.tiredvpn.android.update.UpdateResult.DownloadFailed -> {
-                    Toast.makeText(this@MainActivity, "Ошибка загрузки", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, R.string.update_download_failed, Toast.LENGTH_LONG).show()
                     if (config.forceUpdate) {
                         showUpdateDialog(config) // Retry
                     }

@@ -3,6 +3,7 @@ package com.tiredvpn.android.util
 import android.content.Context
 import androidx.core.content.FileProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -94,6 +95,44 @@ class SharedFilesTest {
         assertTrue("writeText would fail on a missing parent", file.parentFile!!.isDirectory)
         file.writeText("x")
         assertTrue(file.exists())
+    }
+
+    /**
+     * The backup is every server profile in clear text, secrets included, and
+     * earlier versions left it in the root of the cache directory after each
+     * share. Moving the new writes into `share/` does nothing about the copy
+     * already on disk, and the system may never reclaim that cache.
+     */
+    @Test
+    fun `the copies an older version left in the cache root are removed`() {
+        val backup = File(context.cacheDir, "tiredvpn-backup.json").apply { writeText("""[{"secret":"leak"}]""") }
+        val logs = File(context.cacheDir, "tiredvpn_logs.txt").apply { writeText("log") }
+        assertTrue(backup.exists() && logs.exists())
+
+        SharedFiles.file(context, "tiredvpn-backup.json")
+
+        assertFalse("the plaintext backup must not survive first use", backup.exists())
+        assertFalse(logs.exists())
+    }
+
+    @Test
+    fun `only the two known names are removed, not the cache`() {
+        val apk = File(context.cacheDir, "updates/app.apk").apply {
+            parentFile?.mkdirs()
+            writeText("apk")
+        }
+        val other = File(context.cacheDir, "http-cache-entry").apply { writeText("x") }
+
+        SharedFiles.dir(context)
+
+        assertTrue("the downloaded update is not ours to delete", apk.exists())
+        assertTrue("nor is anything else in the cache", other.exists())
+    }
+
+    @Test
+    fun `removing the legacy copies is safe when there are none`() {
+        SharedFiles.removeLegacyCopies(context)
+        assertEquals(0, SharedFiles.removeLegacyCopies(context))
     }
 
     /**

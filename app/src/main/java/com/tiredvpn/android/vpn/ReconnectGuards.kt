@@ -87,5 +87,23 @@ internal class ConnectGeneration {
     /** Open a new generation; every older one is now stale. */
     fun begin(): Int = counter.incrementAndGet()
 
+    /**
+     * Open a new generation, but only if [expected] is still the current one.
+     *
+     * For work that decided to connect a long time before it got round to it.
+     * A reconnect sequence checks the generation, then waits for connectivity
+     * and a backoff — several seconds during which the user can pick a
+     * different server and tap connect. Checking again before calling
+     * `connect()` narrows that window but does not close it: between the check
+     * and the increment, the newer attempt can still arrive, and then the stale
+     * sequence opens a generation *above* it, cancels its job and dials the old
+     * config. Check and claim have to be the same operation.
+     *
+     * @return the new generation, or null when [expected] has been superseded
+     *         and the caller has no right to start anything.
+     */
+    fun beginIfCurrent(expected: Int): Int? =
+        if (counter.compareAndSet(expected, expected + 1)) expected + 1 else null
+
     fun isCurrent(generation: Int): Boolean = counter.get() == generation
 }

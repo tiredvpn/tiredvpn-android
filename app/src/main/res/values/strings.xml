@@ -264,4 +264,15 @@
     <string name="update_download_title">Downloading update</string>
     <string name="update_download_channel">Update downloads</string>
     <string name="update_download_channel_desc">Progress of a new version being downloaded</string>
+
+    <!-- Update available notification and dialog -->
+    <string name="update_available_title">Update available: %1$s</string>
+    <string name="update_available_text">Tap to install</string>
+    <string name="update_available_message">A new version of the app is available</string>
+    <string name="update_available_channel">Updates</string>
+    <string name="update_available_channel_desc">Notifications about new versions of the app</string>
+    <string name="update_action_install">Update</string>
+    <string name="update_action_later">Later</string>
+    <string name="update_action_exit">Exit</string>
+    <string name="update_download_failed">Download failed</string>
 </resources>

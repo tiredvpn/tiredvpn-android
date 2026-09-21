@@ -320,9 +320,9 @@ class UpdateWorker(
         notificationManager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "Обновления",
+                applicationContext.getString(R.string.update_available_channel),
                 NotificationManager.IMPORTANCE_DEFAULT
-            ).apply { description = "Уведомления о новых версиях приложения" }
+            ).apply { description = applicationContext.getString(R.string.update_available_channel_desc) }
         )
 
         notificationManager.createNotificationChannel(
@@ -356,8 +356,8 @@ class UpdateWorker(
 
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_cloud_upload)
-            .setContentTitle("Доступно обновление $versionName")
-            .setContentText(releaseNotes.ifEmpty { "Нажмите для установки" })
+            .setContentTitle(applicationContext.getString(R.string.update_available_title, versionName))
+            .setContentText(releaseNotes.ifEmpty { applicationContext.getString(R.string.update_available_text) })
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)

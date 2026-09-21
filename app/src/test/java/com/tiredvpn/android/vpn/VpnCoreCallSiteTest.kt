@@ -380,17 +380,20 @@ class VpnCoreCallSiteTest {
     @Test
     fun `cleanup is gated on the connection generation`() {
         val service = source("TiredVpnService.kt")
-        assertTrue("connect() must open a generation", service.contains("val generation = connectGeneration.begin()"))
+        assertTrue("connect() must open a generation", service.contains("connectGeneration.begin()"))
+        assertTrue(
+            "one helper asks the question, so the answer cannot drift between teardowns",
+            service.contains("private fun stillOurs(generation: Int, step: String): Boolean")
+        )
         assertTrue(
             "cleanupFailedConnection must refuse to run for a superseded attempt",
             bodyAfter(service, "private fun cleanupFailedConnection(generation: Int) {")
-                .contains("connectGeneration.isCurrent(generation)")
+                .contains("stillOurs(generation,")
         )
-        val sequence = bodyAfter(service, "private suspend fun executeReconnectSequence(generation: Int): Boolean {")
-        assertTrue(
-            "the NonCancellable teardown must re-check before closing the TUN descriptor",
-            occurrences(sequence, "connectGeneration.isCurrent(generation)") >= 2
-        )
+        // Which steps are gated, and the ownership snapshots, are checked in
+        // `cleaning up a failed connect is gated at every step, not only on
+        // entry` and `every destructive step of a reconnect is gated on its
+        // generation`.
     }
 
     @Test
@@ -957,7 +960,10 @@ class VpnCoreCallSiteTest {
 
         val steps = listOf("step 0", "step 1", "step 2", "step 3", "step 3b", "step 4", "step 5")
         for (step in steps) {
-            assertTrue("$step is not gated", body.contains("""if (!stillOurs("$step")) return@withContext"""))
+            assertTrue(
+                "$step is not gated",
+                body.contains("""if (!stillOurs(generation, "$step")) return@withContext""")
+            )
         }
         assertEquals(
             "every gate must belong to a named step, and every step must have one",
@@ -980,6 +986,87 @@ class VpnCoreCallSiteTest {
         assertFalse(
             "closeControlChannel() acts on the field, which by then may be a newer channel",
             body.contains("closeControlChannel()")
+        )
+    }
+
+    /**
+     * A reconnect decides to connect, then waits seconds for connectivity and a
+     * backoff — inside its caller's NonCancellable block, so cancelling it does
+     * nothing and the waits run to completion. A connect the user started
+     * meanwhile would be cancelled and replaced by the sequence's stale config:
+     * the user picks a different server, taps, and lands back on the old one.
+     *
+     * The guarantee is the atomic claim, not the re-checks; the re-checks only
+     * stop the sequence earlier and keep the log readable.
+     */
+    @Test
+    fun `work that waited before connecting claims the generation instead of taking it`() {
+        val service = source("TiredVpnService.kt")
+
+        assertTrue(
+            "connect must be able to decline",
+            service.contains("private fun connect(config: VpnConfig, supersedes: Int? = null): Boolean")
+        )
+        assertTrue(
+            "and the claim must be a compare-and-set, not a check followed by a bump",
+            bodyAfter(service, "private fun connect(config: VpnConfig, supersedes: Int? = null): Boolean {")
+                .contains("connectGeneration.beginIfCurrent(supersedes)")
+        )
+
+        val sequence = bodyAfter(service, "private suspend fun executeReconnectSequence(generation: Int): Boolean {")
+        assertTrue(
+            "the reconnect sequence must claim, not assume",
+            sequence.contains("connect(config, supersedes = generation)")
+        )
+        for (wait in listOf("delay(waitMs)", "delay(backoffMs)")) {
+            assertTrue(
+                "no generation re-check after $wait",
+                Regex("""${Regex.escape(wait)}[\s\S]{0,400}?connectGeneration\.isCurrent\(generation\)""")
+                    .containsMatchIn(sequence)
+            )
+        }
+
+        val scheduled = bodyAfter(service, "private fun scheduleAutoReconnect(config: VpnConfig) {")
+        assertTrue(
+            "the backoff path connects inside NonCancellable too and needs the same claim",
+            scheduled.contains("connect(config, supersedes = scheduledFrom)")
+        )
+        assertTrue(
+            "the generation it claims against must be read before the coroutine is launched, " +
+                "not inside it - read after the wait it names whatever superseded us",
+            scheduled.indexOf("val scheduledFrom = connectGeneration.current") in
+                0 until scheduled.indexOf("pendingReconnectJob = scope.launch")
+        )
+    }
+
+    /**
+     * Same shape as the reconnect sequence: this runs from the catch blocks of
+     * a connect coroutine that has already been cancelled, so a fresh connect
+     * can be building its core, channel and interface while these lines run.
+     * One check at the top is a window, not a guard.
+     */
+    @Test
+    fun `cleaning up a failed connect is gated at every step, not only on entry`() {
+        val service = source("TiredVpnService.kt")
+        val body = bodyAfter(service, "private fun cleanupFailedConnection(generation: Int) {")
+        assertTrue("scanner cannot see the cleanup", body.contains("tunHandles.releaseAll()"))
+
+        for (step in listOf(
+            "cleanupFailedConnection", "native cleanup", "protect server",
+            "TUN ledger", "control.sock", "endpoint pool", "wake lock",
+        )) {
+            assertTrue("$step is not gated", body.contains("""if (!stillOurs(generation, "$step")) return"""))
+        }
+
+        assertTrue("the core stopped must be the one this attempt made", body.contains("ownedProcess?.stop()"))
+        assertTrue(body.contains("if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null"))
+        assertFalse(
+            "closeControlChannel() acts on the field, which may hold a newer channel",
+            body.contains("closeControlChannel()")
+        )
+        assertFalse(
+            "unlinking protect.sock belongs to the generation that owns the name",
+            body.contains("protect.sock")
         )
     }
 
@@ -1079,27 +1166,59 @@ class VpnCoreCallSiteTest {
     }
 
     /**
-     * The download notification is the one piece of UI the update flow puts on
-     * screen, and its three strings were Russian literals in a codebase whose
-     * only `values/strings.xml` is English. Four more literals are still in
-     * this file (the "update available" notification and its channel); they are
-     * named here so that extracting them is a decision rather than an
-     * oversight.
+     * No user-facing text is written in a language the app does not otherwise
+     * speak.
+     *
+     * The whole update flow — the download notification, its channel, the
+     * "update available" notification and the dialog behind it — was Russian
+     * string literals in a codebase whose only `values/strings.xml` is English.
+     * Nothing about that was deliberate: there is no `values-ru`, so those
+     * users saw Russian in exactly eleven places and English everywhere else.
+     *
+     * Stated as "no Cyrillic in a string literal" rather than as a list of the
+     * eleven, because a list only guards the eleven. Comments are stripped
+     * first: prose about the code is not UI, and there is Russian in a comment
+     * or two that has every right to be there.
      */
     @Test
-    fun `the download notification takes its text from resources`() {
-        val worker = source("UpdateWorker.kt")
-        for (key in listOf("update_download_title", "update_download_channel", "update_download_channel_desc")) {
-            assertTrue("$key is not used", worker.contains("R.string.$key"))
-        }
-        for (literal in listOf("Загрузка обновления", "Загрузка обновлений", "Ход загрузки новой версии")) {
-            assertFalse("hardcoded string still in UpdateWorker: $literal", worker.contains(literal))
+    fun `no user-facing string is written in Cyrillic`() {
+        val cyrillic = Regex("""[Ѐ-ӿ]""")
+        val offenders = mutableListOf<String>()
+
+        for (file in sourceRoot().walkTopDown()) {
+            if (!file.isFile || file.extension != "kt") continue
+            for ((n, line) in stripComments(file.readText()).lines().withIndex()) {
+                if (cyrillic.containsMatchIn(line)) offenders += "${file.name}:${n + 1}: ${line.trim()}"
+            }
         }
 
+        assertEquals(
+            "user-facing text belongs in strings.xml, in the language the rest of the app is in",
+            emptyList<String>(), offenders
+        )
+    }
+
+    /** The resources the update flow now depends on exist and are wired up. */
+    @Test
+    fun `the update notifications take their text from resources`() {
+        val keys = listOf(
+            "update_download_title", "update_download_channel", "update_download_channel_desc",
+            "update_available_title", "update_available_text", "update_available_message",
+            "update_available_channel", "update_available_channel_desc",
+            "update_action_install", "update_action_later", "update_action_exit",
+            "update_download_failed",
+        )
+        val users = source("UpdateWorker.kt") + source("MainActivity.kt")
         val strings = File(sourceRoot().parentFile, "res/values/strings.xml").readText()
-        for (key in listOf("update_download_title", "update_download_channel", "update_download_channel_desc")) {
+
+        for (key in keys) {
+            assertTrue("$key is declared but nothing uses it", users.contains("R.string.$key"))
             assertTrue("$key is referenced but not declared", strings.contains("""<string name="$key">"""))
         }
+        assertTrue(
+            "the version has to reach the title, and a format arg is how",
+            strings.contains("""<string name="update_available_title">Update available: %1${'$'}s</string>""")
+        )
     }
 
     @Test

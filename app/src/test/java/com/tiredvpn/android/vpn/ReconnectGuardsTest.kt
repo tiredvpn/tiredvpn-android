@@ -97,6 +97,72 @@ class ReconnectGuardsTest {
         assertTrue(gen.isCurrent(new))
     }
 
+    /**
+     * The check-then-act that a wait makes unsafe.
+     *
+     * The reconnect sequence runs inside its caller's NonCancellable block, so
+     * cancelling it does nothing: it checks the generation, then waits seconds
+     * for connectivity and a backoff, and only then connects. A connect the
+     * user started during that wait would be cancelled and replaced by the
+     * sequence's stale config — the user picks a different server, taps, and
+     * lands back on the old one. Checking again right before the connect
+     * narrows the window; claiming it in the same operation closes it.
+     */
+    @Test
+    fun `a superseded waiter cannot claim the next generation`() {
+        val gen = ConnectGeneration()
+        val waiting = gen.begin()
+
+        // The user taps connect while the sequence sleeps.
+        val user = gen.begin()
+
+        assertNull("the stale sequence must not start anything", gen.beginIfCurrent(waiting))
+        assertTrue("and must not have moved the counter", gen.isCurrent(user))
+    }
+
+    @Test
+    fun `an uncontested waiter claims the next generation`() {
+        val gen = ConnectGeneration()
+        val waiting = gen.begin()
+
+        val claimed = gen.beginIfCurrent(waiting)
+        assertEquals(waiting + 1, claimed)
+        assertTrue(gen.isCurrent(claimed!!))
+        assertFalse("the generation it waited on is now stale", gen.isCurrent(waiting))
+    }
+
+    /**
+     * Repeated, because one round of this proves nothing.
+     *
+     * The interesting wrong implementation is not "always claims" — it is
+     * `if (isCurrent(expected)) begin()`, a check followed by a bump, which is
+     * what the production code did before and which a single round of racing
+     * threads passes most of the time. Two hundred rounds of eight threads
+     * released together is enough for the gap between the read and the
+     * increment to be hit; an atomic compare-and-set cannot be hit at all.
+     */
+    @Test
+    fun `only one of many racing waiters claims, over and over`() {
+        repeat(200) { round ->
+            val gen = ConnectGeneration()
+            val from = gen.begin()
+            val winners = AtomicInteger(0)
+            val start = CountDownLatch(1)
+            val threads = (1..8).map {
+                Thread {
+                    start.await()
+                    if (gen.beginIfCurrent(from) != null) winners.incrementAndGet()
+                }
+            }
+            threads.forEach { it.start() }
+            start.countDown()
+            threads.forEach { it.join() }
+
+            assertEquals("round $round: two waiters both thought they had claimed", 1, winners.get())
+            assertEquals("round $round: the counter moved more than once", from + 1, gen.current)
+        }
+    }
+
     @Test
     fun `generations are unique under concurrent starts`() {
         val gen = ConnectGeneration()

@@ -104,12 +104,23 @@ internal object ServerStoreIntegrity {
  * server on the way past. Secrets live in exactly one place, so that was
  * unrecoverable.
  *
- * What this does instead: union by id. Every server present on either side
- * survives. Where an id is on both sides the encrypted record wins, because the
- * realistic way to get a conflicting id is a stale snapshot of the same server,
- * while the realistic way to get a *new* server during a degraded spell is an
- * import, which mints a fresh id. The active id is only ever set, never cleared,
- * and only when the encrypted store does not name one already.
+ * What this does instead: union by id, with the conflict decided by evidence
+ * rather than by a guess. Every server present on either side survives.
+ *
+ * The guess that had to go was "the encrypted record always wins a conflicting
+ * id". It is right for the case this was written for — a plaintext copy left
+ * behind by a Keystore failure on some older build, which is simply old — and
+ * wrong for the case the fallback exists to serve: a user who changed a
+ * server's secret, or chose a different active server, while the Keystore was
+ * down. Both look identical in the payload, and restoring a JSON backup makes
+ * it worse, because `VpnConfig.fromJson` keeps the id, so a restored record
+ * collides with the encrypted one by construction.
+ *
+ * So the writes made during a degraded spell say so. [ServerRepository] records
+ * the id of every server it saved or deleted while writing to plaintext, and
+ * whether the active server was chosen there; those records win, and only
+ * those. An unmarked plaintext record is an old copy and loses. The active id
+ * is only ever set, never cleared.
  */
 internal object StoreReconciliation {
 
@@ -137,12 +148,23 @@ internal object StoreReconciliation {
         ) : Plan()
     }
 
+    /**
+     * @param dirtyIds servers saved while the store was degraded. Their
+     *        plaintext record is newer than anything in the encrypted store.
+     * @param deletedIds servers deleted while degraded. They must not come back
+     *        from the encrypted copy.
+     * @param activeIdChosenWhileDegraded true when [plainActiveId] is a choice
+     *        made during the degraded spell rather than a leftover.
+     */
     fun plan(
         encryptedPayload: String?,
         encryptedActiveId: String?,
         plainPayload: String?,
         plainActiveId: String?,
         plainHasList: Boolean,
+        dirtyIds: Set<String> = emptySet(),
+        deletedIds: Set<String> = emptySet(),
+        activeIdChosenWhileDegraded: Boolean = false,
     ): Plan {
         if (!plainHasList) return Plan.Nothing
 
@@ -160,24 +182,58 @@ internal object StoreReconciliation {
         val encryptedElements = elementsOf(encrypted)
         val plainElements = elementsOf(plain)
 
+        // The plaintext record for every id that was written during the
+        // degraded spell. These are the only plaintext records entitled to
+        // displace an encrypted one.
+        val newerInPlain = HashMap<String, String>()
+        for (element in plainElements) {
+            val id = idOf(element) ?: continue
+            if (id in dirtyIds) newerInPlain[id] = element
+        }
+
         val merged = mutableListOf<String>()
         val ids = mutableListOf<String?>()
+        val placed = mutableSetOf<String>()
+
+        // Encrypted first, in its own order, so the list the user knows keeps
+        // its shape.
         for (element in encryptedElements) {
-            merged.add(element)
-            ids.add(idOf(element))
+            val id = idOf(element)
+            if (id == null) {
+                // No readable id: cannot be matched or deduplicated, so it is
+                // kept. A duplicate is repairable, a dropped server is not.
+                merged.add(element)
+                ids.add(null)
+                continue
+            }
+            if (id in deletedIds) continue          // deleted while degraded; do not resurrect
+            if (!placed.add(id)) continue
+            merged.add(newerInPlain[id] ?: element) // the degraded write wins, if there was one
+            ids.add(id)
         }
-        val known = ids.filterNotNull().toMutableSet()
+
+        // Then whatever plaintext has that is not placed yet — servers created
+        // during the spell, and unmarked leftovers the encrypted store never
+        // knew about.
         for (element in plainElements) {
             val id = idOf(element)
-            // A record with no readable id cannot be deduplicated, so it is
-            // kept: a duplicate is repairable, a dropped server is not.
-            if (id != null && !known.add(id)) continue
+            if (id == null) {
+                merged.add(element)
+                ids.add(null)
+                continue
+            }
+            if (id in deletedIds) continue
+            if (!placed.add(id)) continue
             merged.add(element)
             ids.add(id)
         }
 
+        // The active server: a choice made during the spell wins outright;
+        // otherwise plaintext may only fill a gap. Never null — clearing the
+        // key is what removed the active server, and an id that names nothing
+        // is repaired by getActiveServer on the next read.
         val activeId = plainActiveId
-            ?.takeIf { encryptedActiveId == null }
+            ?.takeIf { activeIdChosenWhileDegraded || encryptedActiveId == null }
             ?.takeIf { candidate -> ids.any { it == candidate } }
 
         return Plan.Fold(

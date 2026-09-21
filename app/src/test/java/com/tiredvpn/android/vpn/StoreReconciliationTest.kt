@@ -29,7 +29,13 @@ class StoreReconciliationTest {
         encryptedActiveId: String? = null,
         plainActiveId: String? = null,
         plainHasList: Boolean = true,
-    ) = StoreReconciliation.plan(encrypted, encryptedActiveId, plain, plainActiveId, plainHasList)
+        dirtyIds: Set<String> = emptySet(),
+        deletedIds: Set<String> = emptySet(),
+        activeIdChosenWhileDegraded: Boolean = false,
+    ) = StoreReconciliation.plan(
+        encrypted, encryptedActiveId, plain, plainActiveId, plainHasList,
+        dirtyIds, deletedIds, activeIdChosenWhileDegraded,
+    )
 
     // --- positive control: the ids this whole file turns on are readable -----
 
@@ -100,7 +106,116 @@ class StoreReconciliationTest {
         assertEquals("it has no id to promise", emptyList<String>(), plan.expectedIds)
     }
 
+    // --- what was changed while the Keystore was down -----------------------
+
+    /**
+     * The other side of the rule above, and the reason a marker exists at all:
+     * a record written during the degraded spell is newer, however identical
+     * the two copies look. Rotating a server's secret is the case that costs
+     * the user a working tunnel if the old one wins.
+     */
+    @Test
+    fun `a secret changed while degraded beats the encrypted copy`() {
+        val plan = fold(
+            encrypted = array(record("ams", secret = "old-key")),
+            plain = array(record("ams", secret = "rotated-key")),
+            dirtyIds = setOf("ams"),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertTrue("the rotated secret must survive", plan.payload.contains("rotated-key"))
+        assertFalse("the superseded one must not", plan.payload.contains("old-key"))
+        assertEquals("and it is still one server, not two", listOf("ams"), plan.expectedIds)
+    }
+
+    @Test
+    fun `an unmarked copy of the same id still loses`() {
+        val plan = fold(
+            encrypted = array(record("ams", secret = "live-key")),
+            plain = array(record("ams", secret = "year-old-key")),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertTrue(plan.payload.contains("live-key"))
+        assertFalse(plan.payload.contains("year-old-key"))
+    }
+
+    @Test
+    fun `a server deleted while degraded does not come back`() {
+        val plan = fold(
+            encrypted = array(record("ams"), record("dxb")),
+            plain = array(record("ams")),
+            deletedIds = setOf("dxb"),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertEquals(listOf("ams"), plan.expectedIds)
+        assertFalse(plan.payload.contains("dxb"))
+    }
+
+    @Test
+    fun `a delete undone by a later save is not a delete`() {
+        // The repository keeps the two sets disjoint; this is the shape the
+        // planner must handle when it does.
+        val plan = fold(
+            encrypted = array(record("ams", secret = "old")),
+            plain = array(record("ams", secret = "new")),
+            dirtyIds = setOf("ams"),
+            deletedIds = emptySet(),
+        ) as StoreReconciliation.Plan.Fold
+        assertEquals(listOf("ams"), plan.expectedIds)
+        assertTrue(plan.payload.contains("new"))
+    }
+
+    @Test
+    fun `a marked id absent from plaintext leaves the encrypted record alone`() {
+        val plan = fold(
+            encrypted = array(record("ams", secret = "live")),
+            plain = "[]",
+            dirtyIds = setOf("ams"),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertEquals(listOf("ams"), plan.expectedIds)
+        assertTrue(plan.payload.contains("live"))
+    }
+
+    @Test
+    fun `the order of the encrypted list is kept when a record is replaced`() {
+        val plan = fold(
+            encrypted = array(record("a"), record("b", secret = "old"), record("c")),
+            plain = array(record("b", secret = "new")),
+            dirtyIds = setOf("b"),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertEquals(listOf("a", "b", "c"), plan.expectedIds)
+        assertTrue(plan.payload.contains("new"))
+    }
+
     // --- the active server id -----------------------------------------------
+
+    @Test
+    fun `an active server chosen while degraded wins over the encrypted choice`() {
+        val plan = fold(
+            encrypted = array(record("a"), record("b")),
+            plain = array(record("b")),
+            encryptedActiveId = "a",
+            plainActiveId = "b",
+            activeIdChosenWhileDegraded = true,
+        ) as StoreReconciliation.Plan.Fold
+
+        assertEquals("b", plan.activeId)
+    }
+
+    @Test
+    fun `a choice made while degraded is still checked against the merged list`() {
+        val plan = fold(
+            encrypted = array(record("a")),
+            plain = "[]",
+            encryptedActiveId = "a",
+            plainActiveId = "gone",
+            activeIdChosenWhileDegraded = true,
+        ) as StoreReconciliation.Plan.Fold
+
+        assertNull("an id naming nothing must not be written", plan.activeId)
+    }
+
 
     @Test
     fun `the active id is never cleared`() {

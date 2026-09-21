@@ -54,6 +54,13 @@ object ServerRepository {
     private const val KEY_SERVERS = "servers"
     private const val KEY_ACTIVE_SERVER_ID = "active_server_id"
 
+    // What was changed while the encrypted store was unavailable. Kept in the
+    // plaintext store next to the data they describe, so they are cleared by
+    // the same edit that clears it. See StoreReconciliation.
+    private const val KEY_DEGRADED_DIRTY = "degraded_dirty_ids"
+    private const val KEY_DEGRADED_DELETED = "degraded_deleted_ids"
+    private const val KEY_DEGRADED_ACTIVE = "degraded_active_id_chosen"
+
     // Legacy prefs for migration
     private const val LEGACY_PREFS_NAME = "tiredvpn_config"
 
@@ -194,6 +201,7 @@ object ServerRepository {
 
         servers.removeAll { it.id == id }
         saveServersLocked(context, servers)
+        markServerDeletedLocked(context, id)
 
         if (wasActive) {
             val nextServer = servers.firstOrNull()
@@ -220,6 +228,7 @@ object ServerRepository {
     fun setActiveServerId(context: Context, id: String) = synchronized(lock) {
         reconcileStoresLocked(context)
         setActiveServerIdLocked(context, id)
+        markActiveChoiceLocked(context)
     }
 
     // --- internals, all called with [lock] held ---
@@ -286,6 +295,7 @@ object ServerRepository {
             servers.add(config)
         }
         saveServersLocked(context, servers)
+        markServerDirtyLocked(context, config.id)
 
         // If this is the only server, or no active server is set, make it active
         if (servers.size == 1 || activeServerIdLocked(context) == null) {
@@ -300,6 +310,56 @@ object ServerRepository {
             .edit()
             .putString(KEY_SERVERS, jsonArray.toString())
             .apply()
+    }
+
+    // --- what changed while the Keystore was down ---
+    //
+    // Only writes that landed in plaintext are recorded, and only writes that
+    // represent something the user did. The point is to tell a degraded-mode
+    // change apart from a stale copy of the same record, so the fold can let
+    // the change win; marking anything else would hand that privilege to data
+    // that has not changed.
+
+    /** [id] was saved while degraded: its plaintext record is the newer one. */
+    private fun markServerDirtyLocked(context: Context, id: String) {
+        if (!isStorageDegraded) return
+        val plain = plainPrefs(context)
+        val dirty = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty().toMutableSet()
+        val deleted = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty().toMutableSet()
+        // Saved after a delete: it exists again, and the delete is history.
+        dirty.add(id)
+        deleted.remove(id)
+        plain.edit()
+            .putStringSet(KEY_DEGRADED_DIRTY, dirty)
+            .putStringSet(KEY_DEGRADED_DELETED, deleted)
+            .apply()
+    }
+
+    /** [id] was deleted while degraded: it must not come back from encrypted. */
+    private fun markServerDeletedLocked(context: Context, id: String) {
+        if (!isStorageDegraded) return
+        val plain = plainPrefs(context)
+        val dirty = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty().toMutableSet()
+        val deleted = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty().toMutableSet()
+        deleted.add(id)
+        dirty.remove(id)
+        plain.edit()
+            .putStringSet(KEY_DEGRADED_DIRTY, dirty)
+            .putStringSet(KEY_DEGRADED_DELETED, deleted)
+            .apply()
+    }
+
+    /**
+     * The active server was *chosen* while degraded.
+     *
+     * Deliberately not called from [setActiveServerIdLocked]: that also runs
+     * when [getActiveServer] repairs an id that names nothing and when
+     * [saveServerLocked] adopts the first server, neither of which is a choice
+     * worth beating the encrypted store with.
+     */
+    private fun markActiveChoiceLocked(context: Context) {
+        if (!isStorageDegraded) return
+        plainPrefs(context).edit().putBoolean(KEY_DEGRADED_ACTIVE, true).apply()
     }
 
     private fun activeServerIdLocked(context: Context): String? =
@@ -353,6 +413,9 @@ object ServerRepository {
             plainPayload = plain.getString(KEY_SERVERS, null),
             plainActiveId = plain.getString(KEY_ACTIVE_SERVER_ID, null),
             plainHasList = plain.contains(KEY_SERVERS),
+            dirtyIds = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty(),
+            deletedIds = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty(),
+            activeIdChosenWhileDegraded = plain.getBoolean(KEY_DEGRADED_ACTIVE, false),
         )
 
         when (plan) {

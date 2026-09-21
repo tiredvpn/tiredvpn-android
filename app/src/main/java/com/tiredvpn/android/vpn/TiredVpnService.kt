@@ -534,15 +534,41 @@ class TiredVpnService : VpnService() {
         // whoever wires it up next has to implement the core side first.
     }
 
-    private fun connect(config: VpnConfig) {
+    /**
+     * Start a connection attempt.
+     *
+     * [supersedes] is for callers that decided to connect some time ago and
+     * have been waiting since — the auto-reconnect sequence spends seconds in
+     * connectivity checks and backoff, and it is not entitled to cancel a
+     * connect the user started meanwhile. Passing the generation the caller
+     * believes it owns makes the claim atomic: either this becomes the newest
+     * attempt, or nothing happens at all.
+     *
+     * Callers that are the user's own action (ACTION_CONNECT, a sticky
+     * restart) pass null and always win.
+     *
+     * @return false when [supersedes] has been superseded and nothing started.
+     */
+    private fun connect(config: VpnConfig, supersedes: Int? = null): Boolean {
+        // Claimed before anything else, including the watchdog: declining has
+        // to leave no trace, and an armed watchdog with no attempt behind it
+        // kills the process.
+        val generation = if (supersedes == null) {
+            // A new attempt starts here, so every cleanup an older one scheduled
+            // is now stale. Bumping before anything is created means a
+            // NonCancellable teardown already in flight cannot reach what we
+            // are about to make.
+            connectGeneration.begin()
+        } else {
+            connectGeneration.beginIfCurrent(supersedes) ?: run {
+                FileLogger.w(TAG, "connect: generation $supersedes superseded while waiting, a newer attempt owns the connection")
+                return false
+            }
+        }
+
         // WATCHDOG: arm before anything else below, so even the (currently harmless)
         // cancel/init calls that follow are inside the guarded window.
         armConnectWatchdog("connect")
-
-        // A new attempt starts here, so every cleanup an older one scheduled is
-        // now stale. Bumping before anything is created means a NonCancellable
-        // teardown already in flight cannot reach what we are about to make.
-        val generation = connectGeneration.begin()
 
         // Cancel any existing connection attempt
         connectionJob?.cancel()
@@ -624,6 +650,7 @@ class TiredVpnService : VpnService() {
             }
         }
         FileLogger.d(TAG, "connect: job launched, isActive=${connectionJob?.isActive}, isCancelled=${connectionJob?.isCancelled}, isCompleted=${connectionJob?.isCompleted}")
+        return true
     }
 
     /**
@@ -684,6 +711,12 @@ class TiredVpnService : VpnService() {
         }
 
         ensureScopeActive()
+        // The generation this retry belongs to, read before the wait. If
+        // anything opens a newer one while we sleep, the connect below declines
+        // instead of cancelling it — the backoff delay is cancellable, but only
+        // up to the moment it returns, and connect() follows it inside a
+        // NonCancellable block.
+        val scheduledFrom = connectGeneration.current
         pendingReconnectJob = scope.launch {
             try {
                 // Wrap delay() to suppress cosmetic JobCancellationException
@@ -713,7 +746,9 @@ class TiredVpnService : VpnService() {
                     }
                     isReconnecting = true
                     try {
-                        connect(config)
+                        if (!connect(config, supersedes = scheduledFrom)) {
+                            FileLogger.w(TAG, "scheduleAutoReconnect: a newer attempt claimed the connection, standing down")
+                        }
                     } catch (e: Exception) {
                         FileLogger.e(TAG, "scheduleAutoReconnect: connect() failed", e)
                         throw e
@@ -740,20 +775,28 @@ class TiredVpnService : VpnService() {
      * Clean up resources after a failed connection attempt.
      * Does NOT change state or stop service - caller should handle that.
      *
-     * [generation] is the attempt this cleanup belongs to; a newer connect()
-     * makes it stale and the cleanup becomes a no-op rather than closing the
-     * newer attempt's descriptors.
+     * [generation] is the attempt this cleanup belongs to. Checking it once on
+     * entry was not enough, and for the same reason as in
+     * [executeReconnectSequence]: this runs from the catch blocks of a connect
+     * coroutine that has already been cancelled, so a fresh connect() can be
+     * building its core, its channel and its interface while these lines run.
+     * One check at the top is a window, not a guard — every step below is
+     * gated, and the two long-lived objects are taken by identity so that a
+     * field holding a newer one is left alone.
      */
     private fun cleanupFailedConnection(generation: Int) {
-        if (!connectGeneration.isCurrent(generation)) {
-            FileLogger.w(TAG, "cleanupFailedConnection: generation $generation superseded, nothing to clean")
-            return
-        }
+        if (!stillOurs(generation, "cleanupFailedConnection")) return
         FileLogger.d(TAG, "Cleaning up failed connection...")
 
+        // The core and the channel this attempt created. stop() below is not
+        // instantaneous, and nulling the field afterwards would otherwise drop
+        // a newer attempt's core on the floor.
+        val ownedProcess = tiredvpnProcess
+        val ownedChannel = controlChannel
+
         // Stop native process
-        tiredvpnProcess?.stop()
-        tiredvpnProcess = null
+        ownedProcess?.stop()
+        if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
 
         // Unwire the callback bridge to the core. Read cleanupNative before
         // relying on this for anything else: on the Go side it is
@@ -765,30 +808,66 @@ class TiredVpnService : VpnService() {
         // attempt that outlives stopClient() can no longer report its own death
         // to us, and this path never called it at all, so the next start()
         // ran initialize() on top of a core still holding the old callback.
+        //
+        // Gated: the bridge is global JNI state, so dropping it after a newer
+        // core has registered cuts that core's callback rather than ours.
+        if (!stillOurs(generation, "native cleanup")) return
         try { TiredVpnNative.cleanup() } catch (e: Throwable) {
             FileLogger.w(TAG, "cleanupFailedConnection: native cleanup failed: ${e.message}")
         }
 
-        // Close control socket
-        closeControlChannel()
+        // Close the channel we opened, by identity
+        if (ownedChannel != null) {
+            if (controlChannel === ownedChannel) controlChannel = null
+            try { ownedChannel.close() } catch (e: Exception) {
+                FileLogger.w(TAG, "cleanupFailedConnection: closing control channel: ${e.message}")
+            }
+        }
 
-        // Stop protect server
+        // Stop protect server. The socket FILE is not touched here: unlinking
+        // it belongs to the generation that owns the name (see
+        // [protectGeneration]), and this path has no way to know whether a
+        // newer server has bound it already.
+        if (!stillOurs(generation, "protect server")) return
         stopProtectServer()
 
         // Close VPN interface (through the ledger, so it is closed exactly once)
+        if (!stillOurs(generation, "TUN ledger")) return
         vpnInterface = null
         tunHandles.releaseAll()
 
-        // Clean up socket files
+        // Clean up the control socket file. One fixed name again, so this is
+        // only ours while the generation holds.
+        if (!stillOurs(generation, "control.sock")) return
         File("${filesDir.absolutePath}/control.sock").delete()
-        File("${filesDir.absolutePath}/protect.sock").delete()
 
         // The endpoint pool lists every server the user dials; it is rebuilt on
-        // the next connect, so nothing needs it once the core has stopped.
+        // the next connect, so nothing needs it once the core has stopped —
+        // but a newer connect writes it before starting its core, and deleting
+        // it then leaves that core with no failover list at all.
+        if (!stillOurs(generation, "endpoint pool")) return
         ServerPoolConfig.delete(filesDir)
 
-        // Release WakeLock
+        // Release the WakeLock. Shared with whatever is connected now, so a
+        // stale cleanup letting the CPU sleep would end a tunnel it has nothing
+        // to do with — which is exactly the fault this lock was widened to fix.
+        if (!stillOurs(generation, "wake lock")) return
         releaseWakeLock()
+    }
+
+    /**
+     * Is [generation] still the current connection attempt?
+     *
+     * The question every destructive step has to ask, and the reason it is a
+     * function rather than a check at the top of each teardown: cleanup here
+     * runs from cancelled coroutines and from NonCancellable blocks, so between
+     * any two lines a fresh connect() can have created the very thing the next
+     * line destroys. One check at the entry answers for the entry only.
+     */
+    private fun stillOurs(generation: Int, step: String): Boolean {
+        if (connectGeneration.isCurrent(generation)) return true
+        FileLogger.w(TAG, "generation $generation superseded before $step, leaving the newer attempt alone")
+        return false
     }
 
     /**
@@ -3357,23 +3436,15 @@ class TiredVpnService : VpnService() {
             withContext(NonCancellable) {
                 FileLogger.d(TAG, "executeReconnectSequence: Entered NonCancellable context for cleanup")
 
-                /**
-                 * Every step below destroys something shared, and a fresh
-                 * connect() can start at any point in between — `forceResetCore`
-                 * cancels the job this runs in, but the body is NonCancellable
-                 * and keeps going. Checking once on entry only protected the
-                 * steps that happen to come first; the one check that used to
-                 * exist further down covered the TUN descriptor and nothing
-                 * else, while the core, the control channel and `control.sock`
-                 * were torn out from under the new attempt.
-                 */
-                fun stillOurs(step: String): Boolean {
-                    if (connectGeneration.isCurrent(generation)) return true
-                    FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded before $step, leaving the newer attempt alone")
-                    return false
-                }
-
-                if (!stillOurs("step 0")) return@withContext
+                // Every step below destroys something shared, and a fresh
+                // connect() can start at any point in between — forceResetCore
+                // cancels the job this runs in, but the body is NonCancellable
+                // and keeps going. Checking once on entry only protected the
+                // steps that happen to come first; the one check that used to
+                // exist further down covered the TUN descriptor and nothing
+                // else, while the core, the control channel and control.sock
+                // were torn out from under the new attempt.
+                if (!stillOurs(generation, "step 0")) return@withContext
 
                 // The objects this reconnect is entitled to destroy, taken now.
                 // Step 3 blocks for up to five seconds, so re-reading the
@@ -3387,7 +3458,7 @@ class TiredVpnService : VpnService() {
                 connectionJob?.cancel()
                 connectionJob = null
 
-                if (!stillOurs("step 1")) return@withContext
+                if (!stillOurs(generation, "step 1")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 1 - Stop monitoring")
                 // 1. Stop monitoring
                 stopNetworkMonitoring()
@@ -3397,7 +3468,7 @@ class TiredVpnService : VpnService() {
                 stopProcessWatchdog()
                 stopHealthCheck()
 
-                if (!stillOurs("step 2")) return@withContext
+                if (!stillOurs(generation, "step 2")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 2 - Close control socket")
                 // 2. Close the channel we came in with, not whatever the field
                 // holds. FIRST, before stopping the process.
@@ -3408,7 +3479,7 @@ class TiredVpnService : VpnService() {
                     }
                 }
 
-                if (!stillOurs("step 3")) return@withContext
+                if (!stillOurs(generation, "step 3")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 3 - Stop process and WAIT")
                 // 3. WAIT for the core to actually stop.
                 //
@@ -3439,7 +3510,7 @@ class TiredVpnService : VpnService() {
                 // the wait above is the long one. The bridge is global JNI
                 // state, so dropping it after a new core has registered would
                 // cut that core's callback rather than the dead one's.
-                if (!stillOurs("step 3b")) return@withContext
+                if (!stillOurs(generation, "step 3b")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 3b - Native cleanup")
                 try { TiredVpnNative.cleanup() } catch (e: Throwable) {
                     FileLogger.w(TAG, "executeReconnectSequence: native cleanup failed: ${e.message}")
@@ -3450,7 +3521,7 @@ class TiredVpnService : VpnService() {
                 // after the wait above a new core may have bound it. Unlinking
                 // it then leaves connectToControlSocket waiting 30s for a file
                 // that will never reappear.
-                if (!stillOurs("step 4")) return@withContext
+                if (!stillOurs(generation, "step 4")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 4 - Delete control socket file")
                 val controlPath = "${filesDir.absolutePath}/control.sock"
                 val socketFile = File(controlPath)
@@ -3460,7 +3531,7 @@ class TiredVpnService : VpnService() {
                 }
 
                 // 5. Close VPN interface (through the ledger: closed once, ours only).
-                if (!stillOurs("step 5")) return@withContext
+                if (!stillOurs(generation, "step 5")) return@withContext
                 FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Close VPN interface")
                 vpnInterface = null
                 tunHandles.releaseAll()
@@ -3498,7 +3569,14 @@ class TiredVpnService : VpnService() {
             }
 
             // 7. Wait for TCP connectivity before reconnecting
-            // Skip long waits if we just recovered from network loss
+            //
+            // Everything from here to the connect is waiting, and this whole
+            // function runs inside the caller's withContext(NonCancellable) —
+            // so cancelling our job does not stop us, the delays below run to
+            // completion, and several seconds pass in which the user can pick a
+            // different server and tap connect. The generation is therefore
+            // re-checked after every wait, and the connect itself claims it
+            // atomically rather than trusting the last check.
             val skipConnectivityCheck = isNetworkLost
             isNetworkLost = false  // Reset flag
 
@@ -3515,6 +3593,10 @@ class TiredVpnService : VpnService() {
                     FileLogger.d(TAG, "Reconnect: No connectivity, waiting ${waitMs}ms (attempt $connectivityAttempts/$maxConnectivityAttempts)...")
                     enterReconnectingState("Waiting for network...")
                     delay(waitMs)
+                    if (!connectGeneration.isCurrent(generation)) {
+                        FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded while waiting for network")
+                        return false
+                    }
                 }
                 FileLogger.i(TAG, "Reconnect: TCP connectivity check done after $connectivityAttempts attempts")
             } else {
@@ -3525,12 +3607,25 @@ class TiredVpnService : VpnService() {
             val backoffMs = if (reconnectAttempts <= 1) 500L else minOf(1000L * reconnectAttempts, maxBackoffMs)
             FileLogger.d(TAG, "Reconnect: Step 7 - Waiting ${backoffMs}ms before reconnecting...")
             delay(backoffMs)
+            if (!connectGeneration.isCurrent(generation)) {
+                FileLogger.w(TAG, "executeReconnectSequence: generation $generation superseded during backoff")
+                return false
+            }
 
-            // 9. Reconnect
+            // 9. Reconnect.
+            //
+            // `supersedes = generation`: the check above is a courtesy that
+            // keeps the log readable, not the guarantee. The guarantee is that
+            // connect() claims the next generation with a compare-and-set on
+            // this one, so a connect the user started in the last microsecond
+            // cannot be cancelled and replaced by this stale config.
             FileLogger.d(TAG, "Reconnect: Step 8 - Starting reconnection")
             enterReconnectingState(getString(R.string.phase_reconnecting))
             FileLogger.i(TAG, "Attempting automatic reconnection...")
-            connect(config)
+            if (!connect(config, supersedes = generation)) {
+                FileLogger.w(TAG, "executeReconnectSequence: a newer attempt claimed the connection, standing down")
+                return true // not our failure, and not ours to retry
+            }
             FileLogger.d(TAG, "DEBUG: Reconnect sequence COMPLETED successfully")
             return true
         } catch (e: Exception) {

@@ -3,6 +3,7 @@ package com.tiredvpn.android.vpn
 import android.content.Context
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -36,8 +37,11 @@ class ServerStoreMigrationTest {
     @Before
     fun setUp() {
         context = RuntimeEnvironment.getApplication()
+        // The plaintext side is the repository's real fallback store, so the
+        // tests below can either seed it by hand or drive the repository's own
+        // writers and have the result land in the same place.
         encrypted = context.getSharedPreferences("test_enc", Context.MODE_PRIVATE)
-        plain = context.getSharedPreferences("test_plain", Context.MODE_PRIVATE)
+        plain = context.getSharedPreferences("tiredvpn_servers", Context.MODE_PRIVATE)
         encrypted.edit().clear().commit()
         plain.edit().clear().commit()
     }
@@ -164,6 +168,100 @@ class ServerStoreMigrationTest {
 
         assertEquals(listOf("ams"), storedIds())
         assertEquals("an unrelated key is not ours to clear", "x", plain.getString("some_other_key", null))
+    }
+
+    /**
+     * End to end through the repository's own writers: the markers are set by
+     * the same calls the app makes, not by the test.
+     *
+     * Robolectric has no Keystore, so `encryptedPrefsOrNull` fails and the
+     * repository is genuinely in its degraded mode here — which is the only
+     * state in which these marks are supposed to be written at all.
+     */
+    @Test
+    fun `a secret rotated during a degraded spell survives the fold`() {
+        val ams = VpnConfig(name = "AMS", serverAddress = "ams.example", serverPort = 995, secret = "old-key")
+
+        // What the encrypted store held before the Keystore went down.
+        encrypted.edit()
+            .putString(keyServers, """[${ams.toJson()}]""")
+            .putString(keyActive, ams.id)
+            .commit()
+
+        // What the user did while it was down: rotated the secret.
+        ServerRepository.saveServer(context, ams.copy(secret = "rotated-key"))
+        assertTrue(
+            "these tests need the repository to be in its degraded mode, and it is not - " +
+                "the marks under test are only written there",
+            ServerRepository.isStorageDegraded
+        )
+
+        fold()
+
+        val stored = encrypted.getString(keyServers, null)!!
+        assertTrue("the rotation must survive", stored.contains("rotated-key"))
+        assertFalse("the superseded secret must not", stored.contains("old-key"))
+        assertEquals("and it is one server, not two", listOf(ams.id), storedIds())
+    }
+
+    @Test
+    fun `a server deleted during a degraded spell is not resurrected`() {
+        val ams = VpnConfig(name = "AMS", serverAddress = "ams.example", serverPort = 995, secret = "k1")
+        val dxb = VpnConfig(name = "DXB", serverAddress = "dxb.example", serverPort = 995, secret = "k2")
+
+        encrypted.edit()
+            .putString(keyServers, """[${ams.toJson()},${dxb.toJson()}]""")
+            .putString(keyActive, ams.id)
+            .commit()
+
+        ServerRepository.saveServer(context, ams)
+        ServerRepository.saveServer(context, dxb)
+        ServerRepository.deleteServer(context, dxb.id)
+
+        fold()
+
+        assertEquals(listOf(ams.id), storedIds())
+    }
+
+    @Test
+    fun `an active server chosen during a degraded spell survives the fold`() {
+        val ams = VpnConfig(name = "AMS", serverAddress = "ams.example", serverPort = 995, secret = "k1")
+        val dxb = VpnConfig(name = "DXB", serverAddress = "dxb.example", serverPort = 995, secret = "k2")
+
+        encrypted.edit()
+            .putString(keyServers, """[${ams.toJson()},${dxb.toJson()}]""")
+            .putString(keyActive, ams.id)
+            .commit()
+
+        ServerRepository.saveServer(context, ams)
+        ServerRepository.saveServer(context, dxb)
+        ServerRepository.setActiveServerId(context, dxb.id)
+
+        fold()
+
+        assertEquals("the choice made while degraded is the newer one", dxb.id, encrypted.getString(keyActive, null))
+    }
+
+    /**
+     * A latency measurement is not a reason to beat the encrypted store: the
+     * plaintext list it is written into may be a stale snapshot, and marking it
+     * would hand that snapshot the privilege meant for real edits.
+     */
+    @Test
+    fun `a latency ping while degraded does not mark the record as newer`() {
+        val ams = VpnConfig(name = "AMS", serverAddress = "ams.example", serverPort = 995, secret = "live-key")
+
+        encrypted.edit().putString(keyServers, """[${ams.toJson()}]""").commit()
+        // A stale copy sitting in plaintext from an earlier failure.
+        plain.edit().putString(keyServers, """[${ams.copy(secret = "stale-key").toJson()}]""").commit()
+
+        ServerRepository.updateLatency(context, ams.id, 42L)
+
+        fold()
+
+        val stored = encrypted.getString(keyServers, null)!!
+        assertTrue("the live secret must win", stored.contains("live-key"))
+        assertFalse("a ping must not promote a stale copy", stored.contains("stale-key"))
     }
 
     @Test

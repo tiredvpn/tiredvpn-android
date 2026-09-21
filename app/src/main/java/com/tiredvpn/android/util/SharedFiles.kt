@@ -23,7 +23,35 @@ object SharedFiles {
     /** Must match the `path` of the `shared` cache-path in `file_paths.xml`. */
     const val DIR_NAME = "share"
 
-    fun dir(context: Context): File = File(context.cacheDir, DIR_NAME).apply { mkdirs() }
+    /**
+     * What earlier versions wrote into the root of the cache directory.
+     *
+     * `tiredvpn-backup.json` is the plaintext export of every server profile,
+     * secrets included, and it was left there after each share. Moving the new
+     * writes into [DIR_NAME] does not remove the old ones, so an install that
+     * ever exported a backup keeps that file until the system decides to
+     * reclaim the cache — which it may never do.
+     *
+     * Only these two names, by name. The cache directory belongs to several
+     * things (the downloaded APK, HTTP caches) and sweeping it is not ours to
+     * do.
+     */
+    private val LEGACY_NAMES = listOf("tiredvpn-backup.json", "tiredvpn_logs.txt")
+
+    fun dir(context: Context): File = File(context.cacheDir, DIR_NAME).apply {
+        mkdirs()
+        removeLegacyCopies(context)
+    }
 
     fun file(context: Context, name: String): File = File(dir(context), name)
+
+    /** @return how many stale copies were deleted; for the test to observe. */
+    internal fun removeLegacyCopies(context: Context): Int {
+        var removed = 0
+        for (name in LEGACY_NAMES) {
+            val stale = File(context.cacheDir, name)
+            if (stale.isFile && stale.delete()) removed++
+        }
+        return removed
+    }
 }
