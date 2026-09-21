@@ -21,7 +21,7 @@ import org.robolectric.annotation.Config
  * right string is a separate question, answered by ImportCallSiteTest.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ConfigCodecTest {
 
     private fun link(host: String, port: Int = 995, secret: String = "s3cr3t", extra: String = "") =

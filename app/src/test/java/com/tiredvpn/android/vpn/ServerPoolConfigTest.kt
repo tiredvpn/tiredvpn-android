@@ -417,6 +417,95 @@ class ServerPoolConfigTest {
         assertEquals(emptyList<String>(), args)
     }
 
+    // --- whether a pool file is written at all ---
+
+    /**
+     * The threshold TiredVpnService.preparePoolConfig used to hold inline, and
+     * the one decision on that path that nothing tested: a pool of fewer than
+     * two is "no file", which makes the service delete whatever a previous,
+     * larger pool left behind and fall back to `-server`.
+     *
+     * A note for whoever mutates this next: the `pool.size < 2` early-out
+     * cannot be caught from here. Weakening it to `< 1` leaves every answer
+     * below unchanged, because a one-server pool yields one entry and the
+     * second threshold rejects it anyway. That is a property of the code, not
+     * a hole in these tests — the early-out decides whether `entries` runs,
+     * not what comes back. The second threshold, which is a real rule, is
+     * caught: see `a pool that collapses to one entry`.
+     */
+    @Test
+    fun `a single server is not worth a pool file`() {
+        assertTrue(ServerPoolConfig.entriesForPoolFile(listOf(server("a")), emptyMap()).isEmpty())
+    }
+
+    @Test
+    fun `an empty pool is not worth a pool file`() {
+        assertTrue(ServerPoolConfig.entriesForPoolFile(emptyList(), emptyMap()).isEmpty())
+    }
+
+    @Test
+    fun `two usable servers are worth a pool file`() {
+        val entries = ServerPoolConfig.entriesForPoolFile(
+            listOf(server("a"), server("b", address = "198.51.100.2")),
+            emptyMap(),
+        )
+
+        assertEquals(2, entries.size)
+    }
+
+    /**
+     * The second threshold, and the reason there are two. `entries` drops a
+     * server with no usable address, so a pool of two can collapse to one
+     * after the build — and a one-entry pool file is worse than none. The
+     * first check cannot see this case, because the pool was big enough.
+     */
+    @Test
+    fun `a pool that collapses to one entry is not worth a file either`() {
+        val entries = ServerPoolConfig.entriesForPoolFile(
+            listOf(server("a"), server("b", address = "   ")),
+            emptyMap(),
+        )
+
+        assertTrue(
+            "one usable server out of two must mean no file, not a one-server file: $entries",
+            entries.isEmpty(),
+        )
+    }
+
+    /**
+     * Positive control (rule 2): the blank address above has to be what makes
+     * the pool collapse, not something about having named the server "b".
+     */
+    @Test
+    fun `the same pool with both addresses usable does produce a file`() {
+        val entries = ServerPoolConfig.entriesForPoolFile(
+            listOf(server("a"), server("b", address = "198.51.100.2")),
+            emptyMap(),
+        )
+
+        assertEquals(2, entries.size)
+    }
+
+    /**
+     * And it goes through [ServerPoolConfig.entries], so the pre-resolved
+     * addresses the TUN path passes in are honoured rather than dropped.
+     */
+    @Test
+    fun `the pre-resolved addresses reach the entries`() {
+        val entries = ServerPoolConfig.entriesForPoolFile(
+            listOf(server("a", address = "vpn-a.example.com"), server("b", address = "vpn-b.example.com")),
+            mapOf("a" to "203.0.113.9:995"),
+        )
+
+        assertEquals(2, entries.size)
+        assertEquals(
+            "the resolved address for a must be used, not the hostname",
+            "203.0.113.9",
+            entries.first().address,
+        )
+        assertEquals("vpn-b.example.com", entries[1].address)
+    }
+
     // --- file handling ---
 
     @Test

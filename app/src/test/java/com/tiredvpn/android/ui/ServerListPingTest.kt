@@ -30,7 +30,7 @@ import org.robolectric.annotation.Config
  * and then asks [ServerRepository] what survived.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ServerListPingTest {
 
     private lateinit var context: Context

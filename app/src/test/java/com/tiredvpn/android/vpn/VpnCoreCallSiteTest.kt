@@ -45,6 +45,19 @@ class VpnCoreCallSiteTest {
     private fun sourceOrNull(name: String): String? =
         sourceRoot().walkTopDown().firstOrNull { it.isFile && it.name == name }?.readText()
 
+    /**
+     * Every Kotlin file in main, comments stripped, keyed by file name.
+     *
+     * For rules of the form "nothing anywhere calls this". Asking one file
+     * answers a narrower question than the rule states — see rule 7 in
+     * verification.md, where a guard placed in the common funnel missed the
+     * one of eleven entry points that bypassed it.
+     */
+    private fun allSources(): Map<String, String> =
+        sourceRoot().walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .associate { it.name to stripComments(it.readText()) }
+
     private fun stripComments(text: String): String {
         val out = StringBuilder(text.length)
         var i = 0
@@ -634,6 +647,115 @@ class VpnCoreCallSiteTest {
         assertTrue(sourceOrNull("PortHopper.kt") != null)
     }
 
+    /**
+     * The rest of the hop path, which the test above does not reach.
+     *
+     * Removing the `port_hop` write left the machinery standing: the service
+     * still builds a PortHopperConfig and a ConnectionManager, and
+     * ConnectionManager still has a hop checker, a forced hop and a reset.
+     * None of them is called. A single line — `connectionManager?.
+     * startHopChecker(scope)` — would put the whole lie back, and it contains
+     * no string the test above looks for.
+     *
+     * So the rule is stated where it can be checked: the hopper's output
+     * reaches nothing, in any file.
+     */
+    @Test
+    fun `no caller anywhere revives the hop path`() {
+        val sources = allSources()
+
+        // Positive control (rule 2): the scan has to be looking at the files
+        // that declare these, or it proves nothing by finding no callers.
+        assertTrue("ConnectionManager.kt missing from the scan", sources.containsKey("ConnectionManager.kt"))
+        assertTrue("PortHopper.kt missing from the scan", sources.containsKey("PortHopper.kt"))
+        assertTrue(
+            "the scan is not reading ConnectionManager's declarations",
+            sources.getValue("ConnectionManager.kt").contains("fun startHopChecker(")
+        )
+
+        val forbidden = listOf(
+            // Starts the loop that would hop.
+            "startHopChecker",
+            // Advances the hopper and returns an endpoint to dial.
+            "forceHop",
+            "resetPortHopper",
+            // Reads the hopper's output, which is where a UI claim comes from.
+            "getCurrentEndpoint()",
+            "getCurrentPort()",
+            "getPortHopperStats",
+            "getTimeUntilNextHopMs()",
+            // Installs the callback the old lie was reported through.
+            "onReconnectNeeded",
+        )
+
+        for (member in forbidden) {
+            val callers = sources
+                .filterKeys { it != "ConnectionManager.kt" }
+                .filterValues { it.contains(member) }
+                .keys
+            assertEquals(
+                "ConnectionManager.$member has a caller again in $callers; the core still answers " +
+                    "`unknown command` to port_hop, so a hop reported to the user did not happen",
+                emptySet<String>(),
+                callers
+            )
+        }
+
+        // `stopHopChecker` is the one member the service is allowed to call:
+        // stopping a checker that was never started is a no-op and cannot
+        // claim anything. Pinned to exactly one call site so it cannot quietly
+        // become the place a start creeps back in beside.
+        assertEquals(
+            "stopHopChecker is allowed once, in initConnectionManager, and nowhere else",
+            1,
+            occurrences(sources.getValue("TiredVpnService.kt"), "stopHopChecker()")
+        )
+        assertTrue(
+            "the allowed call must still be the defensive one in initConnectionManager",
+            bodyAfter(sources.getValue("TiredVpnService.kt"), "private fun initConnectionManager(")
+                .contains("connectionManager?.stopHopChecker()")
+        )
+    }
+
+    /**
+     * The other half of the same lie: the core can hop by itself, and the app
+     * never asks it to.
+     *
+     * `cmd/tiredvpn` takes `-port-hop`, `-port-hop-start`, `-port-hop-end`,
+     * `-port-hop-strategy` and `-port-hop-seed`, and `client.Config` drives
+     * `StartPortHopChecker` from them. Nothing in this app puts any of them on
+     * the command line — so a user who turns port hopping on in Settings gets
+     * a Kotlin PortHopper nothing reads and a core that was never told.
+     *
+     * Asserted as "absent" deliberately. The day a flag is added, this test
+     * fails and whoever adds it has to decide what the Kotlin PortHopper is
+     * still for: two generators disagreeing about the port is worse than one.
+     */
+    @Test
+    fun `the core is not told to hop either`() {
+        val sources = allSources()
+
+        // Positive control (rule 2): the scan must cover the two files that
+        // build the core's argv, or "no flag anywhere" is a statement about
+        // files it never opened.
+        assertTrue(
+            "positive control: TiredVpnService must still assemble the argv",
+            sources.getValue("TiredVpnService.kt").contains("""args.add("-android")""")
+        )
+        assertTrue(
+            "positive control: ServerPoolConfig must still assemble the endpoint flags",
+            sources.getValue("ServerPoolConfig.kt").contains("""mutableListOf("-server", endpoint)""")
+        )
+
+        val passers = sources.filterValues { it.contains("-port-hop") }.keys
+        assertEquals(
+            "a port-hopping flag reaches the core from $passers; see PortHopperDivergenceTest " +
+                "before letting the Kotlin PortHopper run alongside it",
+            emptySet<String>(),
+            passers
+        )
+    }
+
     // --- 8 the gap against core 1.10 ----------------------------------------
 
     @Test
@@ -679,9 +801,22 @@ class VpnCoreCallSiteTest {
     @Test
     fun `the reconnect response is read only once the state says Connected`() {
         val service = source("TiredVpnService.kt")
-        val connectedAssignment = service.indexOf("_state.value = VpnState.Connected(\n                                        strategy = connectedStrategy")
+
+        // Matched on tokens rather than on an exact 40-space indent: the rule
+        // is about the order of two statements, and a reformat that moves them
+        // both is not a regression. The old literal encoded the indentation,
+        // so `./gradlew ktlintFormat` would have failed this test while the
+        // property it guards still held.
+        val connectedAssignment = Regex(
+            """_state\.value\s*=\s*VpnState\.Connected\(\s*strategy\s*=\s*connectedStrategy"""
+        ).find(service)?.range?.first ?: -1
         val applyCall = service.indexOf("source = \"network_changed response\"")
-        assertTrue("both landmarks must be found", connectedAssignment >= 0 && applyCall >= 0)
+
+        assertTrue(
+            "landmark not found: the Connected assignment fed by connectedStrategy",
+            connectedAssignment >= 0
+        )
+        assertTrue("landmark not found: the network_changed response apply", applyCall >= 0)
         assertTrue(
             "the rebuild path refuses to run outside Connected, so reading the pair before " +
                 "the state is set drops the change silently",

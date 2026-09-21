@@ -27,7 +27,7 @@ import java.io.File
  * that all of them come back, in order.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ImportSourceTest {
 
     @get:Rule

@@ -39,18 +39,43 @@ object PingManager {
         try {
             val process = Runtime.getRuntime().exec("/system/bin/ping -c 1 -W 1 $host")
             val reader = BufferedReader(InputStreamReader(process.inputStream))
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                if (line!!.contains("time=")) {
-                    val time = line!!.substringAfter("time=").substringBefore(" ms").trim()
-                    return time.toDoubleOrNull()?.toLong() ?: -1L
-                }
-            }
+            val latency = parseIcmpLatencyMs(reader.lineSequence())
+            if (latency != null) return latency
             process.waitFor()
         } catch (e: Exception) {
             Log.e(TAG, "ICMP ping failed: ${e.message}")
         }
         return -1L
+    }
+
+    /**
+     * The verdict `/system/bin/ping`'s output carries, or null when no line
+     * mentions a time at all.
+     *
+     * Split out from [pingIcmp] so the parsing can be driven from a test
+     * without a `ping` binary: this is what turns a server's entry in the list
+     * from "—" into a number, and it is the part that gets the format wrong.
+     * The caller still owns the process; this owns only the text.
+     *
+     * Null and -1 are different answers, and the split keeps them that way:
+     * the first line mentioning `time=` decides the outcome whether or not it
+     * parses, so an unparseable one is -1 (a verdict) while no such line at
+     * all is null (no verdict, the caller reaps the process and gives up).
+     * That is exactly how the inline loop behaved.
+     *
+     * The other two rules it inherits, unchanged: the value is read up to a
+     * SPACE followed by `ms`, so busybox-style `time=1.23ms` does not parse;
+     * and the result is truncated to whole milliseconds, so anything under
+     * 1 ms reports 0.
+     */
+    internal fun parseIcmpLatencyMs(lines: Sequence<String>): Long? {
+        for (line in lines) {
+            if (line.contains("time=")) {
+                val time = line.substringAfter("time=").substringBefore(" ms").trim()
+                return time.toDoubleOrNull()?.toLong() ?: -1L
+            }
+        }
+        return null
     }
 
     private fun pingTcp(host: String, port: Int): Long {

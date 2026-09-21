@@ -707,8 +707,7 @@ class TiredVpnService : VpnService() {
         reconnectAttempts++
 
         // Maximum number of reconnect attempts before giving up
-        val maxReconnectAttempts = 30
-        if (reconnectAttempts > maxReconnectAttempts) {
+        if (ReconnectBackoff.exhausted(reconnectAttempts)) {
             FileLogger.e(TAG, "scheduleAutoReconnect: Too many attempts ($reconnectAttempts), giving up")
             _state.value = VpnState.Error("Connection failed after $reconnectAttempts attempts")
             reconnectLock.release(token)
@@ -719,8 +718,8 @@ class TiredVpnService : VpnService() {
             return
         }
 
-        // Exponential backoff: 2s, 4s, 6s, 8s, 10s (capped)
-        val backoffMs = minOf(2000L * reconnectAttempts, maxBackoffMs)
+        // Linear backoff: 2s, 4s, 6s, 8s, 10s (capped)
+        val backoffMs = ReconnectBackoff.scheduleDelayMs(reconnectAttempts, maxBackoffMs)
 
         FileLogger.i(TAG, "scheduleAutoReconnect: Scheduling reconnect in ${backoffMs}ms (attempt $reconnectAttempts)")
 
@@ -1377,8 +1376,8 @@ class TiredVpnService : VpnService() {
         resolvedById: Map<String, String>
     ): String? {
         try {
-            val entries = if (pool.size < 2) emptyList() else ServerPoolConfig.entries(pool, resolvedById)
-            if (entries.size < 2) {
+            val entries = ServerPoolConfig.entriesForPoolFile(pool, resolvedById)
+            if (entries.isEmpty()) {
                 ServerPoolConfig.delete(filesDir)
                 FileLogger.i(TAG, "Endpoint pool: single server, using -server")
                 return null
@@ -1827,20 +1826,19 @@ class TiredVpnService : VpnService() {
     private suspend fun resolveServerEndpoint(endpoint: String): String? {
         return withContext(Dispatchers.IO) {
             try {
-                // Parse host:port
-                val parts = endpoint.split(":")
-                if (parts.size != 2) {
+                // Parse host:port, and decide whether a lookup is needed at all.
+                val plan = EndpointResolution.plan(endpoint)
+                if (plan is EndpointResolution.Plan.Malformed) {
                     FileLogger.e(TAG, "Invalid endpoint format: $endpoint")
                     return@withContext null
                 }
-                val host = parts[0]
-                val port = parts[1]
-
-                // Check if already an IP address
-                if (host.matches(Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$"))) {
+                if (plan is EndpointResolution.Plan.AlreadyLiteral) {
                     FileLogger.d(TAG, "Endpoint is already an IP: $endpoint")
-                    return@withContext endpoint
+                    return@withContext plan.endpoint
                 }
+                val resolve = plan as EndpointResolution.Plan.Resolve
+                val host = resolve.host
+                val port = resolve.port
 
                 // Resolve hostname to IP
                 FileLogger.d(TAG, "Resolving hostname: $host")
@@ -3721,7 +3719,7 @@ class TiredVpnService : VpnService() {
                 while (!checkTcpConnectivity(config.serverAddress, config.serverPort) && connectivityAttempts < maxConnectivityAttempts) {
                     connectivityAttempts++
                     // Shorter backoff: 1s, 2s, 3s (max 3s instead of 30s)
-                    val waitMs = minOf(1000L * connectivityAttempts, 3000L)
+                    val waitMs = ReconnectBackoff.connectivityWaitMs(connectivityAttempts)
                     FileLogger.d(TAG, "Reconnect: No connectivity, waiting ${waitMs}ms (attempt $connectivityAttempts/$maxConnectivityAttempts)...")
                     enterReconnectingState("Waiting for network...")
                     delay(waitMs)
@@ -3736,7 +3734,7 @@ class TiredVpnService : VpnService() {
             }
 
             // 8. Minimal delay before reconnecting (only on retry attempts)
-            val backoffMs = if (reconnectAttempts <= 1) 500L else minOf(1000L * reconnectAttempts, maxBackoffMs)
+            val backoffMs = ReconnectBackoff.sequenceDelayMs(reconnectAttempts, maxBackoffMs)
             FileLogger.d(TAG, "Reconnect: Step 7 - Waiting ${backoffMs}ms before reconnecting...")
             delay(backoffMs)
             if (!connectGeneration.isCurrent(generation)) {

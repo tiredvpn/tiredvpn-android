@@ -30,7 +30,7 @@ import org.robolectric.annotation.Config
  * be handed to the store at all. Every transaction is recorded and inspected.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class StoreTransactionTest {
 
     private val servers = "servers"

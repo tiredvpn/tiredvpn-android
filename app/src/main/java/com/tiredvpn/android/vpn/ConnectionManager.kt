@@ -193,8 +193,13 @@ class ConnectionManager(
 
     /**
      * Replace port in host:port string.
+     *
+     * `internal` rather than private so its handling of the address shapes
+     * this app actually stores can be asserted: the split is on the LAST
+     * colon, which is right for `[v6]:port` and wrong for a bare IPv6 literal.
+     * See ConnectionManagerEndpointTest.
      */
-    private fun replacePort(endpoint: String, newPort: Int): String {
+    internal fun replacePort(endpoint: String, newPort: Int): String {
         val colonIndex = endpoint.lastIndexOf(':')
         return if (colonIndex != -1) {
             val host = endpoint.substring(0, colonIndex)

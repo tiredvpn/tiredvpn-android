@@ -27,7 +27,7 @@ import java.io.File
  * So the assertion is the real call, not a string comparison of paths.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class SharedFilesTest {
 
     private lateinit var context: Context
