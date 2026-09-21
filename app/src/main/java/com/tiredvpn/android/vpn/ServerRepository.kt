@@ -234,16 +234,30 @@ object ServerRepository {
         }
     }
 
+    /**
+     * The server the VPN would dial, or null when there is none.
+     *
+     * A read, and only a read. It used to repair a stale pointer by writing the
+     * first server's id back, which made a getter that the settings screen
+     * calls dozens of times per frame - once per row, from the main thread -
+     * also a writer racing every other writer on this lock. Two screens
+     * observing at once each committed a transaction, the ping wave read
+     * through it, and a delete landing between the two halves of somebody's
+     * read-modify-write is how a removed server came back.
+     *
+     * Nothing needs the repair: the fallback is deterministic, so every reader
+     * agrees on the same server, [deleteServer] repoints the pointer when it
+     * removes the one it named, and [saveServerLocked] adopts a server when
+     * there is no pointer at all. A dangling id costs one lookup miss and is
+     * overwritten the next time the user picks a server.
+     */
     fun getActiveServer(context: Context): VpnConfig? = synchronized(lock) {
         reconcileStoresLocked(context)
         val servers = loadServersLocked(context).servers
         if (servers.isEmpty()) return null
 
         val activeId = activeServerIdLocked(context)
-        servers.find { it.id == activeId } ?: servers.first().also {
-            // If active ID not found but servers exist, default to first
-            setActiveServerIdLocked(context, it.id)
-        }
+        servers.find { it.id == activeId } ?: servers.first()
     }
 
     /** @return false when the store refused the write; the choice did not land. */
@@ -423,10 +437,10 @@ object ServerRepository {
     /**
      * Record in [editor] that the active server was *chosen* while degraded.
      *
-     * Deliberately not called from [setActiveServerIdLocked]: that also runs
-     * when [getActiveServer] repairs an id that names nothing and when
-     * [saveServerLocked] adopts the first server, neither of which is a choice
-     * worth beating the encrypted store with.
+     * Deliberately not called by [saveServerLocked] when it adopts the only
+     * server: that is a consequence of a save, not a choice worth beating the
+     * encrypted store with. Only [setActiveServerId], which exists because the
+     * user picked something, marks it.
      */
     private fun markActiveChoice(editor: SharedPreferences.Editor) {
         if (!isStorageDegraded) return
@@ -452,13 +466,12 @@ object ServerRepository {
     private fun activeServerIdLocked(context: Context): String? =
         getPrefs(context).getString(KEY_ACTIVE_SERVER_ID, null)
 
-    private fun setActiveServerIdLocked(context: Context, id: String) {
-        getPrefs(context).edit().putString(KEY_ACTIVE_SERVER_ID, id).apply()
-    }
-
-    private fun clearActiveServerIdLocked(context: Context) {
-        getPrefs(context).edit().remove(KEY_ACTIVE_SERVER_ID).apply()
-    }
+    // There is no setActiveServerIdLocked or clearActiveServerIdLocked any
+    // more. Every write of the pointer belongs to a transaction that is writing
+    // something else as well - the shortened list in [deleteServer], the new
+    // server in [saveServerLocked], the choice plus its journal mark in
+    // [setActiveServerId] - so each does it through that transaction's editor.
+    // A standalone setter is what let [getActiveServer] write from a read.
 
     /**
      * Fold anything left in the plaintext stores into the encrypted one.

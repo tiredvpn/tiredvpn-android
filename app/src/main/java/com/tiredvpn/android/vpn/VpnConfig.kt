@@ -22,13 +22,6 @@ data class VpnConfig(
     val lastLatencyMs: Long = -1, // -1 means unknown/checking
     val connectionMode: String = "tun", // "tun" or "proxy"
     val proxyPort: Int = 8080,
-    // Port hopping settings
-    val portHoppingEnabled: Boolean = false,
-    val portHopRangeStart: Int = 47000,
-    val portHopRangeEnd: Int = 65535,
-    val portHopIntervalMs: Long = 60_000L,
-    val portHopStrategy: String = "random", // random, sequential, fibonacci
-    val portHopSeed: String? = null, // Optional seed for deterministic hopping (hex string)
     // Traffic shaper
     val shaperPreset: String = "", // "", "youtube_streaming", "chrome_browsing", "random_per_session"
     val shaperSeed: Long = 0L, // 0 = random
@@ -77,13 +70,6 @@ data class VpnConfig(
             put("lastLatencyMs", lastLatencyMs)
             put("connectionMode", connectionMode)
             put("proxyPort", proxyPort)
-            // Port hopping
-            put("portHoppingEnabled", portHoppingEnabled)
-            put("portHopRangeStart", portHopRangeStart)
-            put("portHopRangeEnd", portHopRangeEnd)
-            put("portHopIntervalMs", portHopIntervalMs)
-            put("portHopStrategy", portHopStrategy)
-            portHopSeed?.let { put("portHopSeed", it) }
             // Traffic shaper
             put("shaperPreset", shaperPreset)
             put("shaperSeed", shaperSeed)
@@ -127,14 +113,6 @@ data class VpnConfig(
         if (debugLogging) params.add("debug=true")
         if (connectionMode != "tun") params.add("mode=" + Uri.encode(connectionMode))
         if (proxyPort != 8080) params.add("proxyPort=$proxyPort")
-        if (portHoppingEnabled) {
-            params.add("hop=true")
-            if (portHopRangeStart != 47000) params.add("hopStart=$portHopRangeStart")
-            if (portHopRangeEnd != 65535) params.add("hopEnd=$portHopRangeEnd")
-            if (portHopIntervalMs != 60_000L) params.add("hopInterval=$portHopIntervalMs")
-            if (portHopStrategy != "random") params.add("hopStrategy=" + Uri.encode(portHopStrategy))
-            portHopSeed?.takeIf { it.isNotEmpty() }?.let { params.add("hopSeed=" + Uri.encode(it)) }
-        }
         if (shaperPreset.isNotEmpty()) params.add("shaper=" + Uri.encode(shaperPreset))
         if (shaperSeed != 0L) params.add("shaperSeed=$shaperSeed")
         if (echEnabled) {
@@ -204,13 +182,6 @@ data class VpnConfig(
                 lastLatencyMs = json.optLong("lastLatencyMs", -1),
                 connectionMode = json.optString("connectionMode", "tun"),
                 proxyPort = json.optInt("proxyPort", 8080),
-                // Port hopping
-                portHoppingEnabled = json.optBoolean("portHoppingEnabled", false),
-                portHopRangeStart = json.optInt("portHopRangeStart", 47000),
-                portHopRangeEnd = json.optInt("portHopRangeEnd", 65535),
-                portHopIntervalMs = json.optLong("portHopIntervalMs", 60_000L),
-                portHopStrategy = json.optString("portHopStrategy", "random"),
-                portHopSeed = json.optString("portHopSeed", null).takeIf { !it.isNullOrEmpty() },
                 // Traffic shaper
                 shaperPreset = json.optString("shaperPreset", ""),
                 shaperSeed = json.optLong("shaperSeed", 0L),
@@ -232,13 +203,6 @@ data class VpnConfig(
                 customDns = json.optString("customDns", "")
             )
         }
-
-        // Port hopping strategies
-        val PORT_HOP_STRATEGIES = listOf(
-            "random" to "Random",
-            "sequential" to "Sequential",
-            "fibonacci" to "Fibonacci"
-        )
 
         // Matches a tired:// link embedded in surrounding text: a chat message, a
         // JSON string, a shell here-doc.
@@ -316,12 +280,10 @@ data class VpnConfig(
                     debugLogging = uri.getQueryParameter("debug")?.toBooleanStrictOrNull() ?: false,
                     connectionMode = uri.getQueryParameter("mode") ?: "tun",
                     proxyPort = uri.getQueryParameter("proxyPort")?.toIntOrNull() ?: 8080,
-                    portHoppingEnabled = uri.getQueryParameter("hop")?.toBooleanStrictOrNull() ?: false,
-                    portHopRangeStart = uri.getQueryParameter("hopStart")?.toIntOrNull() ?: 47000,
-                    portHopRangeEnd = uri.getQueryParameter("hopEnd")?.toIntOrNull() ?: 65535,
-                    portHopIntervalMs = uri.getQueryParameter("hopInterval")?.toLongOrNull() ?: 60_000L,
-                    portHopStrategy = uri.getQueryParameter("hopStrategy") ?: "random",
-                    portHopSeed = uri.getQueryParameter("hopSeed")?.takeIf { it.isNotEmpty() },
+                    // Links written before 1.11 carry hop, hopStart, hopEnd,
+                    // hopInterval, hopStrategy and hopSeed. They are read by
+                    // nobody now and that is deliberate: an unknown query
+                    // parameter is ignored here, so such a link still imports.
                     shaperPreset = uri.getQueryParameter("shaper") ?: "",
                     shaperSeed = uri.getQueryParameter("shaperSeed")?.toLongOrNull() ?: 0L,
                     echEnabled = uri.getQueryParameter("ech")?.toBooleanStrictOrNull() ?: false,

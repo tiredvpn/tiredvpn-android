@@ -31,6 +31,11 @@ import java.nio.charset.CodingErrorAction
  * the ADB documentation ("server_v6"), the camelCase written by
  * [VpnConfig.toJson] ("serverAddressV6"), and the query-parameter name used by
  * [VpnConfig.toUrl] ("serverV6"). One vocabulary, three surfaces.
+ *
+ * A key nobody asks for is ignored rather than refused, which is what lets a
+ * payload written by an older version keep importing after a setting is
+ * dropped: the port-hopping fields (`hop`, `hop_start`, `hopStrategy`, ...)
+ * were removed in 1.11 and a backup full of them still reads back.
  */
 object ConfigCodec {
 
@@ -61,11 +66,20 @@ object ConfigCodec {
      * the parser can know that: by the time a [VpnConfig] exists the name is
      * filled in either way, and guessing afterwards which names were invented
      * here means guessing wrong about whoever named their server "Server".
+     *
+     * [v6BySender] is the same question about the IPv6 endpoint, and it exists
+     * for the same reason in a worse form. An absent `serverV6` parses to "",
+     * which is also how "this server has no IPv6 endpoint" is spelled, so a
+     * bare tired:// link re-imported over a stored server silently erased an
+     * endpoint the user had configured by hand. Unlike the name, presence is
+     * what counts and not blankness: a payload that spells the field with an
+     * empty value is asking for the endpoint to be removed, and may.
      */
     data class ParsedServer(
         val config: VpnConfig,
         val splitTunnel: SplitTunnelSpec? = null,
         val namedBySender: Boolean = false,
+        val v6BySender: Boolean = false,
     )
 
     data class SplitTunnelSpec(val mode: String, val apps: Set<String>)
@@ -149,7 +163,11 @@ object ConfigCodec {
             when {
                 config == null -> skipped += Skipped(linkLabel(link, index), REASON_MALFORMED_LINK)
                 !config.isValid -> skipped += Skipped(linkLabel(link, index), rejection(config))
-                else -> servers += ParsedServer(config, namedBySender = linkCarriesName(link))
+                else -> servers += ParsedServer(
+                    config,
+                    namedBySender = linkCarriesName(link),
+                    v6BySender = linkCarriesV6(link),
+                )
             }
         }
         return ParseResult(Format.LINKS, servers, skipped)
@@ -162,6 +180,17 @@ object ConfigCodec {
      */
     private fun linkCarriesName(link: String): Boolean = try {
         !Uri.parse(link).getQueryParameter("name").isNullOrBlank()
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * Did the link mention an IPv6 endpoint at all? Presence, not content:
+     * `serverV6=` with nothing after it is an erase and is honoured, while a
+     * link that never names the parameter must leave a stored endpoint alone.
+     */
+    private fun linkCarriesV6(link: String): Boolean = try {
+        Uri.parse(link).getQueryParameter("serverV6") != null
     } catch (e: Exception) {
         false
     }
@@ -265,6 +294,7 @@ object ConfigCodec {
     // twice, which no exporter does; the first present key wins.
     private val SERVER_KEYS = listOf("server", "serverAddress", "server_address", "address", "host")
     private val PORT_KEYS = listOf("port", "serverPort", "server_port")
+    private val V6_KEYS = listOf("server_v6", "serverV6", "serverAddressV6", "server_address_v6")
 
     /** A JSON object that became a server, or the reason it did not. */
     private sealed interface Outcome {
@@ -312,22 +342,6 @@ object ConfigCodec {
             connectionMode = json.firstString(listOf("mode", "connectionMode", "connection_mode"))
                 ?: "tun",
             proxyPort = json.firstInt(listOf("proxy_port", "proxyPort")) ?: 8080,
-            // Port hopping
-            portHoppingEnabled = json.firstBool(
-                listOf("hop", "port_hopping", "portHoppingEnabled")
-            ) ?: false,
-            portHopRangeStart = json.firstInt(listOf("hopStart", "hop_start", "portHopRangeStart"))
-                ?: 47000,
-            portHopRangeEnd = json.firstInt(listOf("hopEnd", "hop_end", "portHopRangeEnd"))
-                ?: 65535,
-            portHopIntervalMs = json.firstLong(
-                listOf("hopInterval", "hop_interval", "portHopIntervalMs")
-            ) ?: 60_000L,
-            portHopStrategy = json.firstString(
-                listOf("hopStrategy", "hop_strategy", "portHopStrategy")
-            ) ?: "random",
-            portHopSeed = json.firstString(listOf("hopSeed", "hop_seed", "portHopSeed"))
-                ?.takeIf { it.isNotEmpty() },
             // Traffic shaper
             shaperPreset = json.firstString(listOf("shaper", "shaper_preset", "shaperPreset")) ?: "",
             shaperSeed = json.firstLong(listOf("shaperSeed", "shaper_seed")) ?: 0L,
@@ -337,9 +351,7 @@ object ConfigCodec {
             echPublicName = json.firstString(listOf("echPublicName", "ech_public_name"))
                 ?: "cloudflare-ech.com",
             // IPv6 endpoint
-            serverAddressV6 = json.firstString(
-                listOf("server_v6", "serverV6", "serverAddressV6", "server_address_v6")
-            ) ?: "",
+            serverAddressV6 = json.firstString(V6_KEYS) ?: "",
             preferIpv6 = json.firstBool(listOf("prefer_ipv6", "preferIpv6")) ?: false,
             fallbackV4 = json.firstBool(listOf("fallback_v4", "fallbackV4")) ?: true,
             // IPv6 inside the tunnel
@@ -356,6 +368,7 @@ object ConfigCodec {
                 config,
                 splitTunnelFromJson(json),
                 namedBySender = !json.firstString(listOf("name")).isNullOrBlank(),
+                v6BySender = V6_KEYS.any { json.present(it) },
             )
         )
     }

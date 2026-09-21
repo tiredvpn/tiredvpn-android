@@ -13,6 +13,7 @@ import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivityServerConfigBinding
 import com.tiredvpn.android.importer.ConfigCodec
 import com.tiredvpn.android.importer.ImportPreview
+import com.tiredvpn.android.util.StoreWriteError
 import com.tiredvpn.android.util.TvUtils
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
@@ -221,7 +222,17 @@ class ServerConfigActivity : BaseActivity() {
             serverPort = serverPort,
             secret = secret
         )
-        ServerRepository.saveServer(this, config)
+        // A refused write used to close the form and say "Server saved", which
+        // for a secret the user has just typed in is data loss announced as
+        // success. The form stays open so the text is still there to copy.
+        if (!StoreWriteError.unless(
+                ServerRepository.saveServer(this, config),
+                this,
+                R.string.store_save_failed,
+            )
+        ) {
+            return
+        }
 
         Toast.makeText(this, "Server saved", Toast.LENGTH_SHORT).show()
         finish()

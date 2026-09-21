@@ -147,16 +147,24 @@ class BootReceiver : BroadcastReceiver() {
         // Check if user enabled auto-connect on boot (default true for TV devices)
         val connectOnBoot = prefs.getBoolean(KEY_CONNECT_ON_BOOT, true)
 
-        if (!connectOnBoot) {
-            FileLogger.d(TAG, "Connect on boot disabled by user, skipping")
-            return
-        }
-
-        // Check if VPN should be connected (was running before reboot)
+        // Check how the previous session ended. Both flags used to be read here
+        // and logged and then ignored: the receiver connected on
+        // `connect_on_boot` alone, so a user who switched the VPN off and
+        // rebooted got it back. See BootPolicy.
         val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
         val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
 
-        FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
+        FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
+
+        if (!BootPolicy.shouldConnectOnBoot(connectOnBoot, lastSession)) {
+            FileLogger.i(
+                TAG,
+                if (!connectOnBoot) "Connect on boot disabled by user, skipping"
+                else "Previous session was ended by the user, not reconnecting after boot"
+            )
+            return
+        }
 
         val config = ServerRepository.getActiveServer(context)
         if (config == null || !config.isValid) {
@@ -180,13 +188,17 @@ class BootReceiver : BroadcastReceiver() {
     private fun handleAppUpdated(context: Context) {
         val prefs = context.getSharedPreferences(CREDENTIAL_PREFS_NAME, Context.MODE_PRIVATE)
 
-        // Check if VPN was running before app update
+        // Check if VPN was running before app update. Same question as the boot
+        // path asks, so it is asked through the same object rather than
+        // open-coded twice - the two readings had already been drifting, this
+        // one being the stricter.
         val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
         val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
 
-        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
+        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
 
-        if (!vpnShouldBeConnected && !vpnWasConnected) {
+        if (!BootPolicy.shouldRestartAfterUpdate(lastSession)) {
             FileLogger.d(TAG, "VPN was not connected before update, skipping")
             return
         }

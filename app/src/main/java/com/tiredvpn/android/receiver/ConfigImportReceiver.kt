@@ -7,6 +7,7 @@ import android.util.Log
 import android.widget.Toast
 import com.tiredvpn.android.importer.ConfigCodec
 import com.tiredvpn.android.importer.ConfigImporter
+import com.tiredvpn.android.vpn.ServerRepository
 import java.io.File
 
 /**
@@ -80,9 +81,22 @@ class ConfigImportReceiver : BroadcastReceiver() {
         // A companion app provisioning a node does not get to decide which node
         // the user connects through; only an empty list selects itself.
         val result = ConfigImporter.apply(context, plan, mayChangeActiveServer = false)
+        if (result.failed > 0) {
+            // There is no user in front of this - it arrives over adb from a
+            // companion app - so the log is the report. Said loudly: a
+            // provisioning run that reports success while the store dropped
+            // the node is worse than one that fails.
+            Log.e(
+                TAG,
+                "import: the store refused ${result.failed} of ${result.failed + result.added + result.updated} " +
+                    "entr(ies); storage degraded=${ServerRepository.isStorageDegraded} " +
+                    "reason=${ServerRepository.storageDegradationReason}"
+            )
+        }
         showToast(
             context,
-            "Imported: ${result.added} added, ${result.updated} updated, ${result.skipped} skipped"
+            "Imported: ${result.added} added, ${result.updated} updated, " +
+                "${result.skipped} skipped, ${result.failed} failed to save"
         )
     }
 

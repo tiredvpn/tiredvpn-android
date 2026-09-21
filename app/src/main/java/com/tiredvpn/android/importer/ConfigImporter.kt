@@ -50,7 +50,19 @@ object ConfigImporter {
         val hasWork: Boolean get() = writable.isNotEmpty()
     }
 
-    data class Result(val added: Int, val updated: Int, val skipped: Int)
+    /**
+     * [failed] counts entries the store refused. It is separate from [skipped],
+     * which is about the payload - a malformed link, a duplicate - and is
+     * therefore the user's problem to fix. A refusal is the device's, and used
+     * to be invisible: `apply` called saveServer, dropped the false it returned
+     * and reported the entry as written anyway.
+     */
+    data class Result(
+        val added: Int,
+        val updated: Int,
+        val skipped: Int,
+        val failed: Int = 0,
+    )
 
     const val REASON_DUPLICATE = "already listed earlier in this import"
 
@@ -133,7 +145,7 @@ object ConfigImporter {
                 entries += PlannedEntry(incoming, Action.ADD, server.splitTunnel)
             } else {
                 entries += PlannedEntry(
-                    merge(match, incoming, server.namedBySender),
+                    merge(match, incoming, server.namedBySender, server.v6BySender),
                     Action.UPDATE,
                     server.splitTunnel,
                 )
@@ -154,12 +166,27 @@ object ConfigImporter {
      * user did choose. That question is answered by the codec, which knows
      * whether a name was in the payload - guessing it back from the string here
      * cost the name of everyone who called their server "Server".
+     *
+     * The IPv6 endpoint is the same trap one step further along, because the
+     * value that means "the sender said nothing" is "" and so is the value that
+     * means "this server has no IPv6 endpoint". A bare tired:// link carries no
+     * serverV6 at all, so re-importing one over a server whose v6 endpoint the
+     * user had filled in erased it, and `sameServer` deliberately treats the
+     * short form as the same server - which is what routed it through here
+     * rather than adding a second entry. Presence decides, so a payload that
+     * does name the field, even empty, still removes the endpoint.
      */
-    private fun merge(existing: VpnConfig, incoming: VpnConfig, namedBySender: Boolean): VpnConfig =
+    private fun merge(
+        existing: VpnConfig,
+        incoming: VpnConfig,
+        namedBySender: Boolean,
+        v6BySender: Boolean,
+    ): VpnConfig =
         incoming.copy(
             id = existing.id,
             lastLatencyMs = existing.lastLatencyMs,
             name = if (namedBySender) incoming.name else existing.name,
+            serverAddressV6 = if (v6BySender) incoming.serverAddressV6 else existing.serverAddressV6,
         )
 
     /** Plan against what is currently stored. */
@@ -181,8 +208,18 @@ object ConfigImporter {
         val hadActiveServer = ServerRepository.getActiveServer(context) != null
         val writable = plan.writable
 
+        // Counted from what the store accepted, not from what was planned -
+        // the same rule the counts already followed for the payload. Split
+        // tunnel rules are written only for an entry that landed: rules
+        // attached to a server that is not there point at nothing.
+        val written = mutableListOf<PlannedEntry>()
+        val refused = mutableListOf<PlannedEntry>()
         for (entry in writable) {
-            ServerRepository.saveServer(context, entry.config)
+            if (!ServerRepository.saveServer(context, entry.config)) {
+                refused += entry
+                continue
+            }
+            written += entry
             entry.splitTunnel?.let {
                 SplitTunnelSettings.save(context, entry.config.id, it.mode, it.apps)
             }
@@ -191,7 +228,12 @@ object ConfigImporter {
         // Selecting an active server is only obvious when there is one candidate.
         // Importing a pool of four must not silently move the user onto whichever
         // node happened to be last in the file.
-        val single = writable.singleOrNull()
+        //
+        // "One candidate" is still counted over the plan the user confirmed,
+        // not over what survived: two entries of which one was refused is not
+        // a payload with one server in it. It just may not be pointed at
+        // something the store did not take.
+        val single = writable.singleOrNull()?.takeIf { it in written }
         if (single != null &&
             (!hadActiveServer || (mayChangeActiveServer && single.action == Action.ADD))
         ) {
@@ -199,9 +241,10 @@ object ConfigImporter {
         }
 
         return Result(
-            added = plan.toAdd.size,
-            updated = plan.toUpdate.size,
+            added = written.count { it.action == Action.ADD },
+            updated = written.count { it.action == Action.UPDATE },
             skipped = plan.skipped.size,
+            failed = refused.size,
         )
     }
 

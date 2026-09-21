@@ -55,17 +55,6 @@
 
     <!-- Obfuscation / Evasion -->
     <string name="obfuscation">OBFUSCATION</string>
-    <string name="port_hopping">Port Hopping</string>
-    <string name="port_hopping_desc">Rotate ports to hinder DPI blocking</string>
-    <string name="port_hop_range">Port Range</string>
-    <string name="port_hop_range_start">Start port</string>
-    <string name="port_hop_range_end">End port</string>
-    <string name="port_hop_interval">Hop Interval</string>
-    <string name="port_hop_interval_hint">Interval (seconds)</string>
-    <string name="port_hop_strategy">Hop Strategy</string>
-    <string name="port_hop_seed">Seed (optional)</string>
-    <string name="port_hop_seed_hint">Leave empty for random</string>
-    <string name="port_hop_disabled">Disabled</string>
     <string name="traffic_shaper">Traffic Shaper</string>
     <string name="traffic_shaper_off">Off</string>
     <string name="shaper_seed">Shaper Seed</string>
@@ -99,7 +88,6 @@
     <string name="value_disabled">Disabled</string>
     <string name="invalid_value">Invalid value</string>
     <string name="invalid_dns">Invalid DNS address</string>
-    <string name="invalid_port_range">Invalid port range</string>
 
     <string name="security">SECURITY</string>
     <string name="kill_switch">Kill Switch</string>
@@ -278,4 +266,16 @@
     <string name="update_action_later">Later</string>
     <string name="update_action_exit">Exit</string>
     <string name="update_download_failed">Download failed</string>
+
+    <!-- Connect budget: which wait ran out, rather than one sentence for all three -->
+    <string name="connect_timed_out_at">Connection timed out waiting for %1$s</string>
+
+    <!-- Storage writes that did not land. The screen used to show success regardless. -->
+    <string name="store_reason_refused">the store refused the write</string>
+    <string name="store_reason_degraded">encrypted storage is unavailable (%1$s)</string>
+    <string name="store_reason_unknown">reason unknown</string>
+    <string name="store_save_failed">Could not save the server: %1$s</string>
+    <string name="store_delete_failed">Could not delete the server: %1$s</string>
+    <string name="store_active_failed">Could not switch the active server: %1$s</string>
+    <string name="store_import_failed">%1$d of the imported servers could not be saved: %2$s</string>
 </resources>
