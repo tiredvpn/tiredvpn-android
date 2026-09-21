@@ -7,6 +7,130 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-21
+
+This release is the result of an audit: eleven independent reviews of the
+codebase, then a fix pass over everything they found that was real. Two defects
+in it explain most of the "it dropped and never came back" reports.
+
+### Fixed
+
+- **The recovery path no longer switches itself off.** Stopping the VPN wrote a
+  persistent "the user does not want a VPN" flag and cancelled the 15-minute
+  watchdog. That would be correct if only the user could stop it - but the same
+  function ran when Android destroyed the service, when the VPN permission was
+  revoked, when the reconnect budget ran out after thirty attempts, and when a
+  reconnect hit an invalid config. After any of those the watchdog, the boot
+  receiver and the airplane-mode receiver were all gated off, and nothing
+  brought the tunnel back until the app was opened and connect was tapped. A
+  stop now carries what caused it, and only a user-initiated stop touches the
+  flag. A related hole: Android restarts a sticky service with a null intent,
+  which the service ignored entirely - the process could die (including at the
+  hands of its own connect watchdog), come back, and sit there doing nothing.
+
+- **"Is the core alive" is now answered by the core.** The check was a boolean
+  set when the client started and cleared only by our own stop or by the core
+  saying it had disconnected. The core runs inside this process: a wedged
+  goroutine, a looping handshake or a dead relay never moved that boolean. So
+  the ten-second health check reported a healthy tunnel over a dead one, and the
+  thirty-second process watchdog never fired once. Liveness now comes from the
+  keepalive stream the core already sends, with the boolean kept only for the
+  question it can actually answer - did we start the client at all.
+
+- **The control socket has one writer and one reader.** Five places wrote to it
+  with no lock, and the TUN descriptor is attached to "the next write on this
+  socket" - so a routine status poll could slip in and carry the descriptor
+  away, leaving the command that needed it without one. The attachment was also
+  never cleared, so every later write carried another copy, and after the
+  interface was rebuilt the descriptor number was reused and the core received
+  something else entirely. Three separate buffered readers over the same stream
+  meant one of them swallowed answers meant for another: a `set_fd` reply lost
+  this way turned into a fifty-second wait, a false "Failed to activate tunnel"
+  and a needless interface rebuild.
+
+- **A cancelled reconnect can no longer tear down what a new connect has just
+  built.** Its cleanup ran in a non-cancellable block, so a fresh connect could
+  already own the TUN descriptor, the core, the control channel and the protect
+  socket by the time the old one reached for them. Every destructive step is now
+  gated on the connection generation that started it, and a resource is only
+  released by the code that still owns it. In the same area: a forced reset
+  released a mutex it did not own, which could unlock a reconnect that had just
+  taken it and let two run at once.
+
+- **Reconnect progress no longer looks like failure.** "Reconnecting", "Checking
+  network" and "Waiting for network" were published as error states. The main
+  screen painted them red as "Disconnected", the watchdog read them as "not
+  connected" and restarted the service, and a tap on the button at that moment
+  killed the reconnect in progress.
+
+- **The core's IPv6 renegotiation is applied.** After an automatic reconnect the
+  server can hand out a different pair of tunnel v6 addresses, and the only way
+  it announces that is an `ipv6_changed` event. Nothing listened for it, so the
+  interface kept an address that no longer routed until the next full connect.
+
+- **Servers no longer disappear on import.** Two servers that differed only by
+  their IPv6 endpoint, secret or name were treated as the same server, because
+  the identity key was built from the IPv4 host and port alone - the second one
+  was dropped as a duplicate, or silently overwrote the first. Entries sharing
+  an id but pointing at different endpoints overwrote each other as well.
+
+- **An imported link no longer takes over as the active server.** One tap on a
+  `tired://` link from a stranger made that server active even when the user had
+  their own, and the next connect went wherever the link pointed. Import now
+  only chooses the active server when there is nothing to choose between.
+
+- **The server store survives a bad record and a failed keystore.** A single
+  malformed entry ended the parse of the whole list, so a user could open the
+  app to an empty server list with no error shown; records are now read one by
+  one. If the encrypted store failed to open, the app quietly fell back to
+  plaintext preferences and kept writing secrets there, with nothing said in the
+  log or the UI. Reads and writes are also serialised now: a wave of latency
+  pings could overwrite a concurrent edit, and could bring a just-deleted server
+  back from the dead.
+
+- **Updates are checked against our own signing certificate.** The APK hash and
+  the download URL arrived in the same JSON from the same host, so the hash
+  proved only that the file matched what that host said - and nothing compared
+  the downloaded package to the signature of the app asking to install it. The
+  update flow also treated every failure as "no update available" and retried
+  permanent ones forever, and could pull a full APK over a metered connection.
+
+- **The main screen stops getting stuck on "Connecting".** Three paths refused
+  the attempt without ever moving the state - no config, a declined VPN
+  permission prompt, a dismissed "another VPN is active" dialog - and the button
+  stayed mid-connect until something else changed it.
+
+- **Opening the server list no longer fires dozens of geolocation requests.**
+  Every row rebind called an external IP-geolocation service with no cache, and
+  the list refreshed on every finished ping. The server address was leaving the
+  device to a third party far more often than anyone intended.
+
+### Changed
+
+- **Port hopping is gone from the client.** The setting existed, the generator
+  had tests, and the service sent the core a `port_hop` command - which the core
+  has never implemented and answers with "unknown command". The reply was not
+  read: the UI reported a successful hop to a new port that had not happened.
+  The honest state is no feature, so the path is removed. If it comes back it
+  starts in the core.
+
+- **The dead second VPN service is deleted.** `TiredVpnServiceJNI`, 438 lines,
+  was not in the manifest and not referenced anywhere, and had already drifted
+  from the live one - a legacy flag alias, no server pool, no MTU or IPv6
+  handling, split tunnelling commented out.
+
+- **Logs and notifications say less.** The connected notification no longer
+  shows the tunnel address on the lock screen, and killing a stray core process
+  no longer prints its command line - which contained the server secret in
+  clear text, in the log file the app offers to share.
+
+- **The bundled core is rebuilt when it changes.** The build step that compiles
+  the Go core skipped itself whenever a library file already existed, so a
+  release built on a machine with a stale one shipped that stale core without a
+  word in the build log. It now compares the core revision it built from.
+
+- Bundled core updated to 1.10.0.
+
 ## [1.9.0] - 2026-09-02
 
 ### Fixed
