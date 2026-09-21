@@ -1428,25 +1428,51 @@ class TiredVpnService : VpnService() {
                     protectClientFds.add(clientFd)
 
                     launch {
-                        try {
-                            // Without this a silent client blocks its thread
-                            // forever: the read below has no deadline of its own.
-                            android.system.Os.setsockoptTimeval(
-                                clientFd,
-                                android.system.OsConstants.SOL_SOCKET,
-                                android.system.OsConstants.SO_RCVTIMEO,
-                                android.system.StructTimeval.fromMillis(PROTECT_CLIENT_READ_TIMEOUT_MS)
-                            )
-                        } catch (e: Exception) {
-                            FileLogger.w(TAG, "Protect: cannot set read timeout: ${e.message}")
+                        // Without a deadline a silent client blocks its thread
+                        // forever: the read below has none of its own.
+                        // SO_RCVTIMEO through Os is API 29; below that the only
+                        // lever is closing the descriptor, which makes the
+                        // blocked read return.
+                        // Exactly one of the two paths below may close this
+                        // descriptor. Closing a number twice is what the TUN
+                        // ledger exists to prevent elsewhere: between the two
+                        // closes the number can be handed to something else.
+                        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+                        fun closeOnce(why: String) {
+                            if (closed.compareAndSet(false, true)) {
+                                try { android.system.Os.close(clientFd) } catch (_: Exception) {}
+                            } else {
+                                FileLogger.d(TAG, "Protect: fd already closed ($why)")
+                            }
+                        }
+
+                        var closer: Job? = null
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            try {
+                                android.system.Os.setsockoptTimeval(
+                                    clientFd,
+                                    android.system.OsConstants.SOL_SOCKET,
+                                    android.system.OsConstants.SO_RCVTIMEO,
+                                    android.system.StructTimeval.fromMillis(PROTECT_CLIENT_READ_TIMEOUT_MS)
+                                )
+                            } catch (e: Exception) {
+                                FileLogger.w(TAG, "Protect: cannot set read timeout: ${e.message}")
+                            }
+                        } else {
+                            closer = launch {
+                                delay(PROTECT_CLIENT_READ_TIMEOUT_MS)
+                                FileLogger.w(TAG, "Protect: client silent for ${PROTECT_CLIENT_READ_TIMEOUT_MS}ms, closing fd (pre-API-29 path)")
+                                closeOnce("timeout")
+                            }
                         }
                         try {
                             handleProtectClientFd(clientFd)
                         } catch (e: Exception) {
                             FileLogger.w(TAG, "Protect client error", e)
                         } finally {
+                            closer?.cancel()
                             protectClientFds.remove(clientFd)
-                            try { android.system.Os.close(clientFd) } catch (_: Exception) {}
+                            closeOnce("handler done")
                         }
                     }
                 }
