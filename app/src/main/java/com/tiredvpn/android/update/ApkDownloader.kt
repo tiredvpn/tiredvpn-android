@@ -2,19 +2,27 @@ package com.tiredvpn.android.update
 
 import android.content.Context
 import android.util.Log
-import com.tiredvpn.android.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.IOException
 import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
 
 /**
- * Downloads APK files with progress reporting and SHA256 verification
+ * Downloads APK files with progress reporting and SHA256 verification.
+ *
+ * The cache root and the HTTP client are constructor parameters so the download
+ * path can be exercised against a MockWebServer and a temporary directory; the
+ * [Context] constructor wires the production values.
  */
-class ApkDownloader(private val context: Context) {
+class ApkDownloader(
+    private val cacheRoot: File,
+    private val client: OkHttpClient = UpdateHttp.downloadClient
+) {
+
+    constructor(context: Context) : this(context.cacheDir)
 
     companion object {
         private const val TAG = "ApkDownloader"
@@ -22,99 +30,93 @@ class ApkDownloader(private val context: Context) {
         private const val APK_FILENAME = "update.apk"
     }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .apply {
-            val pin = BuildConfig.UPDATE_SERVER_PIN
-            val updateUrl = BuildConfig.UPDATE_URL
-            if (pin.isNotBlank() && updateUrl.isNotBlank()) {
-                val host = updateUrl.removePrefix("https://").removePrefix("http://")
-                    .substringBefore("/")
-                certificatePinner(
-                    okhttp3.CertificatePinner.Builder()
-                        .add(host, "sha256/$pin")
-                        .build()
-                )
-            }
-        }
-        .build()
-
     /**
-     * Download APK file with progress callback
-     * @param url APK download URL
-     * @param expectedSha256 Expected SHA256 hash for verification
-     * @param onProgress Progress callback (0-100)
-     * @return Downloaded file if successful and verified, null otherwise
+     * Download an APK and verify it against [expectedSha256].
+     *
+     * @param onProgress called with 0-100 while bytes arrive, only when the
+     *        server sent a Content-Length.
+     * @return the file on success, otherwise why it failed and whether a retry
+     *         could help. Never throws.
      */
     suspend fun download(
         url: String,
         expectedSha256: String,
         onProgress: (Int) -> Unit
-    ): File? = withContext(Dispatchers.IO) {
+    ): DownloadOutcome = withContext(Dispatchers.IO) {
+        if (!url.startsWith("https://", ignoreCase = true)) {
+            Log.e(TAG, "Refusing to download an APK over a non-HTTPS URL")
+            return@withContext DownloadOutcome.Failed(
+                FailureKind.PERMANENT,
+                "apkUrl is not https"
+            )
+        }
+
+        val apkFile = File(File(cacheRoot, UPDATES_DIR).apply { mkdirs() }, APK_FILENAME)
+        apkFile.delete()
+
+        Log.d(TAG, "Starting download: $url")
+        val request = Request.Builder().url(url).build()
+
         try {
-            val cacheDir = File(context.cacheDir, UPDATES_DIR).apply {
-                if (!exists()) mkdirs()
-            }
-            val apkFile = File(cacheDir, APK_FILENAME)
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val kind = failureKindForHttp(response.code)
+                    Log.e(TAG, "Download failed: HTTP ${response.code} ($kind)")
+                    return@use DownloadOutcome.Failed(kind, "HTTP ${response.code}")
+                }
 
-            // Delete old file if exists
-            if (apkFile.exists()) {
-                apkFile.delete()
-            }
+                val body = response.body
+                if (body == null) {
+                    Log.e(TAG, "Empty response body")
+                    return@use DownloadOutcome.Failed(
+                        FailureKind.TRANSIENT,
+                        "empty response body"
+                    )
+                }
 
-            Log.d(TAG, "Starting download: $url")
+                val total = body.contentLength()
+                var downloaded = 0L
+                var lastReported = -1
 
-            val request = Request.Builder()
-                .url(url)
-                .build()
-
-            val response = client.newCall(request).execute()
-
-            if (!response.isSuccessful) {
-                Log.e(TAG, "Download failed: ${response.code}")
-                return@withContext null
-            }
-
-            val body = response.body ?: run {
-                Log.e(TAG, "Empty response body")
-                return@withContext null
-            }
-
-            val total = body.contentLength()
-            var downloaded = 0L
-
-            apkFile.outputStream().use { output ->
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(8192)
-                    var read: Int
-                    while (input.read(buffer).also { read = it } != -1) {
-                        output.write(buffer, 0, read)
-                        downloaded += read
-                        if (total > 0) {
-                            val progress = (downloaded * 100 / total).toInt()
-                            onProgress(progress)
+                apkFile.outputStream().use { output ->
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(8192)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            downloaded += read
+                            if (total > 0) {
+                                val progress = (downloaded * 100 / total).toInt()
+                                if (progress != lastReported) {
+                                    lastReported = progress
+                                    onProgress(progress)
+                                }
+                            }
                         }
                     }
                 }
+
+                Log.d(TAG, "Download complete: ${apkFile.length()} bytes")
+
+                val actualSha256 = apkFile.sha256()
+                if (!actualSha256.equals(expectedSha256, ignoreCase = true)) {
+                    Log.e(TAG, "SHA256 mismatch! Expected: $expectedSha256, Actual: $actualSha256")
+                    apkFile.delete()
+                    return@use DownloadOutcome.Failed(
+                        FailureKind.PERMANENT,
+                        "SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+                    )
+                }
+
+                Log.i(TAG, "SHA256 verified successfully")
+                DownloadOutcome.Success(apkFile)
             }
-
-            Log.d(TAG, "Download complete: ${apkFile.length()} bytes")
-
-            // Verify SHA256
-            val actualSha256 = apkFile.sha256()
-            if (!actualSha256.equals(expectedSha256, ignoreCase = true)) {
-                Log.e(TAG, "SHA256 mismatch! Expected: $expectedSha256, Actual: $actualSha256")
-                apkFile.delete()
-                return@withContext null
-            }
-
-            Log.i(TAG, "SHA256 verified successfully")
-            apkFile
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Download error", e)
-            null
+        } catch (e: IOException) {
+            // Covers both the socket and the local file: a full disk and a
+            // dropped connection are equally worth another attempt later.
+            Log.w(TAG, "Download interrupted", e)
+            apkFile.delete()
+            DownloadOutcome.Failed(FailureKind.TRANSIENT, "I/O error: ${e.message}")
         }
     }
 
@@ -122,7 +124,7 @@ class ApkDownloader(private val context: Context) {
      * Get path to downloaded APK if exists
      */
     fun getDownloadedApk(): File? {
-        val apkFile = File(File(context.cacheDir, UPDATES_DIR), APK_FILENAME)
+        val apkFile = File(File(cacheRoot, UPDATES_DIR), APK_FILENAME)
         return if (apkFile.exists()) apkFile else null
     }
 
@@ -131,7 +133,7 @@ class ApkDownloader(private val context: Context) {
      */
     fun clearCache() {
         try {
-            File(context.cacheDir, UPDATES_DIR).deleteRecursively()
+            File(cacheRoot, UPDATES_DIR).deleteRecursively()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to clear cache", e)
         }

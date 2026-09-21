@@ -1,5 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    What FileProvider is allowed to hand out a content:// URI for.
+
+    The previous "shared_logs" root was path="/", i.e. the whole cache directory:
+    log dumps, the downloaded update.apk, and tiredvpn-backup.json with server
+    secrets in it, all reachable through one grant. Narrowed to the two
+    subdirectories that are actually shared.
+
+    Keep every file that gets passed to FileProvider.getUriForFile inside one of
+    these; a file outside them makes that call throw IllegalArgumentException.
+-->
 <paths>
-    <cache-path name="shared_logs" path="/" />
+    <!-- Files the user explicitly exports: log dumps, config backups -->
+    <cache-path name="shared" path="share/" />
+    <!-- Downloaded APK handed to the system installer -->
     <cache-path name="updates" path="updates/" />
 </paths>

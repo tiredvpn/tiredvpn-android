@@ -181,13 +181,31 @@ class VpnWatchdogWorker(
             FileLogger.i(TAG, "=== WATCHDOG RESTARTING VPN ===")
             FileLogger.i(TAG, "State: $currentState, Network: available, Config: valid")
 
-            restartVpn()
-
+            // Result.success() even when the start was refused, and the log
+            // line carries the bad news instead.
+            //
+            // Not for want of honesty — Result.retry() on a *periodic* worker
+            // is not "run again next period". WorkSpec.calculateNextRunTime()
+            // checks isBackedOff() before isPeriodic(), so a retry replaces the
+            // 15-minute period with the backoff policy: exponential from 30s,
+            // doubling, capped at WorkRequest.MAX_BACKOFF_MILLIS = 5 hours,
+            // and runAttemptCount only resets on success. On Android 12+ a
+            // background process is flatly not allowed to start a foreground
+            // service, so the refusal is systematic rather than transient: ten
+            // refusals in a row and the only thing that brings the tunnel back
+            // on its own is checking once every five hours.
+            if (!restartVpn()) {
+                FileLogger.e(TAG, "=== WATCHDOG COULD NOT RESTART THE VPN === the system refused the service start; retrying in ${CHECK_INTERVAL_MINUTES}min")
+            }
             return Result.success()
 
         } catch (e: Exception) {
-            FileLogger.e(TAG, "Watchdog check failed", e)
-            return Result.failure()
+            // Also success, and for a sharper reason: Result.failure() is
+            // terminal for periodic work. One exception here — a Keystore
+            // hiccup inside getActiveServer, say — and the watchdog is not
+            // rescheduled at all, ever, for the lifetime of the install.
+            FileLogger.e(TAG, "Watchdog check failed; keeping the ${CHECK_INTERVAL_MINUTES}min period", e)
+            return Result.success()
         }
     }
 
@@ -205,7 +223,16 @@ class VpnWatchdogWorker(
         }
     }
 
-    private fun restartVpn() {
+    /**
+     * Ask the service to connect.
+     *
+     * @return true when the start was accepted. False means the system refused
+     *         it — most often the Android 12+ ban on starting a foreground
+     *         service from the background, which this worker cannot lift from
+     *         here. Reporting it honestly is what lets [doWork] ask for a retry
+     *         instead of declaring success over a tunnel that is still down.
+     */
+    private fun restartVpn(): Boolean {
         try {
             val serviceIntent = Intent(applicationContext, TiredVpnService::class.java).apply {
                 action = TiredVpnService.ACTION_CONNECT
@@ -218,8 +245,18 @@ class VpnWatchdogWorker(
             }
 
             FileLogger.i(TAG, "VPN restart initiated by watchdog")
+            return true
         } catch (e: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                FileLogger.w(TAG, "=== WATCHDOG BLOCKED === Android ${Build.VERSION.SDK_INT} refuses a background " +
+                    "foreground-service start; the tunnel stays down until the user opens the app or an " +
+                    "allowance-bearing event arrives")
+                return false
+            }
             FileLogger.e(TAG, "Failed to restart VPN", e)
+            return false
         }
     }
 }

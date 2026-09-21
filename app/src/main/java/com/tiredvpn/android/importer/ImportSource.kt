@@ -6,6 +6,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
@@ -78,10 +79,29 @@ object ImportSource {
         }
     }
 
-    /** Read a file the user picked in the system file picker. */
+    /**
+     * Read a file the user picked in the system file picker.
+     *
+     * Same cap as [fromFile], enforced by reading rather than by asking: a
+     * content uri does not have to report a length, and the provider behind it
+     * does not have to be a file at all.
+     */
     fun fromUri(resolver: ContentResolver, uri: Uri): String? {
         return try {
-            resolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            resolver.openInputStream(uri)?.use { stream ->
+                val read = ByteArrayOutputStream()
+                val chunk = ByteArray(8 * 1024)
+                while (true) {
+                    val n = stream.read(chunk)
+                    if (n < 0) break
+                    read.write(chunk, 0, n)
+                    if (read.size() > MAX_FILE_BYTES) {
+                        Log.w(TAG, "picked file is over the size cap")
+                        return null
+                    }
+                }
+                String(read.toByteArray(), Charsets.UTF_8)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "could not read picked file: ${e.javaClass.simpleName}")
             null

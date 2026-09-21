@@ -30,11 +30,19 @@ class NativeProcess(
         private const val TAG = "NativeProcess"
 
         /**
-         * Kill all running tiredvpn processes.
-         * This is critical to avoid process leaks during reconnects.
+         * Kill leftover tiredvpn processes.
+         *
+         * Only a build that ran the core as a separate binary can leave one
+         * behind, so on a JNI build this is an upgrade path and nothing else —
+         * which is why it runs once, from the authoritative reset, instead of
+         * five times per connect walking all of /proc each time.
+         *
+         * The `nativeLibDir` parameter it used to take was never read, and was
+         * passed with two different values from different call sites.
+         *
          * Android doesn't allow pkill, so we use /proc filesystem to find and kill processes.
          */
-        fun killAllTiredVpnProcesses(nativeLibDir: String) {
+        fun killAllTiredVpnProcesses() {
             FileLogger.i(TAG, "=== KILLING ALL TIREDVPN PROCESSES ===")
             try {
                 val myPid = android.os.Process.myPid()
@@ -62,9 +70,17 @@ class NativeProcess(
                         val cmdlineFile = java.io.File(pidDir, "cmdline")
                         if (!cmdlineFile.exists()) return@forEach
 
+                        // /proc/<pid>/cmdline is NUL-separated argv. Matching
+                        // on "tiredvpn" alone also matched our own package
+                        // name, so any second process of this app was a target;
+                        // only the extracted binary is.
                         val cmdline = cmdlineFile.readText()
-                        if (cmdline.contains("libtiredvpn.so") || cmdline.contains("tiredvpn")) {
-                            FileLogger.w(TAG, "Killing orphan tiredvpn process: pid=$pid, cmd=$cmdline")
+                        if (cmdline.contains("libtiredvpn.so")) {
+                            // Redacted: argv holds `-secret <key>`, and this
+                            // line went verbatim into the log file the user
+                            // shares from inside the app.
+                            val argv = cmdline.split('\u0000', ' ').filter { it.isNotEmpty() }
+                            FileLogger.w(TAG, "Killing orphan tiredvpn process: pid=$pid, cmd=${NativeArgs.redact(argv)}")
                             android.os.Process.killProcess(pid)
                             killed++
                         }

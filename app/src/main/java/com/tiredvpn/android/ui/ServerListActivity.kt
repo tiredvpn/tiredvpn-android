@@ -18,12 +18,21 @@ import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.VpnConfig
 
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import com.tiredvpn.android.util.PingManager
 
 class ServerListActivity : BaseActivity() {
     private lateinit var binding: ActivityServerLocationsBinding
     private lateinit var adapter: ServerAdapter
+
+    /** The ping wave started by the last refresh; superseded by the next one. */
+    internal var pingJob: Job? = null
+
+    /** How a single row is measured. A seam, so tests never open a socket. */
+    internal var latencyProbe: suspend (VpnConfig) -> Long = { server ->
+        PingManager.ping(server.serverAddress, server.serverPort)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,12 +109,17 @@ class ServerListActivity : BaseActivity() {
     }
 
     private fun refreshList() {
+        repaintList()
+
+        // Ping servers in background
+        pingServers(ServerRepository.getServers(this))
+    }
+
+    /** Redraw the rows from whatever is stored right now. */
+    private fun repaintList() {
         val servers = ServerRepository.getServers(this)
         val activeServer = ServerRepository.getActiveServer(this)
         adapter.updateList(servers, activeServer?.id, poolIdsFor(servers, activeServer))
-
-        // Ping servers in background
-        pingServers(servers)
     }
 
     /** Ids of the servers the core may fail over between, active one included. */
@@ -114,31 +128,36 @@ class ServerListActivity : BaseActivity() {
         return ServerPoolConfig.selectPool(servers, active).map { it.id }.toSet()
     }
     
+    /**
+     * One ping per server, all at once, at most one wave at a time.
+     *
+     * A ping runs up to ~3 seconds, and this screen refreshes on every resume
+     * and after every edit - so without the cancel below, several waves would
+     * be in the air at once, each describing a list that no longer exists. The
+     * cancelled wave never reaches its write: the store is touched only after
+     * the suspension point.
+     */
     private fun pingServers(servers: List<VpnConfig>) {
-        lifecycleScope.launch {
+        pingJob?.cancel()
+        pingJob = lifecycleScope.launch {
             servers.forEach { server ->
                 // Launch individual coroutine for each server to ping in parallel
                 launch {
-                    val latency = PingManager.ping(server.serverAddress, server.serverPort)
-                    // Update server with new latency
-                    val updatedServer = server.copy(lastLatencyMs = latency)
-                    
-                    // Save to repository (optional, but good for caching)
-                    ServerRepository.saveServer(this@ServerListActivity, updatedServer)
-                    
-                    // Update UI if still on this screen
-                    // We need to fetch the latest list again because multiple coroutines might update it
-                    // This is a bit inefficient but safe for now. 
-                    // Better approach would be to have a StateFlow in ViewModel.
-                    runOnUiThread {
-                         val currentServers = ServerRepository.getServers(this@ServerListActivity)
-                         val currentActive = ServerRepository.getActiveServer(this@ServerListActivity)
-                         adapter.updateList(
-                             currentServers,
-                             currentActive?.id,
-                             poolIdsFor(currentServers, currentActive)
-                         )
-                    }
+                    val latency = latencyProbe(server)
+
+                    // updateLatency and not a read-then-save pair: the captured
+                    // `server` is a whole record from up to three seconds ago,
+                    // and re-reading it here narrows the window without closing
+                    // it — getServer and saveServer take the repository's lock
+                    // separately, so a delete or an edit can still land between
+                    // them. updateLatency exists to do the whole read, check
+                    // and write inside one critical section, and is the only
+                    // caller-visible way to write a latency without rewriting
+                    // the record around it.
+                    ServerRepository.updateLatency(this@ServerListActivity, server.id, latency)
+
+                    // Already on the main dispatcher here (lifecycleScope).
+                    repaintList()
                 }
             }
         }

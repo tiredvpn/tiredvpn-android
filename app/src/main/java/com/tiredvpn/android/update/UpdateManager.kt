@@ -23,19 +23,37 @@ class UpdateManager(private val context: Context) {
     private val _state = MutableStateFlow<UpdateState>(UpdateState.Idle)
     val state: StateFlow<UpdateState> = _state.asStateFlow()
 
+    /** True when the update channel is certificate-pinned; see [UpdateHttp]. */
+    val isChannelPinned: Boolean get() = UpdateHttp.isPinned
+
     /**
-     * Check for update without downloading
+     * Check for update without downloading.
+     *
+     * A failed check lands in [state] as [UpdateState.Error] rather than being
+     * flattened into "no update available" — the return value stays nullable for
+     * callers that only ask "is there something to install".
+     *
      * @return UpdateConfig if available, null otherwise
      */
     suspend fun checkForUpdate(): UpdateConfig? {
         _state.value = UpdateState.Checking
-        val update = checker.checkForUpdate()
-        _state.value = if (update != null) {
-            UpdateState.UpdateAvailable(update)
-        } else {
-            UpdateState.Idle
+        return when (val result = checker.check()) {
+            is VersionCheckResult.UpdateAvailable -> {
+                _state.value = UpdateState.UpdateAvailable(result.config)
+                result.config
+            }
+
+            VersionCheckResult.UpToDate, VersionCheckResult.NotConfigured -> {
+                _state.value = UpdateState.Idle
+                null
+            }
+
+            is VersionCheckResult.Failed -> {
+                Log.w(TAG, "Update check failed (${result.kind}): ${result.reason}")
+                _state.value = UpdateState.Error("Update check failed: ${result.reason}")
+                null
+            }
         }
-        return update
     }
 
     /**
@@ -51,20 +69,30 @@ class UpdateManager(private val context: Context) {
         try {
             _state.value = UpdateState.Downloading(0)
 
-            val apk = downloader.download(config.apkUrl, config.sha256) { progress ->
+            val outcome = downloader.download(config.apkUrl, config.sha256) { progress ->
                 _state.value = UpdateState.Downloading(progress)
                 onProgress(progress)
             }
 
-            if (apk == null) {
-                Log.e(TAG, "Download failed or SHA256 mismatch")
-                _state.value = UpdateState.Error("Download failed")
-                return UpdateResult.DownloadFailed
+            val apk = when (outcome) {
+                is DownloadOutcome.Failed -> {
+                    // A hash mismatch, a 404 and a dead socket used to arrive here
+                    // as the same string. They mean very different things.
+                    Log.e(TAG, "Download failed (${outcome.kind}): ${outcome.reason}")
+                    _state.value = UpdateState.Error(outcome.reason)
+                    return UpdateResult.DownloadFailed(outcome.reason)
+                }
+
+                is DownloadOutcome.Success -> outcome.file
             }
 
             _state.value = UpdateState.ReadyToInstall(config)
 
-            installer.install(apk)
+            if (!installer.install(apk)) {
+                val reason = "downloaded APK is not signed by this app's key"
+                _state.value = UpdateState.Error(reason)
+                return UpdateResult.Error(reason)
+            }
             return UpdateResult.Installing
 
         } catch (e: Exception) {
@@ -119,7 +147,10 @@ sealed class UpdateState {
  */
 sealed class UpdateResult {
     object NoUpdate : UpdateResult()
-    object DownloadFailed : UpdateResult()
+
+    /** @param reason what actually went wrong: hash mismatch, HTTP code, I/O error. */
+    data class DownloadFailed(val reason: String) : UpdateResult()
+
     object Installing : UpdateResult()
     data class Error(val message: String) : UpdateResult()
 }

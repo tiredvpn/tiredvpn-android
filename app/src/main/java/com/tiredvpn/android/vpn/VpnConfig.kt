@@ -42,6 +42,11 @@ data class VpnConfig(
     val fallbackV4: Boolean = true,
     // IPv6 inside the tunnel: "off" (v4-only, leak blackhole) or "dual" (dual-stack)
     val tunnelIpv6: String = "off",
+    // How the core orders the endpoint pool: priority (config order), latency
+    // (fastest measured first) or weighted. Anything else is clamped by
+    // ServerPoolConfig.policyFor, because the core treats an unknown spelling
+    // as a fatal config error rather than ignoring it.
+    val serverSelectionPolicy: String = ServerPoolConfig.DEFAULT_POLICY,
     // QUIC SNI fragmentation
     val quicSniFrag: Boolean = false,
     // Tunnel overrides
@@ -92,6 +97,7 @@ data class VpnConfig(
             put("fallbackV4", fallbackV4)
             // IPv6 inside the tunnel
             put("tunnelIpv6", tunnelIpv6)
+            put("serverSelectionPolicy", serverSelectionPolicy)
             // QUIC SNI fragmentation
             put("quicSniFrag", quicSniFrag)
             // Tunnel overrides
@@ -140,6 +146,9 @@ data class VpnConfig(
         if (preferIpv6) params.add("preferIpv6=true")
         if (!fallbackV4) params.add("fallbackV4=false")
         if (tunnelIpv6 != "off") params.add("tunIpv6=" + Uri.encode(tunnelIpv6))
+        if (serverSelectionPolicy != ServerPoolConfig.DEFAULT_POLICY) {
+            params.add("poolPolicy=" + Uri.encode(serverSelectionPolicy))
+        }
         if (quicSniFrag) params.add("quicSniFrag=true")
         if (mtu != 0) params.add("mtu=$mtu")
         if (customDns.isNotEmpty()) params.add("dns=" + Uri.encode(customDns))
@@ -215,6 +224,7 @@ data class VpnConfig(
                 fallbackV4 = json.optBoolean("fallbackV4", true),
                 // IPv6 inside the tunnel
                 tunnelIpv6 = json.optString("tunnelIpv6", "off"),
+                serverSelectionPolicy = json.optString("serverSelectionPolicy", ServerPoolConfig.DEFAULT_POLICY),
                 // QUIC SNI fragmentation
                 quicSniFrag = json.optBoolean("quicSniFrag", false),
                 // Tunnel overrides
@@ -321,6 +331,8 @@ data class VpnConfig(
                     preferIpv6 = uri.getQueryParameter("preferIpv6")?.toBooleanStrictOrNull() ?: false,
                     fallbackV4 = uri.getQueryParameter("fallbackV4")?.toBooleanStrictOrNull() ?: true,
                     tunnelIpv6 = uri.getQueryParameter("tunIpv6") ?: "off",
+                    serverSelectionPolicy = uri.getQueryParameter("poolPolicy")
+                        ?: ServerPoolConfig.DEFAULT_POLICY,
                     quicSniFrag = uri.getQueryParameter("quicSniFrag")?.toBooleanStrictOrNull() ?: false,
                     mtu = uri.getQueryParameter("mtu")?.toIntOrNull() ?: 0,
                     customDns = uri.getQueryParameter("dns") ?: ""

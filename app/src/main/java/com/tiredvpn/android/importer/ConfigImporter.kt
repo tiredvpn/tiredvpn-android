@@ -64,37 +64,79 @@ object ConfigImporter {
      * a known endpoint is a rotated credential, not a different server: update.
      */
     fun dedupKey(config: VpnConfig): String {
+        val v6 = v6Key(config)
+        return if (v6.isEmpty()) v4Key(config) else "${v4Key(config)}|$v6"
+    }
+
+    /** The v4 or hostname endpoint, normalised. */
+    private fun v4Key(config: VpnConfig): String {
         // An IPv6 literal reaches serverAddress with brackets when Uri parsed the
         // link and without them when the manual authority fallback did. Same host.
         val host = config.serverAddress.trim().lowercase().trim('[', ']')
         return "$host:${config.serverPort}"
     }
 
+    /** The v6 endpoint, normalised; "" when the entry does not name one. */
+    private fun v6Key(config: VpnConfig): String =
+        config.serverAddressV6.trim().lowercase().filterNot { it == '[' || it == ']' }
+
+    /**
+     * Do two entries describe the same server?
+     *
+     * The v4 endpoint has to match. The v6 endpoint is compared only when BOTH
+     * sides name one, because "said nothing about v6" is not "has no v6": a bare
+     * tired:// link carries no serverV6 parameter at all, and treating the short
+     * form of a server as a different server would mint a second entry every
+     * time someone re-imported it.
+     *
+     * When both sides do name a v6 endpoint and the two differ, they are two
+     * ways into two different places and both are kept. Keying on the v4
+     * endpoint alone used to collapse them: the second was reported as a
+     * duplicate inside one payload, and overwrote the first on re-import.
+     */
+    fun sameServer(a: VpnConfig, b: VpnConfig): Boolean {
+        if (v4Key(a) != v4Key(b)) return false
+        val av6 = v6Key(a)
+        val bv6 = v6Key(b)
+        return av6.isEmpty() || bv6.isEmpty() || av6 == bv6
+    }
+
     fun plan(existing: List<VpnConfig>, parsed: ConfigCodec.ParseResult): Plan {
         val byId = existing.associateBy { it.id }
-        val byEndpoint = existing.associateBy { dedupKey(it) }
 
         val entries = mutableListOf<PlannedEntry>()
         val skipped = parsed.skipped.toMutableList()
-        val claimed = mutableSetOf<String>()
+        // Two payload entries collide in two ways: they dial the same place, or
+        // they resolve to the same stored row. Claiming endpoints alone let the
+        // second kind through - both entries planned as UPDATE of one row, the
+        // later write silently on top of the earlier, and "2 updated" reported.
+        val claimedEndpoints = mutableListOf<VpnConfig>()
+        val claimedIds = mutableSetOf<String>()
 
         for (server in parsed.servers) {
             val incoming = server.config
-            val key = dedupKey(incoming)
 
-            if (!claimed.add(key)) {
+            // An id match comes first: a backup file round-trips by id, which
+            // survives the user moving a server to a different address.
+            val match = byId[incoming.id] ?: existing.firstOrNull { sameServer(it, incoming) }
+            val targetId = match?.id ?: incoming.id
+
+            if (claimedEndpoints.any { sameServer(it, incoming) } || targetId in claimedIds) {
                 entries += PlannedEntry(incoming, Action.DUPLICATE, server.splitTunnel)
                 skipped += ConfigCodec.Skipped("${incoming.serverAddress}:${incoming.serverPort}", REASON_DUPLICATE)
                 continue
             }
+            claimedEndpoints += incoming
+            claimedIds += targetId
 
-            // An id match comes first: a backup file round-trips by id, which
-            // survives the user moving a server to a different address.
-            val match = byId[incoming.id] ?: byEndpoint[key]
             if (match == null) {
                 entries += PlannedEntry(incoming, Action.ADD, server.splitTunnel)
             } else {
-                entries += PlannedEntry(merge(match, incoming), Action.UPDATE, server.splitTunnel)
+                entries += PlannedEntry(
+                    merge(match, incoming, server.namedBySender),
+                    Action.UPDATE,
+                    server.splitTunnel,
+                )
             }
         }
         return Plan(entries, skipped)
@@ -108,18 +150,17 @@ object ConfigImporter {
      *  - the measured latency, which the sender cannot know.
      *
      * A name the sender did not choose (a bare link names the server after its
-     * host) must not overwrite a name the user did choose.
+     * host, a nameless JSON object gets "Server") must not overwrite a name the
+     * user did choose. That question is answered by the codec, which knows
+     * whether a name was in the payload - guessing it back from the string here
+     * cost the name of everyone who called their server "Server".
      */
-    private fun merge(existing: VpnConfig, incoming: VpnConfig): VpnConfig {
-        val incomingNameIsAuto = incoming.name.isBlank() ||
-            incoming.name == "Server" ||
-            incoming.name.equals(incoming.serverAddress, ignoreCase = true)
-        return incoming.copy(
+    private fun merge(existing: VpnConfig, incoming: VpnConfig, namedBySender: Boolean): VpnConfig =
+        incoming.copy(
             id = existing.id,
             lastLatencyMs = existing.lastLatencyMs,
-            name = if (incomingNameIsAuto) existing.name else incoming.name,
+            name = if (namedBySender) incoming.name else existing.name,
         )
-    }
 
     /** Plan against what is currently stored. */
     fun plan(context: Context, parsed: ConfigCodec.ParseResult): Plan =
@@ -128,8 +169,15 @@ object ConfigImporter {
     /**
      * Write a plan. Returns the counts the user is shown; they are derived from
      * the same list that was written, not recounted from the payload.
+     *
+     * @param mayChangeActiveServer whether this import is allowed to repoint the
+     *   VPN at something it just wrote. False for every payload that arrived
+     *   from outside the app: one tired:// link and one tap on Import was enough
+     *   to move the user onto the sender's node, and nothing on screen said so.
+     *   A device that has no active server yet is the exception - something has
+     *   to be selected there and there is nothing to displace.
      */
-    fun apply(context: Context, plan: Plan): Result {
+    fun apply(context: Context, plan: Plan, mayChangeActiveServer: Boolean): Result {
         val hadActiveServer = ServerRepository.getActiveServer(context) != null
         val writable = plan.writable
 
@@ -144,7 +192,9 @@ object ConfigImporter {
         // Importing a pool of four must not silently move the user onto whichever
         // node happened to be last in the file.
         val single = writable.singleOrNull()
-        if (single != null && (!hadActiveServer || single.action == Action.ADD)) {
+        if (single != null &&
+            (!hadActiveServer || (mayChangeActiveServer && single.action == Action.ADD))
+        ) {
             ServerRepository.setActiveServerId(context, single.config.id)
         }
 
@@ -156,8 +206,8 @@ object ConfigImporter {
     }
 
     /** Parse, plan and write in one step. For non-interactive callers only. */
-    fun importDirect(context: Context, raw: String?): Result {
+    fun importDirect(context: Context, raw: String?, mayChangeActiveServer: Boolean): Result {
         val parsed = ConfigCodec.parse(raw)
-        return apply(context, plan(context, parsed))
+        return apply(context, plan(context, parsed), mayChangeActiveServer)
     }
 }

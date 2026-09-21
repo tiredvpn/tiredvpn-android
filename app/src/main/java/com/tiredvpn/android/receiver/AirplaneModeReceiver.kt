@@ -60,9 +60,15 @@ class AirplaneModeReceiver : BroadcastReceiver() {
             return
         }
 
-        // Airplane mode disabled - network is coming back
+        // Airplane mode disabled - network is coming back.
+        //
+        // goAsync() is what keeps the process alive across the delay below.
+        // Without it onReceive returned immediately, the receiver was done, and
+        // nothing held the process while a detached coroutine slept for three
+        // seconds — on a device under pressure it simply never woke up.
         FileLogger.i(TAG, "Airplane mode OFF - scheduling VPN reconnect")
-        scheduleReconnect(context)
+        val pending = goAsync()
+        scheduleReconnect(context) { pending.finish() }
     }
 
     private fun isAirplaneModeEnabled(context: Context): Boolean {
@@ -72,7 +78,7 @@ class AirplaneModeReceiver : BroadcastReceiver() {
         ) != 0
     }
 
-    private fun scheduleReconnect(context: Context) {
+    private fun scheduleReconnect(context: Context, onDone: () -> Unit) {
         // Cancel any pending reconnect
         cancelPendingReconnect()
 
@@ -132,6 +138,10 @@ class AirplaneModeReceiver : BroadcastReceiver() {
 
             } catch (e: Exception) {
                 FileLogger.e(TAG, "Error during airplane mode reconnect", e)
+            } finally {
+                // Always: a receiver whose goAsync() result is never finished
+                // is an ANR waiting to be reported against the app.
+                onDone()
             }
         }
     }
@@ -141,6 +151,16 @@ class AirplaneModeReceiver : BroadcastReceiver() {
         reconnectJob = null
     }
 
+    /**
+     * Start the VPN service.
+     *
+     * The half this receiver cannot fix: on Android 12+ starting a foreground
+     * service from the background throws, and ACTION_AIRPLANE_MODE_CHANGED is
+     * not one of the broadcasts that earn a temporary allowance. When that
+     * happens the tunnel comes back on the next VpnWatchdogWorker tick or when
+     * the user next opens the app — and the log says so instead of claiming a
+     * start that did not happen.
+     */
     private fun startVpnService(context: Context) {
         val serviceIntent = Intent(context, TiredVpnService::class.java).apply {
             action = TiredVpnService.ACTION_CONNECT
@@ -154,6 +174,13 @@ class AirplaneModeReceiver : BroadcastReceiver() {
             }
             FileLogger.i(TAG, "VPN service start initiated after airplane mode")
         } catch (e: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                FileLogger.w(TAG, "Cannot start the VPN from the background on Android ${Build.VERSION.SDK_INT}: " +
+                    "airplane-mode broadcasts carry no FGS allowance; leaving it to the watchdog")
+                return
+            }
             FileLogger.e(TAG, "Failed to start VPN service", e)
         }
     }

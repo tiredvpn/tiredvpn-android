@@ -14,6 +14,8 @@ import com.tiredvpn.android.util.FileLogger
  */
 object TiredVpnNative {
     private const val TAG = "TiredVpnNative"
+
+    @Volatile
     private var isLibraryLoaded = false
 
     init {
@@ -24,9 +26,22 @@ object TiredVpnNative {
         } catch (e: UnsatisfiedLinkError) {
             isLibraryLoaded = false
             FileLogger.w(TAG, "Native library not available (JNI mode disabled): ${e.message}")
-            // Don't throw - allow app to continue with ProcessBuilder mode
+            // Don't throw - allow the caller to report a usable error instead
+            // of the process dying on the first external call.
         }
     }
+
+    /**
+     * Whether libtiredvpn.so was loaded for this device's ABI.
+     *
+     * Read before any external call. The flag used to be written and never
+     * looked at, so a device without a matching .so — or a build whose Go
+     * exports drifted from these declarations — went straight into an
+     * `external fun`, and UnsatisfiedLinkError is an Error, which the
+     * `catch (e: Exception)` around the call site does not catch. The app died
+     * instead of reporting a missing core.
+     */
+    val isAvailable: Boolean get() = isLibraryLoaded
 
     // JNI native methods
     private external fun initNative(callback: NativeCallback)
@@ -34,8 +49,6 @@ object TiredVpnNative {
     private external fun startClient(args: Array<String>): Int
     private external fun stopClient()
     private external fun setTunFd(fd: Int)
-    private external fun getTunFd(): Int
-    private external fun sendCommand(cmd: String): String
 
     // Callbacks from Go
     interface NativeCallback {
@@ -43,6 +56,7 @@ object TiredVpnNative {
         fun onLogMessage(message: String)
     }
 
+    @Volatile
     private var callback: NativeCallback? = null
 
     /**
@@ -58,8 +72,16 @@ object TiredVpnNative {
     /**
      * Cleanup native library.
      * Should be called when service is destroyed.
+     *
+     * Safe to call when the library never loaded: the guard is what keeps an
+     * UnsatisfiedLinkError — an Error, not an Exception — out of the
+     * `catch (e: Exception)` blocks that surround the call sites.
      */
     fun cleanup() {
+        if (!isLibraryLoaded) {
+            callback = null
+            return
+        }
         cleanupNative()
         callback = null
         FileLogger.i(TAG, "Native library cleaned up")
@@ -100,25 +122,30 @@ object TiredVpnNative {
     }
 
     /**
-     * Get current TUN file descriptor.
+     * Stop whatever core is still running and drop the JNI callback, so a
+     * fresh [initialize] cannot have the previous core's death delivered to
+     * the new callback.
      *
-     * @return Current TUN fd or -1 if not set
+     * Why it is needed: `startClient` on the Go side cancels the running
+     * client but does NOT wait for its goroutine, while `stopClient` waits up
+     * to five seconds and only then emits "disconnected". Without the wait, the
+     * old goroutine's terminal `sendStateChange` arrives after `initNative`
+     * has already replaced the global callback reference — and the new
+     * NativeProcessJNI marks itself exited on a message about its predecessor.
      */
-    fun getTunFileDescriptor(): Int {
-        return getTunFd()
-    }
-
-    /**
-     * Send command to running client (JSON).
-     *
-     * @param cmd JSON command string
-     * @return JSON response string
-     */
-    fun command(cmd: String): String {
-        FileLogger.d(TAG, "Sending command: $cmd")
-        val response = sendCommand(cmd)
-        FileLogger.d(TAG, "Response: $response")
-        return response
+    fun reset() {
+        if (!isLibraryLoaded) return
+        try {
+            stopClient()
+        } catch (e: Throwable) {
+            FileLogger.w(TAG, "reset: stopClient failed: ${e.message}")
+        }
+        try {
+            cleanupNative()
+        } catch (e: Throwable) {
+            FileLogger.w(TAG, "reset: cleanupNative failed: ${e.message}")
+        }
+        callback = null
     }
 
     // Callback proxy that forwards to registered callback

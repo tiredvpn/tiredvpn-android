@@ -30,14 +30,47 @@ object ServerPoolConfig {
     /** Name of the generated file inside the app's private `filesDir`. */
     const val FILE_NAME = "pool.toml"
 
-    // Selection tuning, copied from configs/client.example.toml rather than
-    // invented here, so a change in the core's documented defaults is a
-    // one-line diff against a known source.
-    private const val POLICY = "priority"
-    private const val FAILURE_THRESHOLD = 2
-    private const val COOLDOWN = "1m"
-    private const val MAX_COOLDOWN = "30m"
-    private const val MIN_DWELL = "5m"
+    /**
+     * Endpoint-selection policies the core will accept in `[selection].policy`.
+     *
+     * Not a suggestion list: `toml.Selection.Resolve` returns an error for any
+     * other spelling, `applyClientTOMLConfig` propagates it and the client
+     * refuses to start. A typo here does not degrade, it bricks the connect —
+     * hence [policyFor], which clamps instead of trusting the caller.
+     */
+    val KNOWN_POLICIES = setOf("priority", "latency", "weighted")
+
+    /**
+     * Policy written when the profile does not name a usable one.
+     *
+     * Deliberately still `priority`, and the reason is in the core rather than
+     * here. `internal/endpoint/selector.go` does implement latency ranking
+     * (`rankLocked` over `latencyEWMA`), but nothing wires the configured
+     * policy into it: `strategy.Manager.SetEndpoints` calls
+     * `SetEndpointsTuned(eps, endpoint.Tuning{Family: &policy})` and leaves
+     * `Tuning.Selection` at its zero value, `SelectPriority`, while
+     * `ParseSelectionPolicy` has no caller outside its own package. The core
+     * says as much out loud — `warnUnappliedSelection` logs
+     * "selection.policy=%q is not implemented yet; candidates stay in
+     * configuration order" for anything but priority.
+     *
+     * So shipping `latency` as the default today buys one warning line per
+     * connect and no re-ranking. The knob is plumbed and the profile can ask
+     * for it; the default flips when the core wires it up.
+     */
+    const val DEFAULT_POLICY = "priority"
+
+    /**
+     * The policy to write for [active], clamped to what the core accepts.
+     *
+     * An unrecognised value is replaced rather than passed through: the core
+     * treats it as a fatal config error, so passing it on would turn a bad
+     * string in a profile into a client that cannot connect at all.
+     */
+    fun policyFor(active: VpnConfig): String {
+        val requested = active.serverSelectionPolicy.trim().lowercase()
+        return if (requested in KNOWN_POLICIES) requested else DEFAULT_POLICY
+    }
 
     /** One `[[servers]]` element, already split into the keys the core expects. */
     data class Entry(
@@ -241,6 +274,22 @@ object ServerPoolConfig {
      * polling N servers on a timer is a periodic fan-out pattern with no cover
      * traffic behind it, which is the shape a censor looks for. The client
      * learns a server is down by dialling it.
+     *
+     * `failure_threshold`, `cooldown`, `max_cooldown` and `min_dwell` used to
+     * be written here with the values 2 / 1m / 30m / 5m, copied from
+     * `configs/client.example.toml`. They are gone, and not because they were
+     * wrong — they are byte-identical to `internal/endpoint/selector.go`'s
+     * `defaultFailureThreshold` / `defaultCooldown` / `defaultMaxCooldown` /
+     * `defaultMinDwell`, which `Config` applies to every zero field. Two
+     * reasons to stop writing them:
+     *
+     *  - The loader runs `dec.DisallowUnknownFields()`, so every key in this
+     *    file is a compatibility liability: a core that does not know one
+     *    rejects the whole config, not just that line. The file should say only
+     *    what we mean to differ from the default.
+     *  - Pinning a value the core owns means that when the core retunes it, the
+     *    phone quietly keeps the old number — the exact drift that copying from
+     *    the example config was supposed to prevent.
      */
     fun render(entries: List<Entry>, active: VpnConfig): String {
         require(entries.isNotEmpty()) { "render: empty server pool" }
@@ -269,12 +318,8 @@ object ServerPoolConfig {
         }
 
         sb.append("\n[selection]\n")
-        sb.append("policy = ").append(quote(POLICY)).append('\n')
+        sb.append("policy = ").append(quote(policyFor(active))).append('\n')
         sb.append("family = ").append(quote(familyFor(entries, active))).append('\n')
-        sb.append("failure_threshold = ").append(FAILURE_THRESHOLD).append('\n')
-        sb.append("cooldown = ").append(quote(COOLDOWN)).append('\n')
-        sb.append("max_cooldown = ").append(quote(MAX_COOLDOWN)).append('\n')
-        sb.append("min_dwell = ").append(quote(MIN_DWELL)).append('\n')
         return sb.toString()
     }
 

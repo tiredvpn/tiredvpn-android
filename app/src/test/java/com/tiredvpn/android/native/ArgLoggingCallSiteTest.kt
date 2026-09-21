@@ -130,7 +130,10 @@ class ArgLoggingCallSiteTest {
         assertEquals(
             "a new flag appeared - decide whether it carries a credential, then update this list",
             setOf(
-                "-android", "-c", "-config", "-control-socket", "-cover", "-cover-host", "-debug",
+                // -cover-host left the set with TiredVpnServiceJNI.kt, the
+                // unregistered 438-line service that was the only place still
+                // using the legacy alias. The live paths pass -cover.
+                "-android", "-c", "-config", "-control-socket", "-cover", "-debug",
                 "-ech", "-ech-config", "-ech-public-name", "-fallback", "-fallback-v4", "-listen",
                 "-prefer-ipv6", "-protect-path", "-quic", "-quic-port", "-quic-sni-frag",
                 "-rtt-masking", "-rtt-profile", "-secret", "-server", "-server-v6", "-shaper",

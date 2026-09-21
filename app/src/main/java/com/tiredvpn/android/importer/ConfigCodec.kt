@@ -1,9 +1,13 @@
 package com.tiredvpn.android.importer
 
+import android.net.Uri
 import android.util.Base64
 import com.tiredvpn.android.vpn.VpnConfig
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 
 /**
  * Turns whatever the user pasted, tapped or pushed over adb into servers.
@@ -37,12 +41,31 @@ object ConfigCodec {
     private const val MAX_BASE64_DEPTH = 2
 
     /**
+     * How deep one structure may sit inside another - a JSON array whose
+     * elements are strings holding more JSON. A subscription that wraps each
+     * node in its own blob needs one level; the cap is here so a hand-made
+     * payload cannot walk this parser down a thousand of them.
+     *
+     * Counted separately from [MAX_BASE64_DEPTH] on purpose. One shared budget
+     * meant stepping into an array element spent the allowance for decoding it,
+     * and the perfectly ordinary "base64 -> array -> base64 per element" shape
+     * was rejected.
+     */
+    private const val MAX_STRUCT_DEPTH = 4
+
+    /**
      * A server as it arrived, before it is matched against what is already stored.
      * Split-tunnel rules travel with the server they were exported next to.
+     *
+     * [namedBySender] records whether the payload actually carried a name. Only
+     * the parser can know that: by the time a [VpnConfig] exists the name is
+     * filled in either way, and guessing afterwards which names were invented
+     * here means guessing wrong about whoever named their server "Server".
      */
     data class ParsedServer(
         val config: VpnConfig,
         val splitTunnel: SplitTunnelSpec? = null,
+        val namedBySender: Boolean = false,
     )
 
     data class SplitTunnelSpec(val mode: String, val apps: Set<String>)
@@ -70,11 +93,13 @@ object ConfigCodec {
 
     const val REASON_MALFORMED_LINK = "not a usable tired:// link"
     const val REASON_INCOMPLETE = "server address, port or secret missing"
+    const val REASON_BAD_PORT = "server port is outside 1-65535"
     const val REASON_NOT_AN_OBJECT = "not a server object"
+    const val REASON_TOO_DEEP = "nested too deeply to be a config"
 
     // --- entry point ---
 
-    fun parse(raw: String?): ParseResult = parseAt(raw, depth = 0)
+    fun parse(raw: String?): ParseResult = parseAt(raw, base64Depth = 0, structDepth = 0)
 
     /**
      * Recognise the payload without parsing it. Kept separate so the decision and
@@ -92,18 +117,18 @@ object ConfigCodec {
         return Format.UNKNOWN
     }
 
-    private fun parseAt(raw: String?, depth: Int): ParseResult {
+    private fun parseAt(raw: String?, base64Depth: Int, structDepth: Int): ParseResult {
         val text = raw?.trim().orEmpty()
         if (text.isEmpty()) return ParseResult.nothing()
 
         return when (val format = detect(text)) {
             Format.LINKS -> parseLinks(text)
-            Format.JSON_ARRAY -> parseJsonArray(text, depth)
-            Format.JSON_OBJECT -> parseJsonObject(text, depth)
+            Format.JSON_ARRAY -> parseJsonArray(text, base64Depth, structDepth)
+            Format.JSON_OBJECT -> parseJsonObject(text, base64Depth, structDepth)
             Format.BASE64 -> {
-                if (depth >= MAX_BASE64_DEPTH) return ParseResult.nothing(format)
+                if (base64Depth >= MAX_BASE64_DEPTH) return ParseResult.nothing(format)
                 val decoded = decodeBase64(text) ?: return ParseResult.nothing(format)
-                val inner = parseAt(decoded, depth + 1)
+                val inner = parseAt(decoded, base64Depth + 1, structDepth)
                 // Report the format the user actually handed us, not the inner one:
                 // "base64 that decoded to nothing usable" is the useful message.
                 if (inner.isEmpty) ParseResult.nothing(format) else inner
@@ -123,11 +148,22 @@ object ConfigCodec {
             val config = VpnConfig.fromUrl(link)
             when {
                 config == null -> skipped += Skipped(linkLabel(link, index), REASON_MALFORMED_LINK)
-                !config.isValid -> skipped += Skipped(linkLabel(link, index), REASON_INCOMPLETE)
-                else -> servers += ParsedServer(config)
+                !config.isValid -> skipped += Skipped(linkLabel(link, index), rejection(config))
+                else -> servers += ParsedServer(config, namedBySender = linkCarriesName(link))
             }
         }
         return ParseResult(Format.LINKS, servers, skipped)
+    }
+
+    /**
+     * Did the sender name this server, or did [VpnConfig.fromUrl] fall back to
+     * naming it after its host? Asked of the link, because that is the only
+     * place the answer still exists.
+     */
+    private fun linkCarriesName(link: String): Boolean = try {
+        !Uri.parse(link).getQueryParameter("name").isNullOrBlank()
+    } catch (e: Exception) {
+        false
     }
 
     /** Endpoint only. The secret lives in the query string, which is dropped here. */
@@ -141,17 +177,17 @@ object ConfigCodec {
 
     // --- JSON ---
 
-    private fun parseJsonArray(text: String, depth: Int): ParseResult {
+    private fun parseJsonArray(text: String, base64Depth: Int, structDepth: Int): ParseResult {
         val array = try {
             JSONArray(text)
         } catch (e: Exception) {
             return ParseResult.nothing(Format.JSON_ARRAY)
         }
-        val result = parseArrayElements(array, depth)
+        val result = parseArrayElements(array, base64Depth, structDepth)
         return ParseResult(Format.JSON_ARRAY, result.first, result.second)
     }
 
-    private fun parseJsonObject(text: String, depth: Int): ParseResult {
+    private fun parseJsonObject(text: String, base64Depth: Int, structDepth: Int): ParseResult {
         val obj = try {
             JSONObject(text)
         } catch (e: Exception) {
@@ -161,25 +197,25 @@ object ConfigCodec {
         // An export bundle: {"servers":[...]} — also accepted under "configs".
         for (key in BUNDLE_KEYS) {
             val nested = obj.optJSONArray(key) ?: continue
-            val result = parseArrayElements(nested, depth)
+            val result = parseArrayElements(nested, base64Depth, structDepth)
             return ParseResult(Format.JSON_OBJECT, result.first, result.second)
         }
 
-        val parsed = serverFromJson(obj)
-        return if (parsed == null) {
-            ParseResult(
+        return when (val outcome = objectFromJson(obj)) {
+            is Outcome.Server ->
+                ParseResult(Format.JSON_OBJECT, listOf(outcome.parsed), emptyList())
+            is Outcome.Rejected -> ParseResult(
                 Format.JSON_OBJECT,
                 emptyList(),
-                listOf(Skipped(objectLabel(obj, 0), REASON_INCOMPLETE)),
+                listOf(Skipped(objectLabel(obj, 0), outcome.reason)),
             )
-        } else {
-            ParseResult(Format.JSON_OBJECT, listOf(parsed), emptyList())
         }
     }
 
     private fun parseArrayElements(
         array: JSONArray,
-        depth: Int,
+        base64Depth: Int,
+        structDepth: Int,
     ): Pair<List<ParsedServer>, List<Skipped>> {
         val servers = mutableListOf<ParsedServer>()
         val skipped = mutableListOf<Skipped>()
@@ -187,16 +223,19 @@ object ConfigCodec {
         for (i in 0 until array.length()) {
             when (val element = array.opt(i)) {
                 is JSONObject -> {
-                    val parsed = serverFromJson(element)
-                    if (parsed == null) {
-                        skipped += Skipped(objectLabel(element, i), REASON_INCOMPLETE)
-                    } else {
-                        servers += parsed
+                    when (val outcome = objectFromJson(element)) {
+                        is Outcome.Server -> servers += outcome.parsed
+                        is Outcome.Rejected ->
+                            skipped += Skipped(objectLabel(element, i), outcome.reason)
                     }
                 }
                 // An array of links, or of base64 blobs, is a legal shape too.
                 is String -> {
-                    val inner = parseAt(element, depth + 1)
+                    if (structDepth >= MAX_STRUCT_DEPTH) {
+                        skipped += Skipped("entry #${i + 1}", REASON_TOO_DEEP)
+                        continue
+                    }
+                    val inner = parseAt(element, base64Depth, structDepth + 1)
                     if (inner.servers.isEmpty() && inner.skipped.isEmpty()) {
                         skipped += Skipped("entry #${i + 1}", REASON_MALFORMED_LINK)
                     } else {
@@ -227,11 +266,32 @@ object ConfigCodec {
     private val SERVER_KEYS = listOf("server", "serverAddress", "server_address", "address", "host")
     private val PORT_KEYS = listOf("port", "serverPort", "server_port")
 
+    /** A JSON object that became a server, or the reason it did not. */
+    private sealed interface Outcome {
+        data class Server(val parsed: ParsedServer) : Outcome
+        data class Rejected(val reason: String) : Outcome
+    }
+
+    /**
+     * Why a config that parsed cannot be connected to.
+     *
+     * A port of 70000 is not a missing port: reporting it as "missing" sends the
+     * user looking for a field that is right there in their payload.
+     */
+    private fun rejection(config: VpnConfig): String = when {
+        config.serverAddress.isBlank() || config.secret.isBlank() -> REASON_INCOMPLETE
+        config.serverPort !in 1..65535 -> REASON_BAD_PORT
+        else -> REASON_INCOMPLETE
+    }
+
     /**
      * Build a server from one JSON object, accepting every spelling of every
      * field. Returns null when the result would not be connectable.
      */
-    fun serverFromJson(json: JSONObject): ParsedServer? {
+    fun serverFromJson(json: JSONObject): ParsedServer? =
+        (objectFromJson(json) as? Outcome.Server)?.parsed
+
+    private fun objectFromJson(json: JSONObject): Outcome {
         val config = VpnConfig(
             id = json.firstString(listOf("id"))?.takeIf { it.isNotBlank() }
                 ?: java.util.UUID.randomUUID().toString(),
@@ -289,9 +349,15 @@ object ConfigCodec {
             mtu = json.firstInt(listOf("mtu")) ?: 0,
             customDns = json.firstString(listOf("dns", "customDns", "custom_dns")) ?: "",
         )
-        if (!config.isValid) return null
+        if (!config.isValid) return Outcome.Rejected(rejection(config))
 
-        return ParsedServer(config, splitTunnelFromJson(json))
+        return Outcome.Server(
+            ParsedServer(
+                config,
+                splitTunnelFromJson(json),
+                namedBySender = !json.firstString(listOf("name")).isNullOrBlank(),
+            )
+        )
     }
 
     private fun splitTunnelFromJson(json: JSONObject): SplitTunnelSpec? {
@@ -337,12 +403,31 @@ object ConfigCodec {
             return null
         }
         if (bytes.isEmpty()) return null
-        val printable = bytes.all { b ->
-            val v = b.toInt() and 0xFF
-            v in 0x20..0x7E || v == 0x09 || v == 0x0A || v == 0x0D || v >= 0x80
+        return asText(bytes)
+    }
+
+    /**
+     * The bytes as text, or null if they are not text.
+     *
+     * Decoded, not scanned. The scan this replaces accepted every byte from 0x80
+     * up "because it might be UTF-8", which is most of what random data is made
+     * of: noise carrying a link-shaped run decoded into a config with replacement
+     * characters in it. Control characters are refused as before - nobody pastes
+     * a NUL - with tab, CR and LF allowed because config files have lines.
+     */
+    private fun asText(bytes: ByteArray): String? {
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        val text = try {
+            decoder.decode(ByteBuffer.wrap(bytes)).toString()
+        } catch (e: CharacterCodingException) {
+            return null
         }
-        if (!printable) return null
-        return String(bytes, Charsets.UTF_8)
+        val hasControlChars = text.any {
+            (it.code < 0x20 || it.code == 0x7F) && it != '\t' && it != '\n' && it != '\r'
+        }
+        return if (hasControlChars) null else text
     }
 }
 

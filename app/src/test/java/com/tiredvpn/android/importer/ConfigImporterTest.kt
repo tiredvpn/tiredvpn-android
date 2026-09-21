@@ -36,8 +36,9 @@ class ConfigImporterTest {
     private fun link(host: String, port: Int = 995, secret: String = "k", extra: String = "") =
         "tired://$host:$port?secret=$secret$extra"
 
+    /** The in-app import: started by the user, so it may select what it writes. */
     private fun import(payload: String): ConfigImporter.Result =
-        ConfigImporter.importDirect(context, payload)
+        ConfigImporter.importDirect(context, payload, mayChangeActiveServer = true)
 
     private fun stored(): List<VpnConfig> = ServerRepository.getServers(context)
 
@@ -120,6 +121,61 @@ class ConfigImporterTest {
     }
 
     @Test
+    fun `two entries that differ only in their v6 endpoint are both stored`() {
+        // Keying on the v4 endpoint alone threw the second one away as a
+        // duplicate and reported it as such, which is indistinguishable from
+        // "the sender sent the same server twice".
+        val payload = """[
+            {"server":"pool.example","port":995,"secret":"k1","server_v6":"[2001:db8::1]:995"},
+            {"server":"pool.example","port":995,"secret":"k2","server_v6":"[2001:db8::2]:995"}
+        ]"""
+
+        val result = import(payload)
+
+        assertEquals(2, result.added)
+        assertEquals(2, stored().size)
+        assertEquals(
+            listOf("[2001:db8::1]:995", "[2001:db8::2]:995"),
+            stored().map { it.serverAddressV6 }.sorted(),
+        )
+    }
+
+    @Test
+    fun `an entry that says nothing about v6 updates the stored server that has one`() {
+        // The other half of the decision above: a bare link carries no serverV6
+        // parameter at all. "Says nothing" is not "says none" - re-importing the
+        // short form of a server must not mint a second entry for it.
+        import("""{"server":"n1.example","port":995,"secret":"k","server_v6":"[2001:db8::1]:995"}""")
+
+        val result = import(link("n1.example", secret = "rotated"))
+
+        assertEquals(0, result.added)
+        assertEquals(1, result.updated)
+        assertEquals(1, stored().size)
+    }
+
+    @Test
+    fun `two payload entries claiming the same stored server do not overwrite each other`() {
+        // Both carry the id of a server that is already stored, so both resolve
+        // to the same row. Without an id claim the second write lands on top of
+        // the first and the user is told two servers were updated.
+        import(link("first.example"))
+        val id = stored().single().id
+
+        val result = import(
+            """[
+                {"id":"$id","server":"first.example","port":995,"secret":"k1"},
+                {"id":"$id","server":"second.example","port":996,"secret":"k2"}
+            ]"""
+        )
+
+        assertEquals(1, result.updated)
+        assertEquals(1, result.skipped)
+        assertEquals(1, stored().size)
+        assertEquals("first.example", stored().single().serverAddress)
+    }
+
+    @Test
     fun `the same endpoint twice in one payload is stored once and reported`() {
         val payload = "${link("n1.example")}\n${link("n1.example", secret = "other")}"
 
@@ -184,6 +240,31 @@ class ConfigImporterTest {
         import(link("n1.example", extra = "&name=Rotterdam"))
 
         assertEquals("Rotterdam", stored().single().name)
+    }
+
+    @Test
+    fun `a name the sender chose is taken even when it is the word Server`() {
+        // "Server" is what the codec falls back to when a payload names nothing,
+        // so treating the word itself as "unnamed" silently discards the choice
+        // of anyone who did name a server that.
+        import(link("n1.example"))
+        ServerRepository.saveServer(context, stored().single().copy(name = "Amsterdam"))
+
+        import("""{"server":"n1.example","port":995,"secret":"k","name":"Server"}""")
+
+        assertEquals("Server", stored().single().name)
+    }
+
+    @Test
+    fun `a payload that names nothing keeps the name the user gave`() {
+        // The control for the test above: with no name field at all the stored
+        // name must survive, which is the whole reason the check exists.
+        import(link("n1.example"))
+        ServerRepository.saveServer(context, stored().single().copy(name = "Amsterdam"))
+
+        import("""{"server":"n1.example","port":995,"secret":"rotated"}""")
+
+        assertEquals("Amsterdam", stored().single().name)
     }
 
     @Test

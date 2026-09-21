@@ -97,10 +97,25 @@ class BootReceiver : BroadcastReceiver() {
 
         when (action) {
             Intent.ACTION_LOCKED_BOOT_COMPLETED -> {
-                // Direct Boot - device just booted, user hasn't unlocked yet
-                // Use device-protected storage which is available before unlock
-                FileLogger.i(TAG, "Direct Boot (LOCKED_BOOT_COMPLETED) - before unlock")
-                handleBootEvent(context, isDirectBoot = true)
+                // Direct Boot: the device has booted but the user has not
+                // unlocked, so credential-protected storage is not mounted.
+                //
+                // We deliberately do NOT start the service here. The old code
+                // did, reading its "should the VPN be up" flag from
+                // device-protected storage and then asking ServerRepository for
+                // the profile — which lives in credential-protected storage
+                // behind an EncryptedSharedPreferences whose Keystore key is
+                // not even available before unlock. It saw an empty store and
+                // stopped the service as if the user had configured nothing,
+                // which is indistinguishable in the log from a real
+                // misconfiguration.
+                //
+                // Moving the profile to device-protected storage would fix the
+                // timing by giving up at-rest protection for the one credential
+                // the whole product depends on. Not worth it: ACTION_BOOT_COMPLETED
+                // arrives the moment the user unlocks, and VpnWatchdogWorker
+                // covers the gap.
+                FileLogger.i(TAG, "Direct Boot (LOCKED_BOOT_COMPLETED) - server profile is not readable before unlock, waiting for BOOT_COMPLETED")
             }
 
             Intent.ACTION_BOOT_COMPLETED,
@@ -109,7 +124,7 @@ class BootReceiver : BroadcastReceiver() {
             "android.intent.action.REBOOT" -> {
                 // Normal boot completed - device is unlocked
                 FileLogger.i(TAG, "Boot completed (after unlock) - $action")
-                handleBootEvent(context, isDirectBoot = false)
+                handleBootEvent(context)
             }
 
             Intent.ACTION_MY_PACKAGE_REPLACED -> {
@@ -124,16 +139,10 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun handleBootEvent(context: Context, isDirectBoot: Boolean) {
-        // Get preferences from appropriate storage
-        val prefs = if (isDirectBoot && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            // Use device-protected storage for Direct Boot
-            val deviceContext = context.createDeviceProtectedStorageContext()
-            deviceContext.getSharedPreferences(DEVICE_PREFS_NAME, Context.MODE_PRIVATE)
-        } else {
-            // Use normal credential-protected storage
-            context.getSharedPreferences(CREDENTIAL_PREFS_NAME, Context.MODE_PRIVATE)
-        }
+    private fun handleBootEvent(context: Context) {
+        // Credential-protected storage: reached only after unlock, which is
+        // the only moment the server profile can actually be read.
+        val prefs = context.getSharedPreferences(CREDENTIAL_PREFS_NAME, Context.MODE_PRIVATE)
 
         // Check if user enabled auto-connect on boot (default true for TV devices)
         val connectOnBoot = prefs.getBoolean(KEY_CONNECT_ON_BOOT, true)
@@ -149,24 +158,10 @@ class BootReceiver : BroadcastReceiver() {
 
         FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
 
-        // In Direct Boot mode, we can only start if VPN was already configured
-        // (we can't access credential-protected storage to check config)
-        if (isDirectBoot) {
-            if (!vpnWasConnected) {
-                FileLogger.d(TAG, "Direct Boot: VPN was not connected before, skipping")
-                return
-            }
-            // In Direct Boot, we'll try to start and let the service handle config loading
-            FileLogger.i(TAG, "Direct Boot: VPN was connected, attempting restart")
-        }
-
-        // For normal boot, check if we have valid config
-        if (!isDirectBoot) {
-            val config = ServerRepository.getActiveServer(context)
-            if (config == null || !config.isValid) {
-                FileLogger.d(TAG, "No valid server configured, skipping auto-connect")
-                return
-            }
+        val config = ServerRepository.getActiveServer(context)
+        if (config == null || !config.isValid) {
+            FileLogger.d(TAG, "No valid server configured, skipping auto-connect")
+            return
         }
 
         // Check if VPN permission is already granted
@@ -231,6 +226,16 @@ class BootReceiver : BroadcastReceiver() {
             VpnWatchdogWorker.schedule(context)
 
         } catch (e: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                // BOOT_COMPLETED does carry an FGS allowance, so this is not
+                // expected here - but if it happens, the watchdog is the
+                // fallback and must be armed.
+                FileLogger.w(TAG, "Foreground start refused after boot; arming the watchdog instead")
+                VpnWatchdogWorker.schedule(context)
+                return
+            }
             FileLogger.e(TAG, "Failed to start VPN service", e)
         }
     }
