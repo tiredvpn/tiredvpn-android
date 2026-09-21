@@ -15,7 +15,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
 import com.google.android.material.textfield.TextInputEditText
@@ -34,11 +40,22 @@ class SettingsActivity : BaseActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
 
+    /** Pending "reconnect once the tunnel is really down" after a mode change. */
+    internal var reconnectJob: Job? = null
+
     private val restoreLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let { restoreConfigs(it) } }
 
     companion object {
+
+        /**
+         * A config file is a few kilobytes. Anything past this is not one, and
+         * reading it whole would be the picker's problem becoming ours. Same
+         * ceiling as ImportActivity.
+         */
+        internal const val MAX_RESTORE_BYTES = 1 * 1024 * 1024
+
         // Full canonical strategy list. The stored value (first) is the EXACT
         // strategy ID accepted by the core (ForceStrategy by ID/prefix). Labels
         // are human-readable. "auto" means automatic selection (default).
@@ -492,18 +509,64 @@ class SettingsActivity : BaseActivity() {
         }
     }
 
+    /**
+     * Read the picked file off the main thread and refuse anything that is not
+     * plausibly a config. The document comes from a picker, so it can be a
+     * gigabyte of anything; reading it inline froze the screen for as long as
+     * that took. The ceiling matches the one in ImportActivity.
+     */
     private fun restoreConfigs(uri: Uri) {
-        val text = try {
-            contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
-        } catch (e: Exception) {
-            Toast.makeText(this, "Failed to read file: ${e.message}", Toast.LENGTH_LONG).show()
-            return
+        lifecycleScope.launch {
+            when (val picked = withContext(Dispatchers.IO) { readPickedFile(uri) }) {
+                is PickedFile.TooLarge ->
+                    toast(getString(R.string.restore_too_large, MAX_RESTORE_BYTES / 1024 / 1024))
+                is PickedFile.Unreadable ->
+                    toast(getString(R.string.restore_unreadable, picked.reason))
+                // The picked file goes through the same codec as every other
+                // import, so a backup, a link list and a subscription blob all
+                // restore identically.
+                is PickedFile.Text -> ImportPreview.show(
+                    this@SettingsActivity,
+                    ConfigCodec.parse(picked.value),
+                    fromExternalSource = false
+                )
+            }
         }
-
-        // The picked file goes through the same codec as every other import, so a
-        // backup, a link list and a subscription blob all restore identically.
-        ImportPreview.show(this, ConfigCodec.parse(text), fromExternalSource = false)
     }
+
+    internal sealed interface PickedFile {
+        data class Text(val value: String) : PickedFile
+        data class Unreadable(val reason: String) : PickedFile
+        data object TooLarge : PickedFile
+    }
+
+    /**
+     * Read at most [MAX_RESTORE_BYTES] + 1 bytes, so an enormous document is
+     * recognised as enormous without being held in memory first. Callers run
+     * this off the main thread.
+     */
+    internal fun readPickedFile(uri: Uri): PickedFile = try {
+        contentResolver.openInputStream(uri).use { stream ->
+            if (stream == null) {
+                PickedFile.Unreadable("no such document")
+            } else {
+                val buffer = ByteArray(MAX_RESTORE_BYTES + 1)
+                var read = 0
+                while (read < buffer.size) {
+                    val n = stream.read(buffer, read, buffer.size - read)
+                    if (n < 0) break
+                    read += n
+                }
+                if (read > MAX_RESTORE_BYTES) PickedFile.TooLarge
+                else PickedFile.Text(String(buffer, 0, read, Charsets.UTF_8))
+            }
+        }
+    } catch (e: Exception) {
+        PickedFile.Unreadable(e.message ?: e.javaClass.simpleName)
+    }
+
+    private fun toast(message: String) =
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     private fun showProtocolDialog() {
         val config = ServerRepository.getActiveServer(this) ?: return
@@ -592,7 +655,9 @@ class SettingsActivity : BaseActivity() {
             }
             .setPositiveButton("Custom") { dialog, _ ->
                 val host = hostEditText.text?.toString()?.trim() ?: ""
-                if (host.isNotEmpty()) {
+                if (!InputValidation.isValidHost(host)) {
+                    Toast.makeText(this, R.string.invalid_host, Toast.LENGTH_SHORT).show()
+                } else {
                     val newConfig = config.copy(coverHost = host)
                     ServerRepository.saveServer(this, newConfig)
                     updateAdvancedSettingsDisplay(newConfig)
@@ -628,8 +693,9 @@ class SettingsActivity : BaseActivity() {
         return layout to edit
     }
 
+    /** Same rule as before, from the shared validator (Patterns is deprecated). */
     private fun isValidIpAddress(value: String): Boolean =
-        android.util.Patterns.IP_ADDRESS.matcher(value).matches()
+        InputValidation.isIpv4Literal(value)
 
     private fun showPortHoppingDialog() {
         val config = ServerRepository.getActiveServer(this) ?: return
@@ -801,6 +867,18 @@ class SettingsActivity : BaseActivity() {
                 val echConfig = configEdit.text?.toString()?.trim() ?: ""
                 val publicName = nameEdit.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
                     ?: "cloudflare-ech.com"
+
+                // An ECHConfigList that isn't base64 cannot be decoded by
+                // anything downstream, and the outer SNI has to be a real host.
+                if (echConfig.isNotEmpty() && !InputValidation.isBase64(echConfig)) {
+                    Toast.makeText(this, R.string.invalid_base64, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                if (!InputValidation.isValidHost(publicName)) {
+                    Toast.makeText(this, R.string.invalid_host, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
                 val newConfig = config.copy(
                     echEnabled = enabled,
                     echConfig = echConfig,
@@ -828,7 +906,13 @@ class SettingsActivity : BaseActivity() {
             .setTitle(R.string.server_address_v6)
             .setView(layout)
             .setPositiveButton(R.string.save) { _, _ ->
-                val v6 = hostEdit.text?.toString()?.trim() ?: ""
+                // Stored as typed, this field used to break the connection at
+                // dial time instead of here. Empty stays legal - it means off.
+                val v6 = InputValidation.parseV6Endpoint(hostEdit.text?.toString())
+                if (v6 == null) {
+                    Toast.makeText(this, R.string.invalid_v6_endpoint, Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
                 val newConfig = config.copy(serverAddressV6 = v6)
                 ServerRepository.saveServer(this, newConfig)
                 updateObfuscationDisplay(newConfig)
@@ -918,10 +1002,14 @@ class SettingsActivity : BaseActivity() {
                     return@setSingleChoiceItems
                 }
 
-                // Check if VPN is currently connected
-                val wasConnected = TiredVpnService.state.value is VpnState.Connected
+                // A mode change only means something for a live tunnel, and
+                // Connecting counts: dropping the mode on it without a restart
+                // would leave the core running the mode the user just left.
+                val wasUp = TiredVpnService.state.value.let {
+                    it is VpnState.Connected || it is VpnState.Connecting
+                }
 
-                if (wasConnected) {
+                if (wasUp) {
                     // Disconnect first
                     val stopIntent = Intent(this, TiredVpnService::class.java)
                     stopIntent.action = TiredVpnService.ACTION_DISCONNECT
@@ -933,18 +1021,33 @@ class SettingsActivity : BaseActivity() {
                 ServerRepository.saveServer(this, newConfig)
                 loadSettings()
 
-                if (wasConnected) {
-                    // Reconnect in new mode after a short delay
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        val startIntent = Intent(this, TiredVpnService::class.java)
-                        startIntent.action = TiredVpnService.ACTION_CONNECT
-                        startService(startIntent)
-                    }, 1500)
-                }
+                // Reconnect when the service actually reports Disconnected. The
+                // old 1.5 s timer was a guess: a CONNECT that arrives mid-teardown
+                // is swallowed by the service's own "already connecting" guard,
+                // and the timer fired regardless of whether the screen still
+                // existed.
+                if (wasUp) awaitDisconnectThenConnect()
 
                 dialog.dismiss()
             }
             .show()
+    }
+
+    /**
+     * Wait for the teardown the DISCONNECT above started, then connect again.
+     *
+     * Tied to the Activity's scope on purpose: if the user leaves this screen
+     * the reconnect goes with it, which is the same thing the old timer did by
+     * accident and this does on purpose.
+     */
+    private fun awaitDisconnectThenConnect() {
+        reconnectJob?.cancel()
+        reconnectJob = lifecycleScope.launch {
+            TiredVpnService.state.first { it is VpnState.Disconnected }
+            val startIntent = Intent(this@SettingsActivity, TiredVpnService::class.java)
+            startIntent.action = TiredVpnService.ACTION_CONNECT
+            startService(startIntent)
+        }
     }
 
     private fun showProxyPortDialog() {
@@ -960,12 +1063,27 @@ class SettingsActivity : BaseActivity() {
             .setTitle(R.string.proxy_port)
             .setView(input)
             .setPositiveButton(R.string.save) { _, _ ->
-                val port = input.text.toString().toIntOrNull() ?: 8080
-                if (port in 1024..65535) {
-                    val newConfig = config.copy(proxyPort = port)
-                    ServerRepository.saveServer(this, newConfig)
-                    loadSettings()
+                // Out-of-range used to be dropped without a word, which reads
+                // exactly like "saved" from the other side of the screen.
+                val port = InputValidation.parsePort(
+                    input.text.toString(),
+                    min = InputValidation.MIN_USER_PORT
+                )
+                if (port == null) {
+                    Toast.makeText(
+                        this,
+                        getString(
+                            R.string.invalid_port,
+                            InputValidation.MIN_USER_PORT,
+                            InputValidation.MAX_PORT
+                        ),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@setPositiveButton
                 }
+                val newConfig = config.copy(proxyPort = port)
+                ServerRepository.saveServer(this, newConfig)
+                loadSettings()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()

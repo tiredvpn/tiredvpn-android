@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
+import androidx.core.widget.doOnTextChanged
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -81,6 +82,10 @@ class ServerConfigActivity : BaseActivity() {
         binding.saveButton.setOnClickListener {
             saveConfig()
         }
+
+        // An error marker that survives the correction is worse than none.
+        listOf(binding.serverAddressInput, binding.serverPortInput, binding.secretInput)
+            .forEach { field -> field.doOnTextChanged { _, _, _, _ -> field.error = null } }
 
         binding.importClipboardButton.setOnClickListener {
             importFromClipboard()
@@ -167,20 +172,35 @@ class ServerConfigActivity : BaseActivity() {
     private fun saveConfig() {
         val name = binding.serverNameInput.text?.toString()?.trim() ?: ""
         val serverAddress = binding.serverAddressInput.text?.toString()?.trim() ?: ""
-        val serverPort = binding.serverPortInput.text?.toString()?.toIntOrNull() ?: 993
         val secret = binding.secretInput.text?.toString() ?: ""
 
-        // Validate
+        // Validate. Every bad field is marked, not just the first one, and a
+        // bad port is refused here: it used to become 993 silently, and the
+        // user found out by being bounced back to the server list at connect.
+        var ok = true
+
         if (serverAddress.isEmpty()) {
             binding.serverAddressInput.error = getString(R.string.required)
-            return
+            ok = false
+        }
+
+        val serverPort = InputValidation.parsePort(binding.serverPortInput.text?.toString())
+        if (serverPort == null) {
+            binding.serverPortInput.error = getString(
+                R.string.invalid_port,
+                InputValidation.MIN_PORT,
+                InputValidation.MAX_PORT
+            )
+            ok = false
         }
 
         if (secret.isEmpty()) {
             binding.secretInput.error = getString(R.string.required)
-            return
+            ok = false
         }
-        
+
+        if (!ok || serverPort == null) return
+
         val finalName = if (name.isEmpty()) serverAddress else name
 
         // Load existing config to preserve other settings if editing
