@@ -21,10 +21,28 @@ class ApkInstaller(private val context: Context) {
     }
 
     /**
-     * Install APK file using system installer
+     * Install APK file using system installer.
+     *
+     * Refuses APKs that are not signed by the key the installed app carries —
+     * see [ApkSignatureGuard]. This is the single choke point every install path
+     * goes through, so the check cannot be skipped by calling from elsewhere.
+     *
      * @param apkFile The APK file to install
+     * @return false when the file was rejected and deleted, true when the system
+     *         installer was handed the file. Throws only if starting the
+     *         installer activity fails.
      */
-    fun install(apkFile: File) {
+    fun install(apkFile: File): Boolean {
+        if (!ApkSignatureGuard.verify(context, apkFile)) {
+            Log.e(
+                TAG,
+                "Refusing to install ${apkFile.name}: its signing certificate does not match " +
+                    "the installed app. Deleting it."
+            )
+            apkFile.delete()
+            return false
+        }
+
         try {
             val uri = FileProvider.getUriForFile(
                 context,
@@ -39,6 +57,7 @@ class ApkInstaller(private val context: Context) {
 
             Log.i(TAG, "Starting APK installation: ${apkFile.name}")
             context.startActivity(intent)
+            return true
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start installation", e)
