@@ -2,8 +2,10 @@ package com.tiredvpn.android.importer
 
 import android.util.Base64
 import com.tiredvpn.android.vpn.VpnConfig
+import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -229,6 +231,52 @@ class ConfigCodecTest {
         assertEquals(4, ConfigCodec.parse(payload).servers.size)
     }
 
+    @Test
+    fun `a base64 array of base64 links parses - the budget is per kind, not shared`() {
+        // base64 -> JSON array -> base64 per element is what a subscription that
+        // wraps per-node blobs looks like. One shared counter spent the base64
+        // budget on stepping into the array and rejected the elements.
+        val elements = (1..2).joinToString(",", "[", "]") { "\"${b64(link("n$it.example"))}\"" }
+
+        assertEquals(2, ConfigCodec.parse(b64(elements)).servers.size)
+    }
+
+    @Test
+    fun `base64 nested three deep is still refused`() {
+        // The guard on the fix above: separating the counters must not turn the
+        // base64 budget into no budget.
+        assertTrue(ConfigCodec.parse(b64(b64(b64(link("a.example"))))).servers.isEmpty())
+    }
+
+    @Test
+    fun `a JSON array nested absurdly deep is refused rather than followed`() {
+        var payload = link("a.example")
+        repeat(6) { payload = JSONArray(listOf(payload)).toString() }
+
+        assertTrue(ConfigCodec.parse(payload).servers.isEmpty())
+    }
+
+    @Test
+    fun `base64 of bytes that are not text is refused`() {
+        // 0xFF and 0xFE cannot appear in UTF-8 at all. Waving through every byte
+        // above 0x7F let random data that happened to contain a link-shaped run
+        // decode into a "config".
+        val bytes = link("a.example").toByteArray() + byteArrayOf(0xFF.toByte(), 0xFE.toByte())
+
+        val parsed = ConfigCodec.parse(Base64.encodeToString(bytes, Base64.NO_WRAP))
+
+        assertTrue(parsed.servers.isEmpty())
+    }
+
+    @Test
+    fun `base64 of a config with a non-ASCII name still decodes`() {
+        // The control: refusing non-text must not mean refusing text that is not
+        // ASCII. A name in Cyrillic is several bytes above 0x7F, legally.
+        val payload = b64("""{"server":"a.example","port":995,"secret":"k","name":"Амстердам"}""")
+
+        assertEquals("Амстердам", ConfigCodec.parse(payload).servers.single().config.name)
+    }
+
     // --- nothing usable ---
 
     @Test
@@ -253,6 +301,24 @@ class ConfigCodecTest {
         val parsed = ConfigCodec.parse("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5")
 
         assertTrue(parsed.servers.isEmpty())
+    }
+
+    @Test
+    fun `a port outside the legal range is reported as a bad value, not a missing field`() {
+        // The field is right there in the payload; telling the user it is
+        // missing sends them looking for the wrong thing.
+        val parsed = ConfigCodec.parse("""{"server":"a.example","port":70000,"secret":"k"}""")
+
+        val reason = parsed.skipped.single().reason
+        assertNotEquals(ConfigCodec.REASON_INCOMPLETE, reason)
+        assertTrue("the reason should name the port, was: $reason", reason.contains("port"))
+    }
+
+    @Test
+    fun `a missing secret is still reported as incomplete`() {
+        val parsed = ConfigCodec.parse("""{"server":"a.example","port":995}""")
+
+        assertEquals(ConfigCodec.REASON_INCOMPLETE, parsed.skipped.single().reason)
     }
 
     @Test

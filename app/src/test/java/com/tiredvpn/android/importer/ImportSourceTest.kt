@@ -191,6 +191,30 @@ class ImportSourceTest {
     }
 
     @Test
+    fun `a picked file over the size cap is refused`() {
+        // fromFile has had this cap since it was written; the picker path read
+        // whatever the provider chose to hand over, and a content uri need not
+        // report a length at all.
+        val uri = Uri.parse("content://test/huge.json")
+        val body = "x".repeat((ImportSource.MAX_FILE_BYTES + 1).toInt())
+        shadowOf(context.contentResolver).registerInputStream(uri, body.byteInputStream())
+
+        assertNull(ImportSource.fromUri(context.contentResolver, uri))
+    }
+
+    @Test
+    fun `a picked file at the size cap is still read`() {
+        val uri = Uri.parse("content://test/big.json")
+        val body = "x".repeat(ImportSource.MAX_FILE_BYTES.toInt())
+        shadowOf(context.contentResolver).registerInputStream(uri, body.byteInputStream())
+
+        assertEquals(
+            ImportSource.MAX_FILE_BYTES.toInt(),
+            ImportSource.fromUri(context.contentResolver, uri)?.length,
+        )
+    }
+
+    @Test
     fun `an unreadable uri is refused rather than crashing`() {
         assertNull(ImportSource.fromUri(context.contentResolver, Uri.parse("content://test/gone")))
     }

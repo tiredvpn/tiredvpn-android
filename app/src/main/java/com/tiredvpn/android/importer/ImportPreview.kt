@@ -44,7 +44,14 @@ object ImportPreview {
             .setTitle(R.string.import_title)
             .setMessage(planMessage(activity, plan, fromExternalSource))
             .setPositiveButton(R.string.restore_import) { _, _ ->
-                val result = ConfigImporter.apply(activity, plan)
+                // An import the user started inside the app may select what it
+                // wrote; one that arrived from outside may not take over a
+                // server the user already picked.
+                val result = ConfigImporter.apply(
+                    activity,
+                    plan,
+                    mayChangeActiveServer = !fromExternalSource,
+                )
                 Toast.makeText(activity, summary(activity, result), Toast.LENGTH_LONG).show()
                 onDone(result)
             }
