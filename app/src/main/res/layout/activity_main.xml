@@ -135,53 +135,6 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Connection Info (visible when connected) -->
-    <LinearLayout
-        android:id="@+id/connectionInfo"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginHorizontal="24dp"
-        android:layout_marginBottom="16dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:padding="16dp"
-        android:visibility="gone"
-        app:layout_constraintBottom_toTopOf="@id/serverSelector"
-        tools:visibility="visible">
-
-        <ImageView
-            android:layout_width="24dp"
-            android:layout_height="24dp"
-            android:src="@drawable/ic_public"
-            app:tint="@color/primary"
-            android:contentDescription="@null" />
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="16dp"
-            android:orientation="vertical">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/your_new_ip"
-                android:textColor="@color/text_hint"
-                android:textSize="12sp" />
-
-            <TextView
-                android:id="@+id/ipAddressText"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="192.168.1.1"
-                android:textColor="@color/text_primary_dark"
-                android:textSize="14sp"
-                android:textStyle="bold" />
-
-        </LinearLayout>
-
-    </LinearLayout>
-
     <!-- Server Selector Card -->
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/serverSelector"

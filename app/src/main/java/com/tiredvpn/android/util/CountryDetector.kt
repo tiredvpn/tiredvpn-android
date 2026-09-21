@@ -2,7 +2,9 @@ package com.tiredvpn.android.util
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
@@ -19,6 +21,62 @@ object CountryDetector {
         val name: String,      // Full name (e.g., "United States")
         val flag: String       // Emoji flag (e.g., "🇺🇸")
     )
+
+    /** How long a successful lookup is reused. Server locations don't move. */
+    internal const val SUCCESS_TTL_MS = 6L * 60 * 60 * 1000
+
+    /**
+     * How long a failure is remembered. Short, because a failure is usually a
+     * dead network rather than a property of the address - but not zero, or a
+     * list of unreachable servers fires one request per row per repaint.
+     */
+    internal const val FAILURE_TTL_MS = 5L * 60 * 1000
+
+    private const val CACHE_MAX_ENTRIES = 128
+    private const val HTTP_TIMEOUT_MS = 5000
+    private const val RESOLVE_TIMEOUT_MS = 5000L
+
+    /** Test seams: a fake clock and a fake network, so tests never dial out. */
+    internal var clock: () -> Long = System::currentTimeMillis
+    internal var lookup: suspend (String) -> CountryInfo? = { address -> lookupRemote(address) }
+
+    internal fun resetTestSeams() {
+        clock = System::currentTimeMillis
+        lookup = { address -> lookupRemote(address) }
+        clearCache()
+    }
+
+    private class Entry(val info: CountryInfo?, val storedAt: Long)
+
+    /** address -> last answer. Access only under its own lock. */
+    private val cache = object : LinkedHashMap<String, Entry>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Entry>): Boolean =
+            size > CACHE_MAX_ENTRIES
+    }
+
+    internal fun clearCache() = synchronized(cache) { cache.clear() }
+
+    private fun peek(address: String): Entry? = synchronized(cache) {
+        val entry = cache[address] ?: return null
+        val ttl = if (entry.info != null) SUCCESS_TTL_MS else FAILURE_TTL_MS
+        if (clock() - entry.storedAt > ttl) {
+            cache.remove(address)
+            return null
+        }
+        entry
+    }
+
+    private fun store(address: String, info: CountryInfo?) = synchronized(cache) {
+        cache[address] = Entry(info, clock())
+        Unit
+    }
+
+    /**
+     * The answer already in hand for [serverAddress], or null when nothing was
+     * looked up yet (or the last lookup failed). Lets a list row paint its flag
+     * without starting a coroutine on every rebind.
+     */
+    fun cached(serverAddress: String): CountryInfo? = peek(serverAddress)?.info
 
     // Convert ISO 3166-1 alpha-2 country code to emoji flag
     fun countryCodeToFlag(countryCode: String): String {
@@ -92,15 +150,18 @@ object CountryDetector {
         )
 
         for ((url, parser) in apis) {
+            // disconnect() belongs in finally: a throw inside readText() used to
+            // leave the socket open until the finalizer got to it.
+            var connection: HttpURLConnection? = null
             try {
                 Log.d(TAG, "Trying API: $url")
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 5000  // 5 sec
-                connection.readTimeout = 5000
-                connection.requestMethod = "GET"
+                connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = HTTP_TIMEOUT_MS
+                    readTimeout = HTTP_TIMEOUT_MS
+                    requestMethod = "GET"
+                }
 
                 val response = connection.inputStream.bufferedReader().use { it.readText() }
-                connection.disconnect()
 
                 Log.d(TAG, "Response: $response")
                 val result = parser(response)
@@ -110,6 +171,8 @@ object CountryDetector {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "API failed: $url - ${e.message}")
+            } finally {
+                connection?.disconnect()
             }
         }
 
@@ -146,38 +209,61 @@ object CountryDetector {
     /**
      * Resolve hostname to IP and detect country
      */
-    suspend fun detectCountryFromHost(host: String): CountryInfo? = withContext(Dispatchers.IO) {
-        try {
-            Log.d(TAG, "Resolving hostname: $host")
-            val ip = InetAddress.getByName(host).hostAddress ?: return@withContext null
-            Log.d(TAG, "Resolved to IP: $ip")
-            detectCountryFromIP(ip)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to resolve $host: ${e.message}")
-            null
-        }
+    suspend fun detectCountryFromHost(host: String): CountryInfo? {
+        val ip = resolveHost(host) ?: return null
+        Log.d(TAG, "Resolved to IP: $ip")
+        return detectCountryFromIP(ip)
     }
 
     /**
+     * InetAddress.getByName() has no timeout of its own and ignores interrupts
+     * on most Android resolvers, so a dead DNS server used to pin the calling
+     * coroutine forever - including one started per visible list row. The
+     * timeout doesn't stop the resolver thread, it stops us waiting on it.
+     */
+    private suspend fun resolveHost(host: String): String? =
+        withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+            runInterruptible(Dispatchers.IO) {
+                try {
+                    Log.d(TAG, "Resolving hostname: $host")
+                    InetAddress.getByName(host).hostAddress
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to resolve $host: ${e.message}")
+                    null
+                }
+            }
+        }
+
+    /**
      * Try to detect country from server address (IP or hostname)
-     * Falls back to showing the server address if detection fails
+     * Falls back to showing the server address if detection fails.
+     *
+     * Answers are cached per address: the callers are list rows that rebind on
+     * every repaint, and geolocation of a server address is about as stable as
+     * facts get.
      */
     suspend fun detectCountry(serverAddress: String): CountryInfo {
-        Log.d(TAG, "detectCountry: $serverAddress")
+        peek(serverAddress)?.let { return it.info ?: fallbackFor(serverAddress) }
 
+        Log.d(TAG, "detectCountry: $serverAddress")
+        val result = lookup(serverAddress)
+        store(serverAddress, result)
+        return result ?: fallbackFor(serverAddress)
+    }
+
+    private suspend fun lookupRemote(serverAddress: String): CountryInfo? {
         // Check if it's already an IP
         val isIP = serverAddress.matches(Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$"))
-
-        val result = if (isIP) {
+        return if (isIP) {
             detectCountryFromIP(serverAddress)
         } else {
             detectCountryFromHost(serverAddress)
         }
-
-        return result ?: CountryInfo(
-            code = "XX",
-            name = serverAddress,  // Show server address as fallback
-            flag = "🌐"
-        )
     }
+
+    private fun fallbackFor(serverAddress: String) = CountryInfo(
+        code = "XX",
+        name = serverAddress,  // Show server address as fallback
+        flag = "🌐"
+    )
 }

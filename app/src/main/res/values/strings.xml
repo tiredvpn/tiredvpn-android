@@ -245,4 +245,18 @@
     <string name="import_clipboard_nothing">Clipboard has no tired:// link or config</string>
     <string name="pool_active">Fails over to %1$d other server(s)</string>
     <string name="pool_alone">No failover: this is the only configured server</string>
+
+    <!-- Form validation -->
+    <string name="invalid_port">Port must be between %1$d and %2$d</string>
+    <string name="invalid_host">Enter a host name, for example www.google.com</string>
+    <string name="invalid_base64">Must be base64</string>
+    <string name="invalid_v6_endpoint">Use host:port or [IPv6]:port</string>
+
+    <string name="restore_too_large">That file is larger than %1$d MB, so it is not a config</string>
+    <string name="restore_unreadable">Could not read the file: %1$s</string>
+
+    <!-- Log privacy -->
+    <string name="logs_privacy_title">The log names your servers</string>
+    <string name="logs_copy_privacy_message">It holds the addresses of your servers and the output of the core. On Android 9 and older any app running in the background can read the clipboard. Copy it anyway?</string>
+    <string name="logs_share_privacy_message">It holds the addresses of your servers and the output of the core. Send it only where you would send the server addresses themselves.</string>
 </resources>

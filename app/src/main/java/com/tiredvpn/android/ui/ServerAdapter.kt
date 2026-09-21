@@ -10,9 +10,8 @@ import com.tiredvpn.android.databinding.ItemServerLocationBinding
 import com.tiredvpn.android.util.CountryDetector
 import com.tiredvpn.android.vpn.VpnConfig
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class ServerAdapter(
     private var servers: List<VpnConfig>,
@@ -21,6 +20,11 @@ class ServerAdapter(
     private val onServerClick: (VpnConfig) -> Unit,
     private val onServerLongClick: (VpnConfig) -> Unit
 ) : RecyclerView.Adapter<ServerAdapter.ServerViewHolder>() {
+
+    companion object {
+        /** Shown while the country of a freshly seen address is unknown. */
+        const val UNKNOWN_FLAG = "🌐"
+    }
 
     /**
      * Ids of the servers the core may switch between, active one included.
@@ -50,23 +54,45 @@ class ServerAdapter(
 
     override fun getItemCount() = servers.size
 
-    inner class ServerViewHolder(private val binding: ItemServerLocationBinding) : 
+    override fun onViewRecycled(holder: ServerViewHolder) {
+        holder.flagJob?.cancel()
+        holder.flagJob = null
+        holder.boundAddress = null
+    }
+
+    inner class ServerViewHolder(private val binding: ItemServerLocationBinding) :
         RecyclerView.ViewHolder(binding.root) {
-        
+
+        /** Address this holder currently shows; a finished lookup checks it. */
+        internal var boundAddress: String? = null
+        internal var flagJob: Job? = null
+
         fun bind(server: VpnConfig) {
             binding.serverName.text = server.name.ifEmpty { server.serverAddress }
+            boundAddress = server.serverAddress
 
             bindPoolLabel(server)
 
-            // Detect country and set flag
-            scope.launch {
-                val countryInfo = CountryDetector.detectCountry(server.serverAddress)
-                // Ensure UI update on main thread
-                withContext(Dispatchers.Main) {
-                    binding.flagImage.text = countryInfo.flag
+            // Country flag. A cached answer paints straight away - which is the
+            // normal case, since notifyDataSetChanged() rebinds every visible row
+            // after each finished ping. Only a cold address starts a coroutine,
+            // and that coroutine checks the row hasn't been recycled under it
+            // (same shape as the icon loader in SplitTunnelingActivity).
+            flagJob?.cancel()
+            flagJob = null
+            val cached = CountryDetector.cached(server.serverAddress)
+            if (cached != null) {
+                binding.flagImage.text = cached.flag
+            } else {
+                binding.flagImage.text = UNKNOWN_FLAG
+                flagJob = scope.launch {
+                    val countryInfo = CountryDetector.detectCountry(server.serverAddress)
+                    if (boundAddress == server.serverAddress) {
+                        binding.flagImage.text = countryInfo.flag
+                    }
                 }
             }
-            
+
             // Set latency text and color
             val latency = server.lastLatencyMs
             if (latency > 0) {

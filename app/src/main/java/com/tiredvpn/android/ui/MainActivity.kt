@@ -42,28 +42,36 @@ import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnConfig
 import com.tiredvpn.android.vpn.VpnState
 import com.tiredvpn.android.vpn.ServerRepository
+import com.tiredvpn.android.util.BatteryOptimizationHelper
 import com.tiredvpn.android.util.CountryDetector
 import com.tiredvpn.android.util.TvUtils
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.net.URL
 
 @OptIn(UnstableApi::class)
 class MainActivity : BaseActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+
+        /** Set by the update notification; consumed once, in onCreate. */
+        internal const val EXTRA_INSTALL_UPDATE = "install_update"
+
+        private const val STATE_PENDING_UPDATE = "pending_update"
     }
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var updateManager: UpdateManager
-    private var ipFetchJob: Job? = null
     private var countryFetchJob: Job? = null
     private var pendingForceUpdate: UpdateConfig? = null
+
+    /** An already-downloaded APK waiting only for the install permission. */
+    private var pendingInstallDownloaded = false
+
+    /** Held so a rotation can dismiss it instead of leaking the window. */
+    private var progressDialog: AlertDialog? = null
 
     // Current connection phase published by the service, plus the ticker that
     // animates it (rotating "Phase." / "Phase.." / "Phase…") while connecting.
@@ -106,18 +114,23 @@ class MainActivity : BaseActivity() {
     private val installPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { _ ->
-        // Check if permission was granted and retry update
+        // Check if permission was granted and resume whatever asked for it.
+        // There are two askers: an update we offered to download (which leaves
+        // pendingForceUpdate set) and a tap on the "update downloaded"
+        // notification, where the APK is already on disk and nothing is
+        // pending - that second path used to end here doing nothing at all.
         if (updateManager.canInstall()) {
-            pendingForceUpdate?.let { config ->
-                lifecycleScope.launch {
-                    updateManager.downloadAndInstall(config)
-                }
+            val pending = pendingForceUpdate
+            when {
+                pending != null -> startUpdate(pending)
+                pendingInstallDownloaded -> installDownloadedUpdate()
             }
         } else if (pendingForceUpdate?.forceUpdate == true) {
             // Force update required but permission denied - close app
             Toast.makeText(this, "Update required to continue", Toast.LENGTH_LONG).show()
             finish()
         }
+        pendingInstallDownloaded = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -142,8 +155,14 @@ class MainActivity : BaseActivity() {
         updateServerInfo()
         setupTvMode()
 
-        // Check if launched from update notification
-        if (intent?.getBooleanExtra("install_update", false) == true) {
+        pendingForceUpdate = savedInstanceState?.let { readUpdateConfig(it) }
+
+        // Check if launched from update notification. The extra is consumed on
+        // the way in: it lives on the Activity's Intent, which is handed back
+        // on every recreation, so leaving it there restarts the install after
+        // each rotation.
+        if (intent?.getBooleanExtra(EXTRA_INSTALL_UPDATE, false) == true) {
+            intent.removeExtra(EXTRA_INSTALL_UPDATE)
             installDownloadedUpdate()
         } else {
             checkForUpdates()
@@ -154,10 +173,17 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    /**
+     * Ask once a day at most, not once per onCreate.
+     *
+     * A user who says no is asked again on the next rotation, the next return
+     * from settings, every cold start - which is how a reasonable request turns
+     * into something people learn to dismiss. BatteryOptimizationHelper already
+     * keeps the "asked at" timestamp; it just wasn't being called.
+     */
     private fun requestBatteryOptimizationExemption() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            if (BatteryOptimizationHelper.shouldPromptForExemption(this)) {
                 // Request exemption - this shows a system dialog
                 try {
                     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -205,6 +231,9 @@ class MainActivity : BaseActivity() {
     }
 
     override fun onDestroy() {
+        // A dialog still attached to a dying window is a WindowLeaked in the
+        // log and a frozen screen for the user on the way back.
+        dismissProgressDialog()
         mascotPlayer?.release()
         mascotPlayer = null
         super.onDestroy()
@@ -313,9 +342,6 @@ class MainActivity : BaseActivity() {
             when (currentState) {
                 is VpnState.Disconnected, is VpnState.Error -> {
                     Log.d(TAG, "Action: Calling connect()")
-                    // Immediate visual feedback so the tap always feels responsive,
-                    // without waiting for the (possibly lagging) global state.
-                    showConnectingFeedback()
                     connect()
                 }
                 is VpnState.Connected, is VpnState.Connecting -> {
@@ -398,7 +424,6 @@ class MainActivity : BaseActivity() {
                 binding.statusHint.visibility = View.VISIBLE
                 binding.connectButton.setIconTintResource(R.color.text_primary_dark)
                 binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
-                binding.connectionInfo.visibility = View.GONE
                 // Update mascot to sleeping/disconnected
                 stopMascotVideo()
                 binding.mascotImage.setImageResource(R.drawable.sloth_disconnected)
@@ -413,7 +438,6 @@ class MainActivity : BaseActivity() {
                 binding.statusHint.visibility = View.INVISIBLE
                 binding.connectButton.setIconTintResource(R.color.connecting)
                 binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
-                binding.connectionInfo.visibility = View.GONE
             }
             is VpnState.Connected -> {
                 binding.statusText.text = getString(R.string.connected)
@@ -429,7 +453,6 @@ class MainActivity : BaseActivity() {
                 val hintParts = listOf(latencyText, strategyText).filter { it.isNotEmpty() }
                 binding.statusHint.text = hintParts.joinToString(" • ")
                 binding.statusHint.visibility = View.VISIBLE
-                binding.connectionInfo.visibility = View.GONE
             }
             is VpnState.Error -> {
                 stopMascotVideo()
@@ -438,7 +461,6 @@ class MainActivity : BaseActivity() {
                 binding.statusHint.visibility = View.VISIBLE
                 binding.connectButton.setIconTintResource(R.color.error)
                 binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
-                binding.connectionInfo.visibility = View.GONE
 
                 // Ошибка видна в statusHint, отдельный диалог не нужен
             }
@@ -497,6 +519,13 @@ class MainActivity : BaseActivity() {
     }
 
     private fun startVpnService() {
+        // Paint the connecting look here and nowhere earlier. connect() has
+        // three ways to end without starting anything - no server configured,
+        // VPN consent refused, "another VPN is active" dismissed - and the
+        // service state is a StateFlow that stays Disconnected in all three,
+        // so a button painted before the checks stayed "Connecting" forever.
+        showConnectingFeedback()
+
         val intent = Intent(this, TiredVpnService::class.java).apply {
             action = TiredVpnService.ACTION_CONNECT
         }
@@ -528,7 +557,6 @@ class MainActivity : BaseActivity() {
         binding.statusHint.visibility = View.INVISIBLE
         binding.connectButton.setIconTintResource(R.color.connecting)
         binding.connectButton.setBackgroundColor(ContextCompat.getColor(this, R.color.button_background))
-        binding.connectionInfo.visibility = View.GONE
     }
 
     /**
@@ -543,48 +571,6 @@ class MainActivity : BaseActivity() {
         }
         startService(intent)
         Toast.makeText(this, getString(R.string.force_reset_toast), Toast.LENGTH_SHORT).show()
-    }
-
-    private fun fetchExternalIP() {
-        // Cancel any existing job
-        ipFetchJob?.cancel()
-
-        // Show loading state
-        binding.ipAddressText.text = "Fetching..."
-
-        ipFetchJob = lifecycleScope.launch {
-            val ip = withContext(Dispatchers.IO) {
-                try {
-                    // Try multiple IP services for reliability
-                    val services = listOf(
-                        "https://api.ipify.org",
-                        "https://icanhazip.com",
-                        "https://checkip.amazonaws.com"
-                    )
-
-                    for (service in services) {
-                        try {
-                            val result = URL(service).readText().trim()
-                            if (result.isNotEmpty() && result.matches(Regex("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"))) {
-                                return@withContext result
-                            }
-                        } catch (e: Exception) {
-                            // Try next service
-                        }
-                    }
-                    null
-                } catch (e: Exception) {
-                    null
-                }
-            }
-
-            // Update UI on main thread
-            if (ip != null) {
-                binding.ipAddressText.text = ip
-            } else {
-                binding.ipAddressText.text = "Unknown"
-            }
-        }
     }
 
     private fun checkForUpdates() {
@@ -603,8 +589,9 @@ class MainActivity : BaseActivity() {
 
         if (apk != null && apk.exists()) {
             if (!updateManager.canInstall()) {
-                // Request permission first
+                // Request permission first, and remember what to come back to.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    pendingInstallDownloaded = true
                     val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
                         data = Uri.parse("package:$packageName")
                     }
@@ -656,8 +643,13 @@ class MainActivity : BaseActivity() {
             return
         }
 
+        // Keep the config across a recreation: the dialog below is not
+        // cancelable, so a rotation mid-download used to lose both the window
+        // and any idea of what was being downloaded.
+        pendingForceUpdate = config
+
         // Show progress dialog
-        val progressDialog = AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Загрузка обновления")
             .setView(ProgressBar(this).apply {
                 isIndeterminate = false
@@ -665,13 +657,14 @@ class MainActivity : BaseActivity() {
             })
             .setCancelable(false)
             .create()
-        progressDialog.show()
+        dialog.show()
+        progressDialog = dialog
 
         lifecycleScope.launch {
             val result = updateManager.downloadAndInstall(config) { progress ->
-                progressDialog.findViewById<ProgressBar>(android.R.id.progress)?.progress = progress
+                dialog.findViewById<ProgressBar>(android.R.id.progress)?.progress = progress
             }
-            progressDialog.dismiss()
+            dismissProgressDialog()
 
             when (result) {
                 is com.tiredvpn.android.update.UpdateResult.DownloadFailed -> {
@@ -683,9 +676,51 @@ class MainActivity : BaseActivity() {
                 is com.tiredvpn.android.update.UpdateResult.Error -> {
                     Toast.makeText(this@MainActivity, result.message, Toast.LENGTH_LONG).show()
                 }
-                else -> { /* Installing or NoUpdate */ }
+                else -> {
+                    /* Installing or NoUpdate - nothing left to come back to. */
+                    pendingForceUpdate = null
+                }
             }
         }
+    }
+
+    private fun dismissProgressDialog() {
+        progressDialog?.takeIf { it.isShowing }?.dismiss()
+        progressDialog = null
+    }
+
+    /**
+     * pendingForceUpdate is plain state, and the download that sets it runs in
+     * lifecycleScope - so a rotation kills the download and, without this,
+     * forgets what it was. Saved by hand because UpdateConfig is a plain data
+     * class in a package this screen doesn't own.
+     */
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingForceUpdate?.let { config ->
+            outState.putBundle(STATE_PENDING_UPDATE, Bundle().apply {
+                putInt("versionCode", config.versionCode)
+                putString("versionName", config.versionName)
+                putString("apkUrl", config.apkUrl)
+                putString("sha256", config.sha256)
+                putString("releaseNotes", config.releaseNotes)
+                putInt("minAndroidSdk", config.minAndroidSdk)
+                putBoolean("forceUpdate", config.forceUpdate)
+            })
+        }
+    }
+
+    private fun readUpdateConfig(state: Bundle): UpdateConfig? {
+        val saved = state.getBundle(STATE_PENDING_UPDATE) ?: return null
+        return UpdateConfig(
+            versionCode = saved.getInt("versionCode"),
+            versionName = saved.getString("versionName").orEmpty(),
+            apkUrl = saved.getString("apkUrl").orEmpty(),
+            sha256 = saved.getString("sha256").orEmpty(),
+            releaseNotes = saved.getString("releaseNotes").orEmpty(),
+            minAndroidSdk = saved.getInt("minAndroidSdk"),
+            forceUpdate = saved.getBoolean("forceUpdate")
+        )
     }
 
     @Deprecated("Deprecated in Java")
