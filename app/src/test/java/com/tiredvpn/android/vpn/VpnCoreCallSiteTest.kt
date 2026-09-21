@@ -804,10 +804,10 @@ class VpnCoreCallSiteTest {
         val entryPoints = listOf(
             "fun getServers(context: Context): List<VpnConfig> = synchronized(lock) {",
             "fun getActiveServer(context: Context): VpnConfig? = synchronized(lock) {",
-            "fun saveServer(context: Context, config: VpnConfig) = synchronized(lock) {",
-            "fun deleteServer(context: Context, id: String) = synchronized(lock) {",
+            "fun saveServer(context: Context, config: VpnConfig): Boolean = synchronized(lock) {",
+            "fun deleteServer(context: Context, id: String): Boolean = synchronized(lock) {",
             "fun updateLatency(context: Context, id: String, latencyMs: Long): Boolean = synchronized(lock) {",
-            "fun setActiveServerId(context: Context, id: String) = synchronized(lock) {",
+            "fun setActiveServerId(context: Context, id: String): Boolean = synchronized(lock) {",
         )
         for (header in entryPoints) {
             assertTrue(
@@ -1151,10 +1151,59 @@ class VpnCoreCallSiteTest {
             "the only wait must be bounded",
             owned.contains("fun awaitHandover(timeoutMs: Long): Boolean") && owned.contains("awaitNanos(remaining)")
         )
+    }
+
+    /**
+     * "Authoritative" is about generations, not about other teardowns.
+     *
+     * Once somebody has called `takeForTeardown`, `owner` is NOBODY because
+     * *they* took it — and a forced reset that reads that emptiness as "free"
+     * runs the global `stop()` and `cleanup()` alongside the teardown already
+     * doing exactly that. [CoreOwnership.takeForReset] answers null for it, and
+     * null has to mean stop, not "default to NOBODY and carry on".
+     */
+    @Test
+    fun `a reset stands aside when another teardown owns the core`() {
+        val body = bodyAfter(source("TiredVpnService.kt"), "private inline fun withCoreReset(teardown: () -> Unit) {")
+
+        assertTrue("scanner cannot see the helper", body.contains("coreOwnership.takeForReset()"))
+        assertFalse(
+            "an elvis here turns 'somebody else owns it' back into 'nobody owns it'",
+            Regex("""takeForReset\(\)\s*\?:""").containsMatchIn(body)
+        )
+        val bail = body.indexOf("return")
+        val run = body.indexOf("teardown()")
+        assertTrue("there is no early return at all", bail >= 0)
+        assertTrue("the null case must stop before the teardown runs", bail < run)
+        assertTrue("and the null case is what it checks", body.contains("if (taken == null)"))
+    }
+
+    /**
+     * What happens when the wait expires, which is the part that was wrong.
+     *
+     * A timeout does not cancel the wedged teardown, it only stops waiting for
+     * it — so starting a core anyway hands the same one to two owners, and the
+     * old teardown comes back to run `cleanup()`, `stopProtectServer()` and the
+     * `control.sock` unlink over the new attempt's resources. `stopClient()`
+     * has a five-second ceiling of its own, so a teardown still inside it after
+     * seven is a native thread the JVM cannot reclaim: the same fault
+     * [armConnectWatchdog] already answers by ending the process.
+     */
+    @Test
+    fun `a handover that times out ends the process instead of starting a second core`() {
+        val body = bodyAfter(source("TiredVpnService.kt"), "private fun awaitCoreHandover(generation: Int) {")
+        val onTimeout = body.substringAfter("if (!coreOwnership.awaitHandover(coreHandoverTimeoutMs)) {")
+            .substringBefore("coreOwnership.claim(generation)")
+
+        assertTrue("the process must end", onTimeout.contains("android.os.Process.killProcess(android.os.Process.myPid())"))
+        assertTrue("the user must be told", onTimeout.contains("VpnState.Error("))
+        assertFalse(
+            "claiming ownership on the way out is starting anyway by another name",
+            onTimeout.contains("coreOwnership.claim(")
+        )
         assertTrue(
-            "and the caller must proceed on timeout rather than wait again",
-            bodyAfter(source("TiredVpnService.kt"), "private fun awaitCoreHandover(generation: Int) {")
-                .contains("starting anyway")
+            "the claim must be reachable only when the handover succeeded",
+            body.indexOf("coreOwnership.claim(generation)") > body.indexOf("killProcess")
         )
     }
 

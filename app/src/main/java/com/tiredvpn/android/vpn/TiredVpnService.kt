@@ -918,9 +918,20 @@ class TiredVpnService : VpnService() {
     /**
      * The same, for a teardown that answers to no generation: a user-initiated
      * disconnect and the authoritative reset stop whatever is running.
+     *
+     * "Authoritative" does not mean "regardless of who else is in there".
+     * [CoreOwnership.takeForReset] returns null while another teardown holds
+     * the core, and then this does nothing global — that teardown is already
+     * running the same `stop()` and `cleanup()`, and a second pass over one Go
+     * core is the fault the ownership model exists to prevent. Everything else
+     * on the disconnect path still runs; only the process-wide block is skipped.
      */
     private inline fun withCoreReset(teardown: () -> Unit) {
         val taken = coreOwnership.takeForReset()
+        if (taken == null) {
+            FileLogger.w(TAG, "withCoreReset: another teardown owns the core, leaving the core to it")
+            return
+        }
         try {
             teardown()
         } finally {
@@ -931,13 +942,49 @@ class TiredVpnService : VpnService() {
     /**
      * Wait for a teardown in flight to hand the core over, then take ownership.
      *
-     * Called on the connect path before anything process-wide is created. The
-     * wait is bounded; on expiry we start anyway, which is exactly what this
-     * code did before the handover existed.
+     * Called on the connect path before anything process-wide is created.
+     *
+     * On expiry this does **not** start anyway. It used to, and that put the
+     * ownership model back where it started: the wedged teardown is not
+     * cancelled by the timeout, it is merely no longer waited for — so it comes
+     * back at its leisure and runs `cleanup()`, `stopProtectServer()` and the
+     * `control.sock` unlink over resources the new attempt has since created.
+     * A timeout that hands the same core to two owners is worse than no
+     * timeout.
+     *
+     * What it does instead is what [armConnectWatchdog] already does for the
+     * same class of fault, and for the same reason: `stopClient()` has a
+     * five-second ceiling of its own (a select with `time.After` in
+     * jni_android.go), so a teardown still running after seven is a native
+     * thread the JVM cannot reclaim. The process is not in a state anything
+     * should be built on top of. So: say so in the log, tell the UI, and end
+     * the process so the system or the user starts one that is clean — the
+     * watchdog, the boot receiver and a tap on Connect all bring it back, and
+     * the persistent flags are untouched because this is not a user stop.
      */
     private fun awaitCoreHandover(generation: Int) {
         if (!coreOwnership.awaitHandover(coreHandoverTimeoutMs)) {
-            FileLogger.e(TAG, "=== CORE HANDOVER TIMED OUT === previous owner still stopping after ${coreHandoverTimeoutMs}ms, starting anyway")
+            FileLogger.e(
+                TAG,
+                "=== CORE HANDOVER TIMED OUT === the previous teardown has been inside stopClient() for " +
+                    "${coreHandoverTimeoutMs}ms, past its own 5s ceiling: a native thread is wedged and the " +
+                    "JVM cannot reclaim it. Refusing to start a second core on top of it; killing the process " +
+                    "so the system or the user can relaunch cleanly."
+            )
+            Log.e(TAG, "CORE HANDOVER TIMED OUT: killing process to release a wedged native thread")
+
+            clearPhase()
+            _state.value = VpnState.Error(getString(R.string.error_core_wedged))
+            try { updateNotification(getString(R.string.error_core_wedged)) } catch (_: Exception) {}
+
+            // Best-effort: give FileLogger's writer thread (flushes every
+            // ~100ms) one cycle to persist the lines above, and the state flow
+            // one to reach a bound UI, before the process dies.
+            try { Thread.sleep(200) } catch (_: InterruptedException) {}
+            android.os.Process.killProcess(android.os.Process.myPid())
+            // Unreachable in practice; keeps the contract explicit for anyone
+            // reading this as "and then it carries on".
+            throw IllegalStateException("core handover timed out; process is going down")
         }
         coreOwnership.claim(generation)
         FileLogger.d(TAG, "Core ownership claimed by generation $generation")

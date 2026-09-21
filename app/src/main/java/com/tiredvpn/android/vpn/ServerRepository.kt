@@ -61,6 +61,16 @@ object ServerRepository {
     private const val KEY_DEGRADED_DELETED = "degraded_deleted_ids"
     private const val KEY_DEGRADED_ACTIVE = "degraded_active_id_chosen"
 
+    /**
+     * Sticky: the journal was found unreadable at least once.
+     *
+     * Kept separate from the sets it describes because it has to survive the
+     * thing that damaged them. While it stands, the fold refuses — we know
+     * something was changed under a failed Keystore and cannot say what, and
+     * guessing costs a server profile.
+     */
+    private const val KEY_DEGRADED_JOURNAL_DAMAGED = "degraded_journal_damaged"
+
     // Legacy prefs for migration
     private const val LEGACY_PREFS_NAME = "tiredvpn_config"
 
@@ -165,7 +175,12 @@ object ServerRepository {
     fun getServer(context: Context, id: String): VpnConfig? =
         getServers(context).find { it.id == id }
 
-    fun saveServer(context: Context, config: VpnConfig) = synchronized(lock) {
+    /**
+     * @return false when the store refused the write. The caller is the only
+     *         one that can tell the user; this used to return Unit and log, so
+     *         a failed save looked exactly like a successful one on screen.
+     */
+    fun saveServer(context: Context, config: VpnConfig): Boolean = synchronized(lock) {
         reconcileStoresLocked(context)
         saveServerLocked(context, config)
     }
@@ -190,11 +205,14 @@ object ServerRepository {
             FileLogger.d(TAG, "updateLatency: nothing to write for $id")
             return false
         }
+        // false here means "nothing was written", which is what the caller
+        // asked about — whether because nothing changed or because the store
+        // refused it.
         saveServersLocked(context, updated)
-        true
     }
 
-    fun deleteServer(context: Context, id: String) = synchronized(lock) {
+    /** @return false when the store refused the write; the server is still there. */
+    fun deleteServer(context: Context, id: String): Boolean = synchronized(lock) {
         reconcileStoresLocked(context)
         val servers = loadServersLocked(context).servers.toMutableList()
         val wasActive = activeServerIdLocked(context) == id
@@ -207,7 +225,7 @@ object ServerRepository {
         // the store was degraded. Split across two writes, a crash in between
         // leaves the server gone from plaintext with nothing saying so, and the
         // fold brings it back from the encrypted copy.
-        saveServersLocked(context, servers) { editor ->
+        return saveServersLocked(context, servers) { editor ->
             if (wasActive) {
                 if (nextActive != null) editor.putString(KEY_ACTIVE_SERVER_ID, nextActive)
                 else editor.remove(KEY_ACTIVE_SERVER_ID)
@@ -228,14 +246,15 @@ object ServerRepository {
         }
     }
 
-    fun setActiveServerId(context: Context, id: String) = synchronized(lock) {
+    /** @return false when the store refused the write; the choice did not land. */
+    fun setActiveServerId(context: Context, id: String): Boolean = synchronized(lock) {
         reconcileStoresLocked(context)
         // The choice and the note that it was made while degraded, together.
         val editor = getPrefs(context).edit().putString(KEY_ACTIVE_SERVER_ID, id)
         markActiveChoice(editor)
-        if (!editor.commit()) {
-            FileLogger.e(TAG, "=== ACTIVE SERVER WRITE FAILED === the store refused the transaction")
-        }
+        if (editor.commit()) return@synchronized true
+        FileLogger.e(TAG, "=== ACTIVE SERVER WRITE FAILED === the store refused the transaction")
+        false
     }
 
     // --- internals, all called with [lock] held ---
@@ -293,7 +312,7 @@ object ServerRepository {
         return result
     }
 
-    private fun saveServerLocked(context: Context, config: VpnConfig) {
+    private fun saveServerLocked(context: Context, config: VpnConfig): Boolean {
         val servers = loadServersLocked(context).servers.toMutableList()
         val index = servers.indexOfFirst { it.id == config.id }
         if (index >= 0) {
@@ -307,7 +326,7 @@ object ServerRepository {
         val adoptAsActive =
             if (servers.size == 1 || activeServerIdLocked(context) == null) config.id else null
 
-        saveServersLocked(context, servers) { editor ->
+        return saveServersLocked(context, servers) { editor ->
             if (adoptAsActive != null) editor.putString(KEY_ACTIVE_SERVER_ID, adoptAsActive)
             // Saved after a delete: it exists again, and the delete is history.
             markServerChanged(context, editor, dirty = config.id, undeleted = config.id)
@@ -331,14 +350,14 @@ object ServerRepository {
         context: Context,
         servers: List<VpnConfig>,
         also: (SharedPreferences.Editor) -> Unit = {},
-    ) {
+    ): Boolean {
         val jsonArray = JSONArray()
         servers.forEach { jsonArray.put(it.toJson()) }
         val editor = getPrefs(context).edit().putString(KEY_SERVERS, jsonArray.toString())
         also(editor)
-        if (!editor.commit()) {
-            FileLogger.e(TAG, "=== SERVER LIST WRITE FAILED === the store refused the transaction")
-        }
+        if (editor.commit()) return true
+        FileLogger.e(TAG, "=== SERVER LIST WRITE FAILED === the store refused the transaction")
+        return false
     }
 
     // --- what changed while the Keystore was down ---
@@ -370,15 +389,35 @@ object ServerRepository {
     ) {
         if (!isStorageDegraded) return
         val plain = plainPrefs(context)
-        val dirtyIds = readJournalSet(plain, KEY_DEGRADED_DIRTY).toMutableSet()
-        val deletedIds = readJournalSet(plain, KEY_DEGRADED_DELETED).toMutableSet()
 
-        if (dirty != null) { dirtyIds.add(dirty); deletedIds.remove(dirty) }
-        if (deleted != null) { deletedIds.add(deleted); dirtyIds.remove(deleted) }
-        if (undeleted != null) deletedIds.remove(undeleted)
+        // A damaged journal is not an empty one. Overwriting it with a fresh
+        // set is how the marks of an earlier degraded spell disappeared: the
+        // fold had refused because it could not read them, the Keystore went
+        // down again, one save later the unreadable value was replaced by a
+        // tidy set containing only that save, and every profile changed during
+        // the first spell now looked untouched — and lost its conflict against
+        // the encrypted copy.
+        //
+        // So the unreadable value is left exactly as it is, and the damage is
+        // recorded instead. [StoreReconciliation] refuses while that flag
+        // stands, which is the honest answer: something changed here and we
+        // cannot say what.
+        val dirtyIds = readJournalSetOrNull(plain, KEY_DEGRADED_DIRTY)
+        val deletedIds = readJournalSetOrNull(plain, KEY_DEGRADED_DELETED)
+        if (dirtyIds == null || deletedIds == null) {
+            FileLogger.e(TAG, "=== NOT REWRITING A DAMAGED JOURNAL === the marks of an earlier degraded spell are unreadable; recording the damage and leaving them alone")
+            editor.putBoolean(KEY_DEGRADED_JOURNAL_DAMAGED, true)
+            return
+        }
 
-        editor.putStringSet(KEY_DEGRADED_DIRTY, dirtyIds)
-            .putStringSet(KEY_DEGRADED_DELETED, deletedIds)
+        val nextDirty = dirtyIds.toMutableSet()
+        val nextDeleted = deletedIds.toMutableSet()
+        if (dirty != null) { nextDirty.add(dirty); nextDeleted.remove(dirty) }
+        if (deleted != null) { nextDeleted.add(deleted); nextDirty.remove(deleted) }
+        if (undeleted != null) nextDeleted.remove(undeleted)
+
+        editor.putStringSet(KEY_DEGRADED_DIRTY, nextDirty)
+            .putStringSet(KEY_DEGRADED_DELETED, nextDeleted)
     }
 
     /**
@@ -409,10 +448,6 @@ object ServerRepository {
             FileLogger.e(TAG, "=== DEGRADED-MODE JOURNAL IS DAMAGED === $key is not a set of ids", e)
             null
         }
-
-    /** The same, for the write paths, where an unreadable set starts over. */
-    private fun readJournalSet(prefs: SharedPreferences, key: String): Set<String> =
-        readJournalSetOrNull(prefs, key) ?: emptySet()
 
     private fun activeServerIdLocked(context: Context): String? =
         getPrefs(context).getString(KEY_ACTIVE_SERVER_ID, null)
@@ -462,6 +497,17 @@ object ServerRepository {
         // The journal decides which side of a conflict wins, so an unreadable
         // one is not "no marks" — it is not knowing, and the fold must not
         // guess. Read before anything is written and refuse on damage.
+        //
+        // The flag is checked first and is sticky: damage found once stands
+        // until something can say what was changed. Without it the refusal was
+        // only as durable as the damaged value itself, and the next degraded
+        // spell replaced that value with a tidy set — after which the marks of
+        // the spell before it were simply gone.
+        val previouslyDamaged = try {
+            plain.getBoolean(KEY_DEGRADED_JOURNAL_DAMAGED, false)
+        } catch (e: ClassCastException) {
+            true
+        }
         val dirtyIds = readJournalSetOrNull(plain, KEY_DEGRADED_DIRTY)
         val deletedIds = readJournalSetOrNull(plain, KEY_DEGRADED_DELETED)
         val activeChosen = try {
@@ -470,8 +516,12 @@ object ServerRepository {
             FileLogger.e(TAG, "=== DEGRADED-MODE JOURNAL IS DAMAGED === $KEY_DEGRADED_ACTIVE is not a flag", e)
             null
         }
-        if (dirtyIds == null || deletedIds == null || activeChosen == null) {
+        if (previouslyDamaged || dirtyIds == null || deletedIds == null || activeChosen == null) {
             FileLogger.e(TAG, "=== NOT MIGRATING THE PLAINTEXT SERVER LIST === the degraded-mode journal is unreadable; both copies are kept for recovery")
+            // Record it, so the refusal survives the value that caused it.
+            if (!previouslyDamaged) {
+                plain.edit().putBoolean(KEY_DEGRADED_JOURNAL_DAMAGED, true).apply()
+            }
             return
         }
 

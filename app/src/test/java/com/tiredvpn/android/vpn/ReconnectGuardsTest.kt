@@ -264,9 +264,54 @@ class ReconnectGuardsTest {
         assertEquals(CoreOwnership.NOBODY, core.currentOwner)
         core.finishTeardown(9)
 
-        assertEquals("an empty slot yields NOBODY", CoreOwnership.NOBODY, core.takeForReset())
+        assertEquals("an idle slot yields NOBODY", CoreOwnership.NOBODY, core.takeForReset())
         core.finishTeardown(CoreOwnership.NOBODY)
         assertFalse("and must not leave the slot marked busy", core.isTearingDown)
+    }
+
+    /**
+     * An empty slot is two situations, and collapsing them is how a forced
+     * reset ran the global `stop()` and `cleanup()` alongside a teardown
+     * already doing exactly that. Once somebody has taken the core, `owner` is
+     * NOBODY because *they* took it — the emptiness is theirs.
+     */
+    @Test
+    fun `a reset during someone else's teardown takes nothing`() {
+        val core = CoreOwnership()
+        core.claim(1)
+        assertTrue(core.takeForTeardown(1))
+
+        assertNull(
+            "NOBODY with a teardown in flight means 'busy', not 'free'",
+            core.takeForReset()
+        )
+        assertTrue("and the other teardown must keep the slot", core.isTearingDown)
+
+        core.finishTeardown(1)
+        assertEquals("once it is over, a reset may take the idle slot", CoreOwnership.NOBODY, core.takeForReset())
+    }
+
+    @Test
+    fun `a reset cannot steal a core somebody is stopping, however many try`() {
+        repeat(200) { round ->
+            val core = CoreOwnership()
+            core.claim(1)
+            core.takeForTeardown(1)
+
+            val stolen = AtomicInteger(0)
+            val start = CountDownLatch(1)
+            val threads = (1..8).map {
+                Thread {
+                    start.await()
+                    if (core.takeForReset() != null) stolen.incrementAndGet()
+                }
+            }
+            threads.forEach { it.start() }
+            start.countDown()
+            threads.forEach { it.join() }
+
+            assertEquals("round $round: a reset joined a teardown in flight", 0, stolen.get())
+        }
     }
 
     @Test

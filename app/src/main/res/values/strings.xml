@@ -260,6 +260,9 @@
     <string name="logs_copy_privacy_message">It holds the addresses of your servers and the output of the core. On Android 9 and older any app running in the background can read the clipboard. Copy it anyway?</string>
     <string name="logs_share_privacy_message">It holds the addresses of your servers and the output of the core. Send it only where you would send the server addresses themselves.</string>
 
+    <!-- Shown when the VPN core is wedged and the app restarts itself -->
+    <string name="error_core_wedged">The VPN core stopped responding. Restarting the app.</string>
+
     <!-- Update download notification -->
     <string name="update_download_title">Downloading update</string>
     <string name="update_download_channel">Update downloads</string>

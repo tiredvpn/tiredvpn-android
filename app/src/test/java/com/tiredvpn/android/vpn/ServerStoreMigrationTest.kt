@@ -306,6 +306,58 @@ class ServerStoreMigrationTest {
         assertEquals(array(record("ams")), plain.getString(keyServers, null))
     }
 
+    /**
+     * The refusal has to outlive the value that caused it.
+     *
+     * Sequence that lost data: the fold refuses because the journal is
+     * unreadable and leaves plaintext alone; the Keystore fails again; one save
+     * later the unreadable value has been replaced by a tidy set naming only
+     * that save; and every profile changed during the first spell now looks
+     * untouched and loses its conflict against the encrypted copy. So a damaged
+     * journal is never rewritten — the damage is recorded instead.
+     */
+    @Test
+    fun `a damaged journal is not rewritten by the next degraded write`() {
+        val ams = VpnConfig(name = "AMS", serverAddress = "ams.example", serverPort = 995, secret = "rotated")
+        plain.edit()
+            .putString(keyServers, """[${ams.toJson()}]""")
+            .putString("degraded_dirty_ids", "not a set at all")
+            .commit()
+
+        // A later degraded-mode save, through the repository's own writer.
+        val dxb = VpnConfig(name = "DXB", serverAddress = "dxb.example", serverPort = 995, secret = "k2")
+        ServerRepository.saveServer(context, dxb)
+
+        assertEquals(
+            "the unreadable marks must still be there, not replaced by a set naming only the new save",
+            "not a set at all",
+            plain.getString("degraded_dirty_ids", null)
+        )
+        assertTrue(
+            "and the damage must be recorded so the refusal survives it",
+            plain.getBoolean("degraded_journal_damaged", false)
+        )
+    }
+
+    @Test
+    fun `a recorded damage flag keeps the fold refusing even when the sets read fine`() {
+        encrypted.edit().putString(keyServers, array(record("ams", name = "live"))).commit()
+        plain.edit()
+            .putString(keyServers, array(record("ams", name = "degraded")))
+            .putStringSet("degraded_dirty_ids", mutableSetOf("ams"))
+            .putStringSet("degraded_deleted_ids", mutableSetOf())
+            .putBoolean("degraded_journal_damaged", true)
+            .commit()
+
+        fold()
+
+        assertTrue(
+            "readable sets after recorded damage describe only what came after it",
+            encrypted.getString(keyServers, null)!!.contains("live")
+        )
+        assertTrue("and neither copy is destroyed", plain.contains(keyServers))
+    }
+
     @Test
     fun `a contradictory journal stops the fold and destroys nothing`() {
         encrypted.edit().putString(keyServers, array(record("ams"), record("dxb"))).commit()

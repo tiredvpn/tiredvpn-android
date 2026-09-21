@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -168,6 +169,65 @@ class StoreTransactionTest {
         val write = payloadWrites().single()
         assertTrue("the adoption must ride along with the list: $write", activeId in write)
         assertTrue(dirty in write)
+    }
+
+    // --- a refused write is not a saved one --------------------------------
+
+    /**
+     * A store that takes every write and commits none of them.
+     *
+     * Every builder method returns `this` and not the delegate's editor. That
+     * is not a detail: `by` delegation forwards `putString` to the inner editor,
+     * which returns *itself*, so a chain like `edit().putString(…)` hands back
+     * the inner editor and the overridden `commit()` is never reached. The first
+     * version of this double did exactly that and reported the production code
+     * as broken.
+     */
+    private inner class RefusingContext(base: Context) : ContextWrapper(base) {
+        override fun getSharedPreferences(name: String, mode: Int): SharedPreferences {
+            val real = baseContext.getSharedPreferences(name, mode)
+            return object : SharedPreferences by real {
+                override fun edit(): SharedPreferences.Editor = RefusingEditor(real.edit())
+            }
+        }
+    }
+
+    private inner class RefusingEditor(
+        private val inner: SharedPreferences.Editor,
+    ) : SharedPreferences.Editor {
+        override fun putString(key: String, value: String?) = apply { inner.putString(key, value) }
+        override fun putStringSet(key: String, values: MutableSet<String>?) = apply { inner.putStringSet(key, values) }
+        override fun putInt(key: String, value: Int) = apply { inner.putInt(key, value) }
+        override fun putLong(key: String, value: Long) = apply { inner.putLong(key, value) }
+        override fun putFloat(key: String, value: Float) = apply { inner.putFloat(key, value) }
+        override fun putBoolean(key: String, value: Boolean) = apply { inner.putBoolean(key, value) }
+        override fun remove(key: String) = apply { inner.remove(key) }
+        override fun clear() = apply { inner.clear() }
+        override fun commit(): Boolean = false
+        override fun apply() = Unit
+    }
+
+    /**
+     * The caller is the only one that can tell the user. These used to return
+     * Unit and write a line to a log file nobody has open, so a refused save
+     * looked exactly like a successful one on screen.
+     */
+    @Test
+    fun `a refused write is reported to the caller`() {
+        val refusing = RefusingContext(RuntimeEnvironment.getApplication())
+        val ams = server("AMS")
+
+        assertFalse("saveServer must not claim success", ServerRepository.saveServer(refusing, ams))
+        assertFalse("deleteServer must not claim success", ServerRepository.deleteServer(refusing, ams.id))
+        assertFalse("setActiveServerId must not claim success", ServerRepository.setActiveServerId(refusing, ams.id))
+    }
+
+    @Test
+    fun `a write that lands is reported as landed`() {
+        val ams = server("AMS")
+        assertTrue(ServerRepository.saveServer(context, ams))
+        assertTrue(ServerRepository.setActiveServerId(context, ams.id))
+        assertTrue(ServerRepository.deleteServer(context, ams.id))
     }
 
     /**

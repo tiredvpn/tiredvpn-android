@@ -187,11 +187,23 @@ internal class CoreOwnership {
      * Take whatever is in the slot, for the authoritative reset that answers
      * to no generation — a user-initiated disconnect, a forced reset.
      *
-     * @return the generation taken, or [NOBODY] when the slot was empty.
-     *         Either way the caller must pass it to [finishTeardown].
+     * An empty slot is two different situations and they must not be confused.
+     * `owner == NOBODY` with nothing tearing down means the core is not running
+     * and the caller's idempotent cleanup is harmless. `owner == NOBODY` while
+     * `tearingDown` holds a generation means somebody has *already taken* the
+     * core and is inside its stop — the emptiness is theirs, not an invitation.
+     * Returning NOBODY for both is what let a forced reset call the global
+     * `stop()` and `cleanup()` alongside a teardown already doing exactly that.
+     *
+     * @return the generation taken, [NOBODY] when the slot was genuinely idle,
+     *         or null when another teardown owns it. Null means do nothing
+     *         global: the other teardown is already stopping the same core, and
+     *         doing it twice is the fault this class exists to prevent. The
+     *         caller must pass a non-null result to [finishTeardown].
      */
-    fun takeForReset(): Int {
+    fun takeForReset(): Int? {
         lock.withLock {
+            if (tearingDown != NOBODY) return null
             val taken = owner
             owner = NOBODY
             if (taken != NOBODY) tearingDown = taken
