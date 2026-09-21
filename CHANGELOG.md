@@ -63,10 +63,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Bundled core updated to 1.11.3, which also brings: an endpoint the client
+- Bundled core updated to 1.11.4, which also brings: an endpoint the client
   knows is unreachable is skipped rather than waited on, the connection pool
   honours its own limits and its idle timeout, and the cover-domain order no
-  longer repeats per client.
+  longer repeats per client. 1.11.4 itself is two Android-only fixes: the
+  authenticated REALITY data layer is now required here as it already was on
+  every other client - the Android config is built as a literal that bypassed
+  the flag defaults, so the phone was the one platform still accepting the
+  malleable older layer - and a dead native command channel stopped answering
+  "ok" to anything asked of it.
 
 ## [1.10.0] - 2026-09-21
 
