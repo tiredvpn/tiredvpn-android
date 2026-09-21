@@ -20,12 +20,29 @@ class NativeProcessJNI(
 ) : TiredVpnProcess, TiredVpnNative.NativeCallback {
     companion object {
         private const val TAG = "NativeProcessJNI"
+
+        /**
+         * Exit code for "there is no core to run on this device": the .so is
+         * missing for this ABI, or its exports no longer match the `external
+         * fun` declarations. Retrying cannot help, so the service must not
+         * treat it as a transient failure.
+         */
+        const val EXIT_NO_NATIVE_LIBRARY = 127
     }
 
+    @Volatile
     private var isStarted = false
     private val onExitCalled = AtomicBoolean(false)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * True from a successful [start] until the core reports that it left.
+     *
+     * Honest about its limits: the core runs in this process, so this says
+     * "started and has not announced an exit", not "the tunnel works". A
+     * wedged goroutine or a looping handshake leaves it true. The service pairs
+     * it with its own control-channel liveness check.
+     */
     override val isRunning: Boolean
         get() = isStarted
 
@@ -35,10 +52,30 @@ class NativeProcessJNI(
             return
         }
 
+        if (!TiredVpnNative.isAvailable) {
+            // Degrade to a reportable error instead of dying on the first
+            // external call: UnsatisfiedLinkError is an Error, so the
+            // catch (e: Exception) below would let it take the process down.
+            // Null-safe on purpose: this is the degradation path, and it must
+            // not itself throw. Build.SUPPORTED_ABIS is a platform type.
+            val abi = Build.SUPPORTED_ABIS?.firstOrNull() ?: "unknown"
+            FileLogger.e(TAG, "Native core library is not available (abi=$abi)")
+            onError("Native core library missing for this device (abi=$abi)")
+            if (onExitCalled.compareAndSet(false, true)) onExit(EXIT_NO_NATIVE_LIBRARY)
+            return
+        }
+
         try {
             FileLogger.i(TAG, "=== STARTING NATIVE PROCESS (JNI MODE) ===")
             FileLogger.i(TAG, "Command: ${NativeArgs.redact(args)}")
             FileLogger.i(TAG, "Android ${Build.VERSION.SDK_INT} - Using JNI to avoid PhantomProcess kill")
+
+            // Drain any core left over from a previous attempt BEFORE claiming
+            // the callback. startClient() cancels the old client without
+            // waiting for its goroutine, so its terminal state change would
+            // otherwise be delivered to us and mark this instance dead. See
+            // TiredVpnNative.reset.
+            TiredVpnNative.reset()
 
             // Initialize JNI with this callback
             TiredVpnNative.initialize(this)
@@ -65,9 +102,16 @@ class NativeProcessJNI(
             isStarted = true
             FileLogger.i(TAG, "JNI client started successfully")
 
+        } catch (e: LinkageError) {
+            // The .so loaded but an export is missing or its signature drifted
+            // from the declarations in TiredVpnNative. An Error, so it walks
+            // straight past catch (e: Exception) and kills the app.
+            FileLogger.e(TAG, "JNI boundary mismatch: ${e.message}")
+            onError("Native core is incompatible with this build: ${e.message}")
+            if (onExitCalled.compareAndSet(false, true)) onExit(EXIT_NO_NATIVE_LIBRARY)
         } catch (e: Exception) {
             FileLogger.e(TAG, "Failed to start JNI process", e)
-            onExit(1)
+            if (onExitCalled.compareAndSet(false, true)) onExit(1)
         }
     }
 
@@ -82,6 +126,10 @@ class NativeProcessJNI(
             TiredVpnNative.stop()
             isStarted = false
             if (onExitCalled.compareAndSet(false, true)) onExit(0)
+        } catch (e: LinkageError) {
+            FileLogger.e(TAG, "JNI boundary mismatch while stopping: ${e.message}")
+            isStarted = false
+            if (onExitCalled.compareAndSet(false, true)) onExit(EXIT_NO_NATIVE_LIBRARY)
         } catch (e: Exception) {
             FileLogger.e(TAG, "Error stopping JNI process", e)
         }
@@ -126,12 +174,36 @@ class NativeProcessJNI(
                 } catch (e: Exception) {
                     onError("Error: $jsonData")
                 }
+                // Terminal, exactly like "disconnected": the Go side sends
+                // this from the deferred tail of the client goroutine (and
+                // from its recover()), so by the time it arrives the core has
+                // stopped. Leaving isStarted true here is what made every
+                // liveness check in the service report a running core after it
+                // had died — watchdog, health check, network-change handler
+                // and the two connect waits all read this one flag.
+                markExited(1)
             }
             "disconnected" -> {
-                isStarted = false
-                if (onExitCalled.compareAndSet(false, true)) onExit(0)
+                markExited(0)
             }
         }
+    }
+
+    /**
+     * Record that the core has gone, once.
+     *
+     * The `isStarted` guard also filters cross-talk: a superseded core's
+     * terminal callback can still be in flight when a new instance registers
+     * itself, and acting on it would mark a freshly started core dead.
+     * [TiredVpnNative.reset] closes the common case; this closes the rest.
+     */
+    private fun markExited(code: Int) {
+        if (!isStarted) {
+            FileLogger.w(TAG, "Ignoring terminal state for a core this instance never started (code=$code)")
+            return
+        }
+        isStarted = false
+        if (onExitCalled.compareAndSet(false, true)) onExit(code)
     }
 
     override fun onLogMessage(message: String) {

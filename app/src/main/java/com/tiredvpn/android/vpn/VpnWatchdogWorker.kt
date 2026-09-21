@@ -181,9 +181,13 @@ class VpnWatchdogWorker(
             FileLogger.i(TAG, "=== WATCHDOG RESTARTING VPN ===")
             FileLogger.i(TAG, "State: $currentState, Network: available, Config: valid")
 
-            restartVpn()
-
-            return Result.success()
+            // Result.retry() and not success: on Android 12+ a background
+            // process is not allowed to start a foreground service, so this is
+            // the normal outcome rather than an exotic one. The old code caught
+            // the exception inside restartVpn and returned success anyway, so
+            // the watchdog looked healthy in every log while never once
+            // restarting the tunnel.
+            return if (restartVpn()) Result.success() else Result.retry()
 
         } catch (e: Exception) {
             FileLogger.e(TAG, "Watchdog check failed", e)
@@ -205,7 +209,16 @@ class VpnWatchdogWorker(
         }
     }
 
-    private fun restartVpn() {
+    /**
+     * Ask the service to connect.
+     *
+     * @return true when the start was accepted. False means the system refused
+     *         it — most often the Android 12+ ban on starting a foreground
+     *         service from the background, which this worker cannot lift from
+     *         here. Reporting it honestly is what lets [doWork] ask for a retry
+     *         instead of declaring success over a tunnel that is still down.
+     */
+    private fun restartVpn(): Boolean {
         try {
             val serviceIntent = Intent(applicationContext, TiredVpnService::class.java).apply {
                 action = TiredVpnService.ACTION_CONNECT
@@ -218,8 +231,18 @@ class VpnWatchdogWorker(
             }
 
             FileLogger.i(TAG, "VPN restart initiated by watchdog")
+            return true
         } catch (e: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                FileLogger.w(TAG, "=== WATCHDOG BLOCKED === Android ${Build.VERSION.SDK_INT} refuses a background " +
+                    "foreground-service start; the tunnel stays down until the user opens the app or an " +
+                    "allowance-bearing event arrives")
+                return false
+            }
             FileLogger.e(TAG, "Failed to restart VPN", e)
+            return false
         }
     }
 }

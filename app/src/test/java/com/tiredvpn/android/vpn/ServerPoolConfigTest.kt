@@ -22,7 +22,8 @@ class ServerPoolConfigTest {
         secret: String = "shared-secret",
         addressV6: String = "",
         preferIpv6: Boolean = false,
-        fallbackV4: Boolean = true
+        fallbackV4: Boolean = true,
+        policy: String = ServerPoolConfig.DEFAULT_POLICY
     ) = VpnConfig(
         id = id,
         name = name,
@@ -31,8 +32,74 @@ class ServerPoolConfigTest {
         secret = secret,
         serverAddressV6 = addressV6,
         preferIpv6 = preferIpv6,
-        fallbackV4 = fallbackV4
+        fallbackV4 = fallbackV4,
+        serverSelectionPolicy = policy
     )
+
+    // --- selection policy ---
+
+    /**
+     * The clamp is not tidiness. `toml.Selection.Resolve` returns an error for
+     * an unknown policy, `applyClientTOMLConfig` passes it up and the client
+     * refuses to start — so a typo in a profile would turn into "the VPN does
+     * not connect at all", with the reason buried in a core log line.
+     */
+    @Test
+    fun `an unknown policy is replaced rather than written through`() {
+        assertEquals("priority", ServerPoolConfig.policyFor(server("a", policy = "fastest")))
+        assertEquals("priority", ServerPoolConfig.policyFor(server("a", policy = "")))
+        assertEquals("priority", ServerPoolConfig.policyFor(server("a", policy = "   ")))
+    }
+
+    @Test
+    fun `every policy the core accepts is passed through`() {
+        for (policy in ServerPoolConfig.KNOWN_POLICIES) {
+            assertEquals(policy, ServerPoolConfig.policyFor(server("a", policy = policy)))
+        }
+        assertEquals(
+            setOf("priority", "latency", "weighted"),
+            ServerPoolConfig.KNOWN_POLICIES
+        )
+    }
+
+    @Test
+    fun `a policy is normalised before it is matched`() {
+        assertEquals("latency", ServerPoolConfig.policyFor(server("a", policy = " Latency ")))
+        assertEquals("weighted", ServerPoolConfig.policyFor(server("a", policy = "WEIGHTED")))
+    }
+
+    @Test
+    fun `the profile's policy reaches the generated file`() {
+        val a = server("a", policy = "latency")
+        val b = server("b", address = "198.51.100.2", secret = "b-key")
+        val toml = ServerPoolConfig.render(
+            ServerPoolConfig.entries(ServerPoolConfig.selectPool(listOf(a, b), a)),
+            a
+        )
+        assertTrue(toml.contains("""policy = "latency""""))
+    }
+
+    /**
+     * failure_threshold / cooldown / max_cooldown / min_dwell are gone: they
+     * were byte-identical to the core's own defaults, and the TOML loader runs
+     * DisallowUnknownFields, so every key written here is a key a future core
+     * could reject.
+     */
+    @Test
+    fun `no key duplicates a core default`() {
+        val a = server("a")
+        val b = server("b", address = "198.51.100.2", secret = "b-key")
+        val toml = ServerPoolConfig.render(
+            ServerPoolConfig.entries(ServerPoolConfig.selectPool(listOf(a, b), a)),
+            a
+        )
+        for (key in listOf("failure_threshold", "cooldown", "max_cooldown", "min_dwell", "health_check", "recheck_interval")) {
+            assertTrue("$key must not be written: $toml", !toml.contains("$key ="))
+        }
+        // and the two that carry a decision are still there
+        assertTrue(toml.contains("policy = "))
+        assertTrue(toml.contains("family = "))
+    }
 
     // --- pool selection ---
 
@@ -213,10 +280,6 @@ class ServerPoolConfigTest {
             [selection]
             policy = "priority"
             family = "v4_only"
-            failure_threshold = 2
-            cooldown = "1m"
-            max_cooldown = "30m"
-            min_dwell = "5m"
 
             """.trimIndent(),
             ServerPoolConfig.render(entries, a)
