@@ -264,6 +264,63 @@ class ServerStoreMigrationTest {
         assertFalse("a ping must not promote a stale copy", stored.contains("stale-key"))
     }
 
+    /**
+     * `getStringSet` throws `ClassCastException` when the key holds something
+     * that is not a set — a half-written file, an older layout. Thrown out of
+     * the fold it would escape into a plain read; swallowed as "no marks" it
+     * would silently demote every degraded-mode change to an old copy. Neither:
+     * an unreadable journal is damage, and damage means touch nothing.
+     */
+    @Test
+    fun `an unreadable journal stops the fold and destroys nothing`() {
+        encrypted.edit().putString(keyServers, array(record("ams", name = "live"))).commit()
+        plain.edit()
+            .putString(keyServers, array(record("ams", name = "degraded")))
+            .putString("degraded_dirty_ids", "not a set at all")
+            .commit()
+
+        fold()
+
+        assertEquals("the encrypted list must be untouched", listOf("ams"), storedIds())
+        assertTrue(
+            "and it must still be the record it held",
+            encrypted.getString(keyServers, null)!!.contains("live")
+        )
+        assertEquals(
+            "the plaintext copy is the only copy of what it holds",
+            array(record("ams", name = "degraded")),
+            plain.getString(keyServers, null)
+        )
+    }
+
+    @Test
+    fun `a journal flag of the wrong type is damage too`() {
+        encrypted.edit().putString(keyServers, array(record("ams"))).commit()
+        plain.edit()
+            .putString(keyServers, array(record("ams")))
+            .putString("degraded_active_id_chosen", "yes")
+            .commit()
+
+        fold()
+
+        assertEquals(array(record("ams")), plain.getString(keyServers, null))
+    }
+
+    @Test
+    fun `a contradictory journal stops the fold and destroys nothing`() {
+        encrypted.edit().putString(keyServers, array(record("ams"), record("dxb"))).commit()
+        plain.edit()
+            .putString(keyServers, array(record("ams")))
+            .putStringSet("degraded_dirty_ids", mutableSetOf("ams"))
+            .putStringSet("degraded_deleted_ids", mutableSetOf("ams"))
+            .commit()
+
+        fold()
+
+        assertEquals("both records stay until somebody can say what happened", listOf("ams", "dxb"), storedIds())
+        assertTrue("and the source is kept", plain.contains(keyServers))
+    }
+
     @Test
     fun `a fold that lands is confirmed by reading it back before the source dies`() {
         encrypted.edit().putString(keyServers, array(record("a"))).commit()

@@ -277,6 +277,40 @@ class StoreReconciliationTest {
         )
     }
 
+    /**
+     * The two sets are kept disjoint by the repository, so an overlap is not a
+     * tie to break — it is the journal not describing what happened. Either
+     * resolution destroys something: honouring the delete loses a record the
+     * user edited, honouring the edit brings back one they removed.
+     */
+    @Test
+    fun `an id marked both changed and deleted is a refusal, not a tie-break`() {
+        val plan = fold(
+            encrypted = array(record("ams"), record("dxb")),
+            plain = array(record("ams")),
+            dirtyIds = setOf("ams"),
+            deletedIds = setOf("ams"),
+        )
+        assertTrue(plan is StoreReconciliation.Plan.Refuse)
+        assertTrue(
+            "the reason has to name the contradiction",
+            (plan as StoreReconciliation.Plan.Refuse).reason.contains("contradicts itself")
+        )
+    }
+
+    @Test
+    fun `sets that only touch different ids are not a contradiction`() {
+        val plan = fold(
+            encrypted = array(record("ams"), record("dxb")),
+            plain = array(record("ams", secret = "new")),
+            dirtyIds = setOf("ams"),
+            deletedIds = setOf("dxb"),
+        ) as StoreReconciliation.Plan.Fold
+
+        assertEquals(listOf("ams"), plan.expectedIds)
+        assertTrue(plan.payload.contains("new"))
+    }
+
     @Test
     fun `no plaintext list at all is not a fold`() {
         assertTrue(

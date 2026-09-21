@@ -179,6 +179,18 @@ internal object StoreReconciliation {
             return Plan.Refuse("the encrypted server list is damaged")
         }
 
+        // An id marked both changed and deleted is not a tie to break: the two
+        // sets are kept disjoint by construction, so an overlap means the
+        // journal does not describe what happened. Resolving it either way
+        // destroys something — keeping the delete loses a record the user
+        // edited, keeping the edit resurrects one they removed.
+        val contradictory = dirtyIds intersect deletedIds
+        if (contradictory.isNotEmpty()) {
+            return Plan.Refuse(
+                "the degraded-mode journal contradicts itself: ${contradictory.size} id(s) marked both changed and deleted"
+            )
+        }
+
         val encryptedElements = elementsOf(encrypted)
         val plainElements = elementsOf(plain)
 

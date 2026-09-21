@@ -1,7 +1,10 @@
 package com.tiredvpn.android.vpn
 
 import kotlinx.coroutines.sync.Mutex
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * The reconnect mutex, with an owner.
@@ -106,4 +109,122 @@ internal class ConnectGeneration {
         if (counter.compareAndSet(expected, expected + 1)) expected + 1 else null
 
     fun isCurrent(generation: Int): Boolean = counter.get() == generation
+}
+
+/**
+ * Who owns the process-wide core, and the handover between them.
+ *
+ * [ConnectGeneration] answers "is this attempt still current", which is enough
+ * for anything the attempt made for itself — its TUN descriptor, its control
+ * channel. It is not enough for the core, and that is the whole reason this
+ * exists: `NativeProcessJNI.stop()` calls `TiredVpnNative.stop()`, which is
+ * `stopClient()` on a Go package-level variable. There is one core in the
+ * process. Holding a reference to the old `NativeProcessJNI` and calling stop
+ * on *that object* stops whatever core is running, including one a newer
+ * attempt has just started. The protect server has the same shape: one
+ * listening socket, one fixed path, reached through a field.
+ *
+ * Re-checking the generation before the call does not fix it, because the
+ * check and the call are still two steps over shared state. So ownership is
+ * taken, not verified:
+ *
+ *  - a teardown calls [takeForTeardown], which atomically confirms the caller
+ *    owns the core *and* empties the slot. Whoever else arrives now finds
+ *    nothing to stop;
+ *  - a connect calls [awaitHandover] before it starts anything global, so it
+ *    cannot create a core while the previous owner is still inside its stop;
+ *  - [claim] publishes the new owner.
+ *
+ * On deadlock, since this sits in front of blocking JNI: every critical
+ * section here is a handful of field assignments — no JNI, no I/O, no
+ * suspension point inside the lock. The blocking stop happens between
+ * [takeForTeardown] and [finishTeardown], with the lock released. The only
+ * waiting is [awaitHandover], which is bounded and reports a timeout instead
+ * of waiting again; the caller then proceeds, which is what it did before this
+ * class existed. A wedged core can therefore delay a connect by the timeout,
+ * and cannot stop one.
+ */
+internal class CoreOwnership {
+
+    companion object {
+        /** No generation. The core is not running, or nobody admits to it. */
+        const val NOBODY = 0
+    }
+
+    private val lock = ReentrantLock()
+    private val handedOver = lock.newCondition()
+
+    private var owner: Int = NOBODY
+    private var tearingDown: Int = NOBODY
+
+    /** The generation that owns the core, for logging and tests. */
+    val currentOwner: Int get() = lock.withLock { owner }
+
+    /** True while somebody is inside a teardown. */
+    val isTearingDown: Boolean get() = lock.withLock { tearingDown != NOBODY }
+
+    /** Publish [generation] as the owner. Called just before the core starts. */
+    fun claim(generation: Int) {
+        lock.withLock { owner = generation }
+    }
+
+    /**
+     * Take the core out of the slot, if [generation] still owns it.
+     *
+     * @return true when the caller may now stop it, and must call
+     *         [finishTeardown] when done.
+     */
+    fun takeForTeardown(generation: Int): Boolean {
+        lock.withLock {
+            if (generation == NOBODY || owner != generation) return false
+            owner = NOBODY
+            tearingDown = generation
+            return true
+        }
+    }
+
+    /**
+     * Take whatever is in the slot, for the authoritative reset that answers
+     * to no generation — a user-initiated disconnect, a forced reset.
+     *
+     * @return the generation taken, or [NOBODY] when the slot was empty.
+     *         Either way the caller must pass it to [finishTeardown].
+     */
+    fun takeForReset(): Int {
+        lock.withLock {
+            val taken = owner
+            owner = NOBODY
+            if (taken != NOBODY) tearingDown = taken
+            return taken
+        }
+    }
+
+    /** The teardown is over; anyone waiting for the handover may proceed. */
+    fun finishTeardown(generation: Int) {
+        lock.withLock {
+            if (generation != NOBODY && tearingDown == generation) {
+                tearingDown = NOBODY
+                handedOver.signalAll()
+            }
+        }
+    }
+
+    /**
+     * Wait for any teardown in flight to finish, for at most [timeoutMs].
+     *
+     * @return true when the slot is free, false on timeout — in which case the
+     *         caller proceeds anyway and says so in the log. The alternative,
+     *         waiting until the previous owner returns, turns a core wedged in
+     *         Go into a connect that never starts.
+     */
+    fun awaitHandover(timeoutMs: Long): Boolean {
+        lock.withLock {
+            var remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            while (tearingDown != NOBODY) {
+                if (remaining <= 0L) return false
+                remaining = handedOver.awaitNanos(remaining)
+            }
+            return true
+        }
+    }
 }

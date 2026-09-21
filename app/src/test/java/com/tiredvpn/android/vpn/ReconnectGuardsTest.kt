@@ -163,6 +163,154 @@ class ReconnectGuardsTest {
         }
     }
 
+    // --- ownership of the one core in the process ---------------------------
+
+    /**
+     * The check that a generation cannot answer.
+     *
+     * `NativeProcessJNI.stop()` reaches `stopClient()` on a Go package-level
+     * variable, so holding a reference to the old wrapper and calling stop on
+     * it stops whatever core is running. An `isCurrent()` before the call is
+     * check-then-act over shared state; taking the core out of the slot is not.
+     */
+    @Test
+    fun `a teardown that does not own the core is refused`() {
+        val core = CoreOwnership()
+        core.claim(1)
+
+        assertFalse("generation 2 never owned it", core.takeForTeardown(2))
+        assertEquals(1, core.currentOwner)
+        assertTrue(core.takeForTeardown(1))
+    }
+
+    @Test
+    fun `taking for teardown empties the slot so nobody else can stop it twice`() {
+        val core = CoreOwnership()
+        core.claim(1)
+
+        assertTrue(core.takeForTeardown(1))
+        assertFalse("the same teardown must not run twice", core.takeForTeardown(1))
+        assertEquals(CoreOwnership.NOBODY, core.currentOwner)
+        assertTrue("and the slot is marked busy until it finishes", core.isTearingDown)
+
+        core.finishTeardown(1)
+        assertFalse(core.isTearingDown)
+    }
+
+    @Test
+    fun `a teardown of a core nobody owns does nothing`() {
+        val core = CoreOwnership()
+        assertFalse(core.takeForTeardown(CoreOwnership.NOBODY))
+        assertFalse(core.takeForTeardown(7))
+    }
+
+    /**
+     * The other half: a connect must not start a core while the previous owner
+     * is still inside its stop, because the stop it is inside reaches the
+     * global one.
+     */
+    @Test
+    fun `a connect waits for a teardown in flight and then owns the core`() {
+        val core = CoreOwnership()
+        core.claim(1)
+        assertTrue(core.takeForTeardown(1))
+
+        val handedOver = java.util.concurrent.CountDownLatch(1)
+        val waiter = Thread {
+            if (core.awaitHandover(5_000)) handedOver.countDown()
+        }
+        waiter.start()
+
+        Thread.sleep(50)
+        assertEquals("the waiter must still be waiting", 1, handedOver.count)
+
+        core.finishTeardown(1)
+        assertTrue("the handover must wake it", handedOver.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        waiter.join()
+
+        core.claim(2)
+        assertEquals(2, core.currentOwner)
+    }
+
+    /**
+     * Bounded, and that is the deadlock argument: a core wedged in Go delays a
+     * connect by the timeout and cannot prevent it. The caller logs and starts
+     * anyway.
+     *
+     * The JUnit timeout is not decoration. An unbounded `await()` here does not
+     * fail an assertion, it hangs — and a hung suite is a worse signal than a
+     * red one, because it looks like an infrastructure problem. Five seconds is
+     * forty times the wait this asks for.
+     */
+    @Test(timeout = 5_000)
+    fun `waiting for a handover gives up rather than waiting forever`() {
+        val core = CoreOwnership()
+        core.claim(1)
+        core.takeForTeardown(1)
+
+        val startedAt = System.nanoTime()
+        assertFalse("a teardown that never finishes must not block forever", core.awaitHandover(120))
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+        assertTrue("returned after ${elapsedMs}ms, expected at least the timeout", elapsedMs >= 100)
+        assertTrue("and not much more", elapsedMs < 5_000)
+    }
+
+    @Test
+    fun `an authoritative reset takes whatever is there`() {
+        val core = CoreOwnership()
+        core.claim(9)
+
+        assertEquals("a disconnect answers to no generation", 9, core.takeForReset())
+        assertEquals(CoreOwnership.NOBODY, core.currentOwner)
+        core.finishTeardown(9)
+
+        assertEquals("an empty slot yields NOBODY", CoreOwnership.NOBODY, core.takeForReset())
+        core.finishTeardown(CoreOwnership.NOBODY)
+        assertFalse("and must not leave the slot marked busy", core.isTearingDown)
+    }
+
+    @Test
+    fun `a stale finishTeardown does not free the slot a newer teardown holds`() {
+        val core = CoreOwnership()
+        core.claim(1)
+        core.takeForTeardown(1)
+        core.finishTeardown(1)
+
+        core.claim(2)
+        core.takeForTeardown(2)
+
+        core.finishTeardown(1)
+        assertTrue("generation 1 is long gone and may not speak for 2", core.isTearingDown)
+        core.finishTeardown(2)
+        assertFalse(core.isTearingDown)
+    }
+
+    /**
+     * Only one teardown may hold the core, however many arrive at once.
+     * Repeated, for the same reason as the generation test above: one round of
+     * a race proves very little.
+     */
+    @Test
+    fun `only one of many racing teardowns takes the core`() {
+        repeat(200) { round ->
+            val core = CoreOwnership()
+            core.claim(1)
+            val winners = AtomicInteger(0)
+            val start = CountDownLatch(1)
+            val threads = (1..8).map {
+                Thread {
+                    start.await()
+                    if (core.takeForTeardown(1)) winners.incrementAndGet()
+                }
+            }
+            threads.forEach { it.start() }
+            start.countDown()
+            threads.forEach { it.join() }
+
+            assertEquals("round $round: two teardowns both stopped the one core", 1, winners.get())
+        }
+    }
+
     @Test
     fun `generations are unique under concurrent starts`() {
         val gen = ConnectGeneration()

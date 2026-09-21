@@ -200,16 +200,19 @@ object ServerRepository {
         val wasActive = activeServerIdLocked(context) == id
 
         servers.removeAll { it.id == id }
-        saveServersLocked(context, servers)
-        markServerDeletedLocked(context, id)
+        val nextActive = if (wasActive) servers.firstOrNull()?.id else null
 
-        if (wasActive) {
-            val nextServer = servers.firstOrNull()
-            if (nextServer != null) {
-                setActiveServerIdLocked(context, nextServer.id)
-            } else {
-                clearActiveServerIdLocked(context)
+        // One transaction: the shortened list, the successor (or the removal of
+        // the key), and the journal entry that says this delete happened while
+        // the store was degraded. Split across two writes, a crash in between
+        // leaves the server gone from plaintext with nothing saying so, and the
+        // fold brings it back from the encrypted copy.
+        saveServersLocked(context, servers) { editor ->
+            if (wasActive) {
+                if (nextActive != null) editor.putString(KEY_ACTIVE_SERVER_ID, nextActive)
+                else editor.remove(KEY_ACTIVE_SERVER_ID)
             }
+            markServerChanged(context, editor, deleted = id)
         }
     }
 
@@ -227,8 +230,12 @@ object ServerRepository {
 
     fun setActiveServerId(context: Context, id: String) = synchronized(lock) {
         reconcileStoresLocked(context)
-        setActiveServerIdLocked(context, id)
-        markActiveChoiceLocked(context)
+        // The choice and the note that it was made while degraded, together.
+        val editor = getPrefs(context).edit().putString(KEY_ACTIVE_SERVER_ID, id)
+        markActiveChoice(editor)
+        if (!editor.commit()) {
+            FileLogger.e(TAG, "=== ACTIVE SERVER WRITE FAILED === the store refused the transaction")
+        }
     }
 
     // --- internals, all called with [lock] held ---
@@ -294,22 +301,44 @@ object ServerRepository {
         } else {
             servers.add(config)
         }
-        saveServersLocked(context, servers)
-        markServerDirtyLocked(context, config.id)
 
-        // If this is the only server, or no active server is set, make it active
-        if (servers.size == 1 || activeServerIdLocked(context) == null) {
-            setActiveServerIdLocked(context, config.id)
+        // If this is the only server, or no active server is set, make it
+        // active — decided here so the whole write is one transaction.
+        val adoptAsActive =
+            if (servers.size == 1 || activeServerIdLocked(context) == null) config.id else null
+
+        saveServersLocked(context, servers) { editor ->
+            if (adoptAsActive != null) editor.putString(KEY_ACTIVE_SERVER_ID, adoptAsActive)
+            // Saved after a delete: it exists again, and the delete is history.
+            markServerChanged(context, editor, dirty = config.id, undeleted = config.id)
         }
     }
 
-    private fun saveServersLocked(context: Context, servers: List<VpnConfig>) {
+    /**
+     * Write the server list, and whatever else belongs to the same change, in
+     * one transaction.
+     *
+     * One [SharedPreferences.Editor] and `commit()`, not a write followed by a
+     * second write for the degraded-mode journal. Two `apply()` calls are two
+     * enqueued file writes: the process dying between them leaves the new
+     * payload on disk with no mark against it, and the fold then reads that
+     * record as an old copy and keeps the encrypted one — losing exactly the
+     * change the journal exists to protect. A single editor is written to a
+     * temp file and renamed, so the payload and its mark land together or not
+     * at all.
+     */
+    private fun saveServersLocked(
+        context: Context,
+        servers: List<VpnConfig>,
+        also: (SharedPreferences.Editor) -> Unit = {},
+    ) {
         val jsonArray = JSONArray()
         servers.forEach { jsonArray.put(it.toJson()) }
-        getPrefs(context)
-            .edit()
-            .putString(KEY_SERVERS, jsonArray.toString())
-            .apply()
+        val editor = getPrefs(context).edit().putString(KEY_SERVERS, jsonArray.toString())
+        also(editor)
+        if (!editor.commit()) {
+            FileLogger.e(TAG, "=== SERVER LIST WRITE FAILED === the store refused the transaction")
+        }
     }
 
     // --- what changed while the Keystore was down ---
@@ -319,48 +348,71 @@ object ServerRepository {
     // change apart from a stale copy of the same record, so the fold can let
     // the change win; marking anything else would hand that privilege to data
     // that has not changed.
+    //
+    // All of these take the caller's [SharedPreferences.Editor] rather than
+    // opening their own: the mark and the data it describes have to reach the
+    // disk in the same transaction, or the mark is not evidence of anything.
 
-    /** [id] was saved while degraded: its plaintext record is the newer one. */
-    private fun markServerDirtyLocked(context: Context, id: String) {
+    /**
+     * Record a change to one server in [editor].
+     *
+     * @param dirty the id whose plaintext record is now the newer one.
+     * @param deleted the id that must not come back from the encrypted store.
+     * @param undeleted the id that exists again, so an earlier delete no longer
+     *        describes it.
+     */
+    private fun markServerChanged(
+        context: Context,
+        editor: SharedPreferences.Editor,
+        dirty: String? = null,
+        deleted: String? = null,
+        undeleted: String? = null,
+    ) {
         if (!isStorageDegraded) return
         val plain = plainPrefs(context)
-        val dirty = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty().toMutableSet()
-        val deleted = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty().toMutableSet()
-        // Saved after a delete: it exists again, and the delete is history.
-        dirty.add(id)
-        deleted.remove(id)
-        plain.edit()
-            .putStringSet(KEY_DEGRADED_DIRTY, dirty)
-            .putStringSet(KEY_DEGRADED_DELETED, deleted)
-            .apply()
-    }
+        val dirtyIds = readJournalSet(plain, KEY_DEGRADED_DIRTY).toMutableSet()
+        val deletedIds = readJournalSet(plain, KEY_DEGRADED_DELETED).toMutableSet()
 
-    /** [id] was deleted while degraded: it must not come back from encrypted. */
-    private fun markServerDeletedLocked(context: Context, id: String) {
-        if (!isStorageDegraded) return
-        val plain = plainPrefs(context)
-        val dirty = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty().toMutableSet()
-        val deleted = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty().toMutableSet()
-        deleted.add(id)
-        dirty.remove(id)
-        plain.edit()
-            .putStringSet(KEY_DEGRADED_DIRTY, dirty)
-            .putStringSet(KEY_DEGRADED_DELETED, deleted)
-            .apply()
+        if (dirty != null) { dirtyIds.add(dirty); deletedIds.remove(dirty) }
+        if (deleted != null) { deletedIds.add(deleted); dirtyIds.remove(deleted) }
+        if (undeleted != null) deletedIds.remove(undeleted)
+
+        editor.putStringSet(KEY_DEGRADED_DIRTY, dirtyIds)
+            .putStringSet(KEY_DEGRADED_DELETED, deletedIds)
     }
 
     /**
-     * The active server was *chosen* while degraded.
+     * Record in [editor] that the active server was *chosen* while degraded.
      *
      * Deliberately not called from [setActiveServerIdLocked]: that also runs
      * when [getActiveServer] repairs an id that names nothing and when
      * [saveServerLocked] adopts the first server, neither of which is a choice
      * worth beating the encrypted store with.
      */
-    private fun markActiveChoiceLocked(context: Context) {
+    private fun markActiveChoice(editor: SharedPreferences.Editor) {
         if (!isStorageDegraded) return
-        plainPrefs(context).edit().putBoolean(KEY_DEGRADED_ACTIVE, true).apply()
+        editor.putBoolean(KEY_DEGRADED_ACTIVE, true)
     }
+
+    /**
+     * One set out of the journal, or null when it cannot be read as one.
+     *
+     * `getStringSet` throws `ClassCastException` when the key holds something
+     * else — a half-written file, an older layout, anything. Thrown from here
+     * it would escape a read path that has nothing to do with the journal, so
+     * damage is reported as damage and the caller decides.
+     */
+    private fun readJournalSetOrNull(prefs: SharedPreferences, key: String): Set<String>? =
+        try {
+            prefs.getStringSet(key, emptySet()).orEmpty()
+        } catch (e: ClassCastException) {
+            FileLogger.e(TAG, "=== DEGRADED-MODE JOURNAL IS DAMAGED === $key is not a set of ids", e)
+            null
+        }
+
+    /** The same, for the write paths, where an unreadable set starts over. */
+    private fun readJournalSet(prefs: SharedPreferences, key: String): Set<String> =
+        readJournalSetOrNull(prefs, key) ?: emptySet()
 
     private fun activeServerIdLocked(context: Context): String? =
         getPrefs(context).getString(KEY_ACTIVE_SERVER_ID, null)
@@ -407,15 +459,31 @@ object ServerRepository {
         encrypted: SharedPreferences,
         plain: SharedPreferences,
     ) {
+        // The journal decides which side of a conflict wins, so an unreadable
+        // one is not "no marks" — it is not knowing, and the fold must not
+        // guess. Read before anything is written and refuse on damage.
+        val dirtyIds = readJournalSetOrNull(plain, KEY_DEGRADED_DIRTY)
+        val deletedIds = readJournalSetOrNull(plain, KEY_DEGRADED_DELETED)
+        val activeChosen = try {
+            plain.getBoolean(KEY_DEGRADED_ACTIVE, false)
+        } catch (e: ClassCastException) {
+            FileLogger.e(TAG, "=== DEGRADED-MODE JOURNAL IS DAMAGED === $KEY_DEGRADED_ACTIVE is not a flag", e)
+            null
+        }
+        if (dirtyIds == null || deletedIds == null || activeChosen == null) {
+            FileLogger.e(TAG, "=== NOT MIGRATING THE PLAINTEXT SERVER LIST === the degraded-mode journal is unreadable; both copies are kept for recovery")
+            return
+        }
+
         val plan = StoreReconciliation.plan(
             encryptedPayload = encrypted.getString(KEY_SERVERS, null),
             encryptedActiveId = encrypted.getString(KEY_ACTIVE_SERVER_ID, null),
             plainPayload = plain.getString(KEY_SERVERS, null),
             plainActiveId = plain.getString(KEY_ACTIVE_SERVER_ID, null),
             plainHasList = plain.contains(KEY_SERVERS),
-            dirtyIds = plain.getStringSet(KEY_DEGRADED_DIRTY, emptySet()).orEmpty(),
-            deletedIds = plain.getStringSet(KEY_DEGRADED_DELETED, emptySet()).orEmpty(),
-            activeIdChosenWhileDegraded = plain.getBoolean(KEY_DEGRADED_ACTIVE, false),
+            dirtyIds = dirtyIds,
+            deletedIds = deletedIds,
+            activeIdChosenWhileDegraded = activeChosen,
         )
 
         when (plan) {

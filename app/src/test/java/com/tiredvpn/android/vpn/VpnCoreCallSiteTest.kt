@@ -849,7 +849,8 @@ class VpnCoreCallSiteTest {
                 bodyAfter(service, name).contains("releaseWakeLock()")
             )
         }
-        for (name in listOf("private suspend fun connectTunMode(config: VpnConfig) {", "private suspend fun connectProxyMode(config: VpnConfig) {")) {
+        for (name in listOf("private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
+            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {")) {
             assertFalse(
                 "$name must not hand the CPU back while its tunnel is up",
                 bodyAfter(service, name).contains("releaseWakeLock()")
@@ -958,7 +959,10 @@ class VpnCoreCallSiteTest {
         val body = bodyAfter(service, "private suspend fun executeReconnectSequence(generation: Int): Boolean {")
         assertTrue("scanner cannot see the sequence", body.contains("NonCancellable"))
 
-        val steps = listOf("step 0", "step 1", "step 2", "step 3", "step 3b", "step 4", "step 5")
+        // 3b and 4 moved inside the ownership block: the JNI bridge and
+        // control.sock are process-wide, so they belong to whoever owns the
+        // core rather than to whoever passed a check a moment ago.
+        val steps = listOf("step 0", "step 1", "step 2", "step 3", "step 5")
         for (step in steps) {
             assertTrue(
                 "$step is not gated",
@@ -982,6 +986,14 @@ class VpnCoreCallSiteTest {
         assertTrue(
             "and the field is only cleared when it still holds that core",
             body.contains("if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null")
+        )
+        val owned = body.substringAfter("withOwnedCore(generation,").substringBefore("if (!stoppedTheCore)")
+        for (global in listOf("TiredVpnNative.cleanup()", "control.sock")) {
+            assertTrue("$global must sit inside the ownership block", owned.contains(global))
+        }
+        assertTrue(
+            "and a teardown that does not own the core must stop there",
+            body.contains("if (!stoppedTheCore) return@withContext")
         )
         assertFalse(
             "closeControlChannel() acts on the field, which by then may be a newer channel",
@@ -1051,14 +1063,18 @@ class VpnCoreCallSiteTest {
         val body = bodyAfter(service, "private fun cleanupFailedConnection(generation: Int) {")
         assertTrue("scanner cannot see the cleanup", body.contains("tunHandles.releaseAll()"))
 
-        for (step in listOf(
-            "cleanupFailedConnection", "native cleanup", "protect server",
-            "TUN ledger", "control.sock", "endpoint pool", "wake lock",
-        )) {
+        // What the attempt made for itself is gated on the generation.
+        for (step in listOf("cleanupFailedConnection", "TUN ledger", "endpoint pool", "wake lock")) {
             assertTrue("$step is not gated", body.contains("""if (!stillOurs(generation, "$step")) return"""))
         }
 
-        assertTrue("the core stopped must be the one this attempt made", body.contains("ownedProcess?.stop()"))
+        // What the process shares is taken, not checked: the core, the JNI
+        // bridge, the protect server and control.sock all live in one
+        // ownership block.
+        val owned = body.substringAfter("withOwnedCore(generation,").substringBefore("// Close the channel")
+        for (global in listOf("ownedProcess?.stop()", "TiredVpnNative.cleanup()", "stopProtectServer()", "control.sock")) {
+            assertTrue("$global must sit inside the ownership block", owned.contains(global))
+        }
         assertTrue(body.contains("if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null"))
         assertFalse(
             "closeControlChannel() acts on the field, which may hold a newer channel",
@@ -1067,6 +1083,78 @@ class VpnCoreCallSiteTest {
         assertFalse(
             "unlinking protect.sock belongs to the generation that owns the name",
             body.contains("protect.sock")
+        )
+    }
+
+    /**
+     * There is one core in the process. `NativeProcessJNI.stop()` ends in
+     * `stopClient()` on a Go package-level variable, so stopping "the object
+     * this attempt made" stops whatever core is running — including one a
+     * newer attempt started a moment ago. A generation check before the call
+     * does not help: check and call are still two steps over shared state.
+     *
+     * So every path that touches the process-wide core does it inside an
+     * ownership block, and every path that creates one waits for the handover
+     * first.
+     */
+    @Test
+    fun `the one core in the process is stopped by its owner, never by a checker`() {
+        val service = source("TiredVpnService.kt")
+
+        // No path may reach the core outside an ownership block.
+        val guarded = listOf(
+            "private fun cleanupFailedConnection(generation: Int) {" to "withOwnedCore(generation,",
+            "private suspend fun executeReconnectSequence(generation: Int): Boolean {" to "withOwnedCore(generation,",
+            "private fun forceResetCore(reason: String) {" to "withCoreReset {",
+            "private fun disconnect(intent: StopIntent) {" to "withCoreReset {",
+        )
+        for ((header, expected) in guarded) {
+            val body = bodyAfter(service, header)
+            assertTrue("${header.substringBefore('(')} stops the core outside an ownership block", body.contains(expected))
+        }
+
+        // And the JNI stop/cleanup pair may not appear anywhere else.
+        for (call in listOf("TiredVpnNative.cleanup()", "stopAndWait()")) {
+            val loose = service.lines().count { it.contains(call) }
+            assertTrue("$call appears $loose times; every one must sit inside an ownership block", loose <= 4)
+        }
+
+        // Both connect paths take ownership before creating anything global.
+        for (header in listOf(
+            "private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
+            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {",
+        )) {
+            val body = bodyAfter(service, header)
+            val handover = body.indexOf("awaitCoreHandover(generation)")
+            assertTrue("${header.substringBefore('(')} starts the core without waiting for the handover", handover >= 0)
+            val starts = listOf("startProtectServer(", "startTiredVpnProcess(", "startTiredVpnProxyProcess(")
+                .map { body.indexOf(it) }.filter { it >= 0 }
+            assertTrue("nothing global is started here - the scan is broken", starts.isNotEmpty())
+            for (start in starts) {
+                assertTrue("something global is created before the handover", handover < start)
+            }
+        }
+    }
+
+    /** The deadlock argument, stated where it can be checked. */
+    @Test
+    fun `the ownership lock is never held across a blocking call`() {
+        val guards = source("ReconnectGuards.kt")
+        val owned = guards.substringAfter("internal class CoreOwnership")
+        for (forbidden in listOf("TiredVpnNative", "stopAndWait", "Thread.sleep", "File(")) {
+            assertFalse(
+                "CoreOwnership must hold nothing but field assignments inside its lock, found $forbidden",
+                owned.contains(forbidden)
+            )
+        }
+        assertTrue(
+            "the only wait must be bounded",
+            owned.contains("fun awaitHandover(timeoutMs: Long): Boolean") && owned.contains("awaitNanos(remaining)")
+        )
+        assertTrue(
+            "and the caller must proceed on timeout rather than wait again",
+            bodyAfter(source("TiredVpnService.kt"), "private fun awaitCoreHandover(generation: Int) {")
+                .contains("starting anyway")
         )
     }
 

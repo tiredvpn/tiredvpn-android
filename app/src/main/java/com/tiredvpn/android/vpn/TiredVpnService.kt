@@ -255,6 +255,25 @@ class TiredVpnService : VpnService() {
      * generation and only the current one may unlink.
      */
     private val protectGeneration = ConnectGeneration()
+
+    /**
+     * Who is allowed to stop the one core in this process, and the handover
+     * between them. See [CoreOwnership] — the short version is that
+     * `NativeProcessJNI.stop()` reaches a Go package-level variable, so a
+     * snapshot of the Kotlin object stops whatever core is running, not the
+     * one the snapshot was taken of.
+     */
+    private val coreOwnership = CoreOwnership()
+
+    /**
+     * How long a connect waits for the previous owner to finish stopping.
+     *
+     * Its ceiling is Go's: `stopClient()` waits on `clientWg` through a select
+     * with `time.After(5 * time.Second)` and returns either way. Seven seconds
+     * is that plus the protect server's own teardown and slack. On expiry the
+     * connect proceeds and says so — see [CoreOwnership.awaitHandover].
+     */
+    private val coreHandoverTimeoutMs = 7_000L
     private var connectionJob: Job? = null  // Current connection attempt - can be cancelled
     private var connectAttemptsSinceBodyEntered = 0  // Track if coroutine body ever starts
     @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
@@ -625,8 +644,8 @@ class TiredVpnService : VpnService() {
                 // Overall connection timeout - 30 seconds max (REDUCED from 60s for faster failure detection)
                 withTimeout(CONNECTION_TIMEOUT) {
                     when (config.connectionMode) {
-                        "proxy" -> connectProxyMode(config)
-                        else -> connectTunMode(config)
+                        "proxy" -> connectProxyMode(config, generation)
+                        else -> connectTunMode(config, generation)
                     }
                 }
             } catch (e: TimeoutCancellationException) {
@@ -788,32 +807,46 @@ class TiredVpnService : VpnService() {
         if (!stillOurs(generation, "cleanupFailedConnection")) return
         FileLogger.d(TAG, "Cleaning up failed connection...")
 
-        // The core and the channel this attempt created. stop() below is not
-        // instantaneous, and nulling the field afterwards would otherwise drop
-        // a newer attempt's core on the floor.
-        val ownedProcess = tiredvpnProcess
         val ownedChannel = controlChannel
 
-        // Stop native process
-        ownedProcess?.stop()
-        if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
+        // Stop the core and the protect server — process-wide, both of them,
+        // so a snapshot of the Kotlin object is not enough: NativeProcessJNI
+        // .stop() ends up in stopClient() on a Go package-level variable, and
+        // stopProtectServer() closes whatever socket the field holds. Taking
+        // ownership is what makes this safe; a newer connect is inside
+        // awaitCoreHandover until the block below returns.
+        // Everything process-wide goes inside one ownership block: the core,
+        // the JNI callback bridge, the protect server and the control socket
+        // file. A snapshot of the Kotlin objects is not enough for any of them
+        // — NativeProcessJNI.stop() ends in stopClient() on a Go package-level
+        // variable, cleanup() drops a JNI global ref, stopProtectServer()
+        // closes whatever the field holds, and control.sock is one fixed name.
+        // Taking ownership is what makes this safe: a newer connect sits in
+        // awaitCoreHandover until this block returns.
+        withOwnedCore(generation, "cleanupFailedConnection") {
+            val ownedProcess = tiredvpnProcess
+            ownedProcess?.stop()
+            if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
 
-        // Unwire the callback bridge to the core. Read cleanupNative before
-        // relying on this for anything else: on the Go side it is
-        // DeleteGlobalRef on the callback object plus two method-id
-        // assignments (cmd/tiredvpn/jni_android.go, jni_cleanup). It does not
-        // cancel the client context, does not wait for any goroutine and does
-        // not close the dup'd TUN descriptor — four comments here used to say
-        // it did. What it does buy is worth having on this path: a strategy
-        // attempt that outlives stopClient() can no longer report its own death
-        // to us, and this path never called it at all, so the next start()
-        // ran initialize() on top of a core still holding the old callback.
-        //
-        // Gated: the bridge is global JNI state, so dropping it after a newer
-        // core has registered cuts that core's callback rather than ours.
-        if (!stillOurs(generation, "native cleanup")) return
-        try { TiredVpnNative.cleanup() } catch (e: Throwable) {
-            FileLogger.w(TAG, "cleanupFailedConnection: native cleanup failed: ${e.message}")
+            // Unwire the callback bridge. Read cleanupNative before relying on
+            // this for anything else: on the Go side it is DeleteGlobalRef on
+            // the callback object plus two method-id assignments
+            // (cmd/tiredvpn/jni_android.go, jni_cleanup). It does not cancel
+            // the client context, does not wait for any goroutine and does not
+            // close the dup'd TUN descriptor — four comments here used to say
+            // it did. What it does buy is worth having: a strategy attempt that
+            // outlives stopClient() can no longer report its own death to us.
+            try { TiredVpnNative.cleanup() } catch (e: Throwable) {
+                FileLogger.w(TAG, "cleanupFailedConnection: native cleanup failed: ${e.message}")
+            }
+
+            // The protect server belongs to the same handover: the core dials
+            // it, and a half-torn-down pair leaves the core's sockets
+            // unprotected. The socket FILE is not unlinked here — that belongs
+            // to the generation that owns the name, see [protectGeneration].
+            stopProtectServer()
+
+            File("${filesDir.absolutePath}/control.sock").delete()
         }
 
         // Close the channel we opened, by identity
@@ -824,22 +857,10 @@ class TiredVpnService : VpnService() {
             }
         }
 
-        // Stop protect server. The socket FILE is not touched here: unlinking
-        // it belongs to the generation that owns the name (see
-        // [protectGeneration]), and this path has no way to know whether a
-        // newer server has bound it already.
-        if (!stillOurs(generation, "protect server")) return
-        stopProtectServer()
-
         // Close VPN interface (through the ledger, so it is closed exactly once)
         if (!stillOurs(generation, "TUN ledger")) return
         vpnInterface = null
         tunHandles.releaseAll()
-
-        // Clean up the control socket file. One fixed name again, so this is
-        // only ours while the generation holds.
-        if (!stillOurs(generation, "control.sock")) return
-        File("${filesDir.absolutePath}/control.sock").delete()
 
         // The endpoint pool lists every server the user dials; it is rebuilt on
         // the next connect, so nothing needs it once the core has stopped —
@@ -868,6 +889,58 @@ class TiredVpnService : VpnService() {
         if (connectGeneration.isCurrent(generation)) return true
         FileLogger.w(TAG, "generation $generation superseded before $step, leaving the newer attempt alone")
         return false
+    }
+
+    /**
+     * Stop the process-wide core and protect server, but only if [generation]
+     * still owns them — and take them out of the slot before touching them.
+     *
+     * The difference from [stillOurs] is the whole point of [CoreOwnership]:
+     * that one answers a question and leaves the answer to go stale, this one
+     * takes possession. A newer connect arriving after the take finds an empty
+     * slot and waits in [awaitCoreHandover] rather than racing us.
+     *
+     * @return true when [teardown] ran.
+     */
+    private inline fun withOwnedCore(generation: Int, what: String, teardown: () -> Unit): Boolean {
+        if (!coreOwnership.takeForTeardown(generation)) {
+            FileLogger.w(TAG, "$what: generation $generation does not own the core (owner=${coreOwnership.currentOwner}), leaving it alone")
+            return false
+        }
+        try {
+            teardown()
+        } finally {
+            coreOwnership.finishTeardown(generation)
+        }
+        return true
+    }
+
+    /**
+     * The same, for a teardown that answers to no generation: a user-initiated
+     * disconnect and the authoritative reset stop whatever is running.
+     */
+    private inline fun withCoreReset(teardown: () -> Unit) {
+        val taken = coreOwnership.takeForReset()
+        try {
+            teardown()
+        } finally {
+            coreOwnership.finishTeardown(taken)
+        }
+    }
+
+    /**
+     * Wait for a teardown in flight to hand the core over, then take ownership.
+     *
+     * Called on the connect path before anything process-wide is created. The
+     * wait is bounded; on expiry we start anyway, which is exactly what this
+     * code did before the handover existed.
+     */
+    private fun awaitCoreHandover(generation: Int) {
+        if (!coreOwnership.awaitHandover(coreHandoverTimeoutMs)) {
+            FileLogger.e(TAG, "=== CORE HANDOVER TIMED OUT === previous owner still stopping after ${coreHandoverTimeoutMs}ms, starting anyway")
+        }
+        coreOwnership.claim(generation)
+        FileLogger.d(TAG, "Core ownership claimed by generation $generation")
     }
 
     /**
@@ -905,14 +978,17 @@ class TiredVpnService : VpnService() {
         // 3. Close control socket
         closeControlChannel()
 
-        // 4. Stop native process (non-blocking stop, not stopAndWait)
-        try { tiredvpnProcess?.stop() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: stop process", e) }
-        tiredvpnProcess = null
-
-        // 5. Drop the JNI callback bridge, so nothing the previous core still
-        // has running can report state to the next one. Not a goroutine killer
-        // — see cleanupFailedConnection.
-        try { TiredVpnNative.cleanup() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: native cleanup", e) }
+        // 4/5. Stop the core and drop the JNI callback bridge, as one owner.
+        //
+        // takeForReset and not takeForTeardown: this is the authoritative reset
+        // and it answers to no generation — it stops whatever is running. It
+        // still goes through the same slot, so a connect that arrives during it
+        // waits in awaitCoreHandover instead of starting a second core.
+        withCoreReset {
+            try { tiredvpnProcess?.stop() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: stop process", e) }
+            tiredvpnProcess = null
+            try { TiredVpnNative.cleanup() } catch (e: Exception) { FileLogger.w(TAG, "forceResetCore: native cleanup", e) }
+        }
 
         // 6. Kill processes left over from a build that ran the core as a
         // separate binary. In JNI mode there is no such process, so this is
@@ -960,7 +1036,7 @@ class TiredVpnService : VpnService() {
         FileLogger.d(TAG, "forceResetCore: done")
     }
 
-    private suspend fun connectTunMode(config: VpnConfig) {
+    private suspend fun connectTunMode(config: VpnConfig, generation: Int) {
         val controlPath = "${filesDir.absolutePath}/control.sock"
         val protectPath = "${filesDir.absolutePath}/protect.sock"
         FileLogger.d(TAG, "Control socket path: $controlPath")
@@ -1004,7 +1080,13 @@ class TiredVpnService : VpnService() {
         }
         val poolConfigPath = preparePoolConfig(config, pool, resolvedPool)
 
-        // 1a. Start protect socket server BEFORE starting native process
+        // 1a. Take ownership of the process-wide core and protect server
+        // before creating either. A teardown from the attempt we superseded
+        // may still be inside its stop; starting on top of it is how a fresh
+        // core got stopped by an old one's cleanup.
+        awaitCoreHandover(generation)
+
+        // Start protect socket server BEFORE starting native process
         // Native process will use this to call VpnService.protect() on its sockets
         FileLogger.i(TAG, "STEP 1a: Starting protect socket server...")
         startProtectServer(protectPath)
@@ -1153,14 +1235,17 @@ class TiredVpnService : VpnService() {
         FileLogger.i(TAG, "=== ALL STEPS COMPLETE ===")
     }
 
-    private suspend fun connectProxyMode(config: VpnConfig) {
+    private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             throw RuntimeException("HTTP Proxy mode requires Android 10+")
         }
 
         FileLogger.i(TAG, "=== PROXY MODE CONNECT START ===")
 
-        // 1. Start tiredvpn in proxy mode (without -tun, without control socket)
+        // 1. Take ownership of the one core in this process, then start it.
+        awaitCoreHandover(generation)
+
+        // Start tiredvpn in proxy mode (without -tun, without control socket)
         setPhase(getString(R.string.phase_starting_core))
         FileLogger.i(TAG, "STEP 1: Starting tiredvpn in proxy mode...")
         startTiredVpnProxyProcess(config)
@@ -3495,40 +3580,40 @@ class TiredVpnService : VpnService() {
                 // What does bound it: stopClient() in jni_android.go waits on
                 // clientWg through a select with time.After(5 * time.Second)
                 // and returns either way. Five seconds, held here, once.
-                ownedProcess?.stopAndWait()
-                // Null the field only if it is still the core we just stopped.
-                if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
+                // Ownership, not a re-check: stopAndWait() reaches the one core
+                // in the process through a Go package-level variable, so the
+                // object we snapshotted is not what decides which core stops.
+                // Taking it here also parks a newer connect in
+                // awaitCoreHandover instead of letting it start underneath us.
+                val stoppedTheCore = withOwnedCore(generation, "executeReconnectSequence") {
+                    val ownedProcess = tiredvpnProcess
+                    ownedProcess?.stopAndWait()
+                    if (tiredvpnProcess === ownedProcess) tiredvpnProcess = null
 
-                // 3b. Drop the JNI callback bridge. stopAndWait() above only
-                // signals the core's main goroutine; parallel strategy attempts
-                // outlive it, and this path never unwired them, so the next
-                // start() ran initialize() on top of a live core still holding
-                // the previous callback. Unwiring is all this does — see
-                // cleanupFailedConnection for what cleanupNative is.
-                //
-                // Gated, and this is the first check that can actually fire:
-                // the wait above is the long one. The bridge is global JNI
-                // state, so dropping it after a new core has registered would
-                // cut that core's callback rather than the dead one's.
-                if (!stillOurs(generation, "step 3b")) return@withContext
-                FileLogger.d(TAG, "executeReconnectSequence: Step 3b - Native cleanup")
-                try { TiredVpnNative.cleanup() } catch (e: Throwable) {
-                    FileLogger.w(TAG, "executeReconnectSequence: native cleanup failed: ${e.message}")
-                }
+                    // 3b. Drop the JNI callback bridge, inside the same
+                    // ownership: it is global state, and dropping it after a
+                    // newer core has registered cuts that core's callback.
+                    FileLogger.d(TAG, "executeReconnectSequence: Step 3b - Native cleanup")
+                    try { TiredVpnNative.cleanup() } catch (e: Throwable) {
+                        FileLogger.w(TAG, "executeReconnectSequence: native cleanup failed: ${e.message}")
+                    }
 
-                // 4. DELETE control socket file to avoid conflicts.
-                // Same ownership question as protect.sock: one fixed name, and
-                // after the wait above a new core may have bound it. Unlinking
-                // it then leaves connectToControlSocket waiting 30s for a file
-                // that will never reappear.
-                if (!stillOurs(generation, "step 4")) return@withContext
-                FileLogger.d(TAG, "executeReconnectSequence: Step 4 - Delete control socket file")
-                val controlPath = "${filesDir.absolutePath}/control.sock"
-                val socketFile = File(controlPath)
-                if (socketFile.exists()) {
-                    val deleted = socketFile.delete()
-                    FileLogger.d(TAG, "executeReconnectSequence: Control socket file deleted: $deleted")
+                    // 4. Delete the control socket file. One fixed name, and
+                    // after the wait above a new core may have bound it;
+                    // unlinking it then leaves connectToControlSocket waiting
+                    // 30s for a file that will never reappear.
+                    FileLogger.d(TAG, "executeReconnectSequence: Step 4 - Delete control socket file")
+                    val socketFile = File("${filesDir.absolutePath}/control.sock")
+                    if (socketFile.exists()) {
+                        FileLogger.d(TAG, "executeReconnectSequence: Control socket file deleted: ${socketFile.delete()}")
+                    }
                 }
+                if (!stoppedTheCore) return@withContext
+
+                // Steps 3b and 4 moved inside the ownership block above: the
+                // JNI bridge and control.sock are process-wide, so they belong
+                // to whoever owns the core, not to whoever passed a check a
+                // moment ago.
 
                 // 5. Close VPN interface (through the ledger: closed once, ours only).
                 if (!stillOurs(generation, "step 5")) return@withContext
@@ -3841,26 +3926,31 @@ class TiredVpnService : VpnService() {
         // Close control socket
         closeControlChannel()
 
-        // Stop tiredvpn process (now waits internally for up to 5 seconds)
-        try {
-            FileLogger.d(TAG, "Stopping tiredvpn process...")
-            tiredvpnProcess?.stop()
-            FileLogger.d(TAG, "Process stopped")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "Error stopping process", e)
-        }
-        tiredvpnProcess = null
+        // Stop the core and drop its callback bridge, as one owner. A
+        // user-initiated disconnect answers to no generation, so it takes
+        // whatever is in the slot — and a connect racing it waits in
+        // awaitCoreHandover rather than starting a core this block then stops.
+        //
+        // What actually stops the core is stop() (stopClient cancels the client
+        // context and waits up to five seconds on clientWg); cleanup() only
+        // makes sure whatever survived that wait has no way left to call back
+        // into us. Descriptors are closed below, through the ledger.
+        withCoreReset {
+            try {
+                FileLogger.d(TAG, "Stopping tiredvpn process...")
+                tiredvpnProcess?.stop()
+                FileLogger.d(TAG, "Process stopped")
+            } catch (e: Exception) {
+                FileLogger.w(TAG, "Error stopping process", e)
+            }
+            tiredvpnProcess = null
 
-        // Drop the JNI callback bridge. What actually stops the core is the
-        // stop() above (stopClient cancels the client context and waits up to
-        // five seconds on clientWg); this only makes sure that whatever
-        // survived that wait has no way left to call back into us. Descriptors
-        // are closed below, through the ledger.
-        try {
-            TiredVpnNative.cleanup()
-            FileLogger.d(TAG, "Native callback bridge dropped")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "Error cleaning up native library", e)
+            try {
+                TiredVpnNative.cleanup()
+                FileLogger.d(TAG, "Native callback bridge dropped")
+            } catch (e: Exception) {
+                FileLogger.w(TAG, "Error cleaning up native library", e)
+            }
         }
 
         // Close the VPN interface and every other descriptor we established.
