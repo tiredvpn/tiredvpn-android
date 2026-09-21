@@ -34,7 +34,7 @@ import org.robolectric.shadows.ShadowToast
  * the tests fill the real dialog, press the real Save, and read the record.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class SettingsDialogTest {
 
     private lateinit var context: Context

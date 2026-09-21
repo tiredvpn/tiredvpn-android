@@ -7,6 +7,72 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-21
+
+### Compatibility
+
+- **Install this build before the servers move to core 1.11.x. Older builds
+  will not connect after they do.** Core 1.11.0 changed what goes on the wire
+  and says so plainly: an audit of the DPI strategies found an open relay that
+  handed any host on the internet a tunnel for five bytes of ASCII, payloads
+  travelling in clear, and markers that named the protocol to anyone watching.
+  None of those could be closed without changing the wire, and there is no mode
+  where a server accepts both formats - for the authentication holes that mode
+  would keep the hole open, and for the markers it would keep the fingerprint
+  live. The break is not in one strategy: REALITY moved its dispatch byte inside
+  the encrypted layer, the stego framing replaced a literal marker with a keyed
+  one, ALPN stopped advertising `tiredvpn`, and the rest followed. A build older
+  than this one has nothing left to fall back to. This app carries the core it
+  was built with, so installing this release is what makes a phone ready.
+
+### Removed
+
+- **Port hopping is gone from the app.** What was left after 1.10.0 removed the
+  lying code path was a settings screen, a generator and a set of config fields
+  that no longer reached anything: the core has never implemented the command
+  the client used to send. Configs that still carry the old fields import fine;
+  the fields are ignored.
+
+### Fixed
+
+- **Connecting now fails when it says it will.** Each step of a connection
+  attempt had its own timeout and none of them knew about the others, so the
+  worst case was around a minute and forty in "Connecting" before reporting a
+  failure that was decided much earlier. There is one deadline per attempt now,
+  and every step gets what is left of it.
+
+- **A reboot no longer switches the VPN back on against the user's wishes.**
+  Auto-connect on boot was the entire decision, so someone who turned the tunnel
+  off and then restarted their phone got it back. The persistent flags that say
+  how the last session ended were read, logged, and ignored; they now decide.
+  The same rule covers an app update, which never asks the boot preference at
+  all - an update quietly connecting a VPN for someone who had it off is the
+  same defect from the other side.
+
+- **The network change path looks at the network actually carrying traffic**
+  rather than at whichever one was announced last, so a handover is noticed when
+  it happens instead of up to two seconds later.
+
+- **A server that fails to save says so.** Writes to the encrypted store report
+  their outcome now, and the screen that asked for the write shows the failure
+  instead of looking like it worked.
+
+- **A server config sent as JSON keeps its endpoint selection policy.** Only the
+  link format carried it, so the same server arrived with a different policy
+  depending on how it was sent.
+
+### Changed
+
+- Bundled core updated to 1.11.4, which also brings: an endpoint the client
+  knows is unreachable is skipped rather than waited on, the connection pool
+  honours its own limits and its idle timeout, and the cover-domain order no
+  longer repeats per client. 1.11.4 itself is two Android-only fixes: the
+  authenticated REALITY data layer is now required here as it already was on
+  every other client - the Android config is built as a literal that bypassed
+  the flag defaults, so the phone was the one platform still accepting the
+  malleable older layer - and a dead native command channel stopped answering
+  "ok" to anything asked of it.
+
 ## [1.10.0] - 2026-09-21
 
 This release is the result of an audit: eleven independent reviews of the

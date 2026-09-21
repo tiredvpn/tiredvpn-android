@@ -23,7 +23,7 @@ import org.robolectric.annotation.Config
  * takes.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ConfigImportReceiverTest {
 
     private fun importJson(json: String): VpnConfig? {

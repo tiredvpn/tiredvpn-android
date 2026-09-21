@@ -45,6 +45,19 @@ class VpnCoreCallSiteTest {
     private fun sourceOrNull(name: String): String? =
         sourceRoot().walkTopDown().firstOrNull { it.isFile && it.name == name }?.readText()
 
+    /**
+     * Every Kotlin file in main, comments stripped, keyed by file name.
+     *
+     * For rules of the form "nothing anywhere calls this". Asking one file
+     * answers a narrower question than the rule states — see rule 7 in
+     * verification.md, where a guard placed in the common funnel missed the
+     * one of eleven entry points that bypassed it.
+     */
+    private fun allSources(): Map<String, String> =
+        sourceRoot().walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .associate { it.name to stripComments(it.readText()) }
+
     private fun stripComments(text: String): String {
         val out = StringBuilder(text.length)
         var i = 0
@@ -329,9 +342,29 @@ class VpnCoreCallSiteTest {
             "withTimeoutOrNull around a blocking readLine cancels a coroutine and leaves the socket reading",
             service.contains("withTimeoutOrNull(15000)")
         )
+        // The number handed to readLine is the socket option, so it has to be
+        // the real budget. Since ConnectDeadline landed it is no longer the
+        // bare constant: it is what is left of the attempt, capped by the
+        // socket's standing ceiling. Both halves are asserted, because either
+        // one alone brings back a read nobody is measuring — an uncapped
+        // remainder outlives the socket's contract, and the bare ceiling
+        // outlives the attempt.
+        val sendTunFd = bodyAfter(service, "private suspend fun sendTunFd(")
         assertTrue(
-            "the set_fd read must name the budget it actually uses",
-            service.contains("channel.readLine(SET_FD_READ_TIMEOUT)")
+            "the set_fd read must be bounded by what is left of the attempt",
+            sendTunFd.contains("budget.requireSocketTimeoutMs(")
+        )
+        assertTrue(
+            "and by the socket's standing ceiling",
+            sendTunFd.contains("SET_FD_READ_TIMEOUT.toLong()")
+        )
+        assertTrue(
+            "the value computed from both is the one the read gets",
+            sendTunFd.contains("channel.readLine(readMs)")
+        )
+        assertFalse(
+            "an untimed readLine() here is the blocking read this rule exists to stop",
+            Regex("""channel\.readLine\(\s*\)""").containsMatchIn(sendTunFd)
         )
         assertTrue(
             "the timed read must set the socket option, not just a coroutine deadline",
@@ -621,17 +654,42 @@ class VpnCoreCallSiteTest {
         assertTrue("isLibraryLoaded is read now, through isAvailable", native.contains("val isAvailable: Boolean"))
     }
 
+    /**
+     * The core can hop by itself, and the app must not ask it to.
+     *
+     * `cmd/tiredvpn` takes `-port-hop`, `-port-hop-start`, `-port-hop-end`,
+     * `-port-hop-strategy` and `-port-hop-seed`, and `client.Config` drives
+     * `StartPortHopChecker` from them. The client side of the feature is gone —
+     * see PortHoppingRemovedTest — so a flag here would turn half of it back
+     * on: the core would rotate the port and nothing in the app would know.
+     *
+     * Asserted as "absent" deliberately. The day a flag is added, this test
+     * fails and whoever adds it has to bring back the UI and the config field
+     * in the same change, rather than shipping a hop the user cannot see.
+     */
     @Test
-    fun `the service no longer claims port hops that did not happen`() {
-        val service = source("TiredVpnService.kt")
-        assertFalse(
-            "the core has no port_hop command; the old handler wrote it, ignored the answer, " +
-                "and then reported Connected(currentPort = N)",
-            service.contains("port_hop")
+    fun `the core is not told to hop either`() {
+        val sources = allSources()
+
+        // Positive control (rule 2): the scan must cover the two files that
+        // build the core's argv, or "no flag anywhere" is a statement about
+        // files it never opened.
+        assertTrue(
+            "positive control: TiredVpnService must still assemble the argv",
+            sources.getValue("TiredVpnService.kt").contains("""args.add("-android")""")
         )
-        assertFalse("nothing may be wired to the unreachable hop callback", service.contains("onReconnectNeeded"))
-        // The class itself stays: whoever implements the core side next needs it.
-        assertTrue(sourceOrNull("PortHopper.kt") != null)
+        assertTrue(
+            "positive control: ServerPoolConfig must still assemble the endpoint flags",
+            sources.getValue("ServerPoolConfig.kt").contains("""mutableListOf("-server", endpoint)""")
+        )
+
+        val passers = sources.filterValues { it.contains("-port-hop") }.keys
+        assertEquals(
+            "a port-hopping flag reaches the core from $passers; the client side of this " +
+                "feature was removed, so a flag here would turn half of it back on",
+            emptySet<String>(),
+            passers
+        )
     }
 
     // --- 8 the gap against core 1.10 ----------------------------------------
@@ -679,9 +737,22 @@ class VpnCoreCallSiteTest {
     @Test
     fun `the reconnect response is read only once the state says Connected`() {
         val service = source("TiredVpnService.kt")
-        val connectedAssignment = service.indexOf("_state.value = VpnState.Connected(\n                                        strategy = connectedStrategy")
+
+        // Matched on tokens rather than on an exact 40-space indent: the rule
+        // is about the order of two statements, and a reformat that moves them
+        // both is not a regression. The old literal encoded the indentation,
+        // so `./gradlew ktlintFormat` would have failed this test while the
+        // property it guards still held.
+        val connectedAssignment = Regex(
+            """_state\.value\s*=\s*VpnState\.Connected\(\s*strategy\s*=\s*connectedStrategy"""
+        ).find(service)?.range?.first ?: -1
         val applyCall = service.indexOf("source = \"network_changed response\"")
-        assertTrue("both landmarks must be found", connectedAssignment >= 0 && applyCall >= 0)
+
+        assertTrue(
+            "landmark not found: the Connected assignment fed by connectedStrategy",
+            connectedAssignment >= 0
+        )
+        assertTrue("landmark not found: the network_changed response apply", applyCall >= 0)
         assertTrue(
             "the rebuild path refuses to run outside Connected, so reading the pair before " +
                 "the state is set drops the change silently",
@@ -849,8 +920,11 @@ class VpnCoreCallSiteTest {
                 bodyAfter(service, name).contains("releaseWakeLock()")
             )
         }
-        for (name in listOf("private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
-            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {")) {
+        // Matched on the name alone: the rule is about what these two functions
+        // do, and it must not lapse quietly the next time one of them takes
+        // another parameter. bodyAfter still fails loudly if either is gone.
+        for (name in listOf("private suspend fun connectTunMode(",
+            "private suspend fun connectProxyMode(")) {
             assertFalse(
                 "$name must not hand the CPU back while its tunnel is up",
                 bodyAfter(service, name).contains("releaseWakeLock()")
@@ -1120,9 +1194,10 @@ class VpnCoreCallSiteTest {
         }
 
         // Both connect paths take ownership before creating anything global.
+        // Matched on the name, not the full signature - see the wake-lock rule.
         for (header in listOf(
-            "private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
-            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {",
+            "private suspend fun connectTunMode(",
+            "private suspend fun connectProxyMode(",
         )) {
             val body = bodyAfter(service, header)
             val handover = body.indexOf("awaitCoreHandover(generation)")

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import com.tiredvpn.android.util.FileLogger
+import com.tiredvpn.android.vpn.BootDecision
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnWatchdogWorker
@@ -147,66 +148,96 @@ class BootReceiver : BroadcastReceiver() {
         // Check if user enabled auto-connect on boot (default true for TV devices)
         val connectOnBoot = prefs.getBoolean(KEY_CONNECT_ON_BOOT, true)
 
-        if (!connectOnBoot) {
-            FileLogger.d(TAG, "Connect on boot disabled by user, skipping")
-            return
-        }
-
-        // Check if VPN should be connected (was running before reboot)
+        // Both halves of the question, in one place. `connect_on_boot` says
+        // whether the user allows a boot to raise the tunnel at all; the two
+        // persistent flags say whether the session that ended was theirs to
+        // end. The receiver used to read the flags, log them and ignore them,
+        // so a user who switched the VPN off and rebooted got it back.
         val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
         val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
 
-        FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
+        FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
 
-        val config = ServerRepository.getActiveServer(context)
-        if (config == null || !config.isValid) {
-            FileLogger.d(TAG, "No valid server configured, skipping auto-connect")
-            return
+        when (
+            BootDecision.afterBoot(
+                connectOnBoot = connectOnBoot,
+                lastSessionWanted = lastSession == BootPolicy.LastSession.WANTED,
+                hasValidConfig = { ServerRepository.getActiveServer(context)?.isValid == true },
+                // VpnService.prepare() returns null if permission is already granted
+                hasVpnPermission = { VpnService.prepare(context) == null },
+            )
+        ) {
+            BootDecision.Outcome.AUTOSTART_OFF -> {
+                FileLogger.d(TAG, "Connect on boot disabled by user, skipping")
+                return
+            }
+
+            BootDecision.Outcome.NOT_RUNNING_BEFORE -> {
+                FileLogger.i(TAG, "Previous session was ended by the user, not reconnecting after boot")
+                return
+            }
+
+            BootDecision.Outcome.NO_VALID_CONFIG -> {
+                FileLogger.d(TAG, "No valid server configured, skipping auto-connect")
+                return
+            }
+
+            BootDecision.Outcome.NO_VPN_PERMISSION -> {
+                FileLogger.w(TAG, "VPN permission not granted, cannot auto-connect")
+                FileLogger.w(TAG, "User must connect VPN manually first to grant permission")
+                return
+            }
+
+            BootDecision.Outcome.START -> {
+                FileLogger.i(TAG, "=== STARTING VPN AFTER BOOT ===")
+                startVpnService(context)
+            }
         }
-
-        // Check if VPN permission is already granted
-        // VpnService.prepare() returns null if permission is already granted
-        val vpnIntent = VpnService.prepare(context)
-        if (vpnIntent != null) {
-            FileLogger.w(TAG, "VPN permission not granted, cannot auto-connect")
-            FileLogger.w(TAG, "User must connect VPN manually first to grant permission")
-            return
-        }
-
-        FileLogger.i(TAG, "=== STARTING VPN AFTER BOOT ===")
-        startVpnService(context)
     }
 
     private fun handleAppUpdated(context: Context) {
         val prefs = context.getSharedPreferences(CREDENTIAL_PREFS_NAME, Context.MODE_PRIVATE)
 
-        // Check if VPN was running before app update
+        // Check if VPN was running before app update. Same question as the boot
+        // path asks, so it is asked through the same object rather than
+        // open-coded twice - the two readings had already been drifting, this
+        // one being the stricter.
         val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
         val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
 
-        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
+        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
 
-        if (!vpnShouldBeConnected && !vpnWasConnected) {
-            FileLogger.d(TAG, "VPN was not connected before update, skipping")
-            return
+        when (
+            BootDecision.afterAppUpdate(
+                lastSessionWanted = lastSession == BootPolicy.LastSession.WANTED,
+                hasValidConfig = { ServerRepository.getActiveServer(context)?.isValid == true },
+                hasVpnPermission = { VpnService.prepare(context) == null },
+            )
+        ) {
+            BootDecision.Outcome.AUTOSTART_OFF -> return
+
+            BootDecision.Outcome.NOT_RUNNING_BEFORE -> {
+                FileLogger.d(TAG, "VPN was not connected before update, skipping")
+                return
+            }
+
+            BootDecision.Outcome.NO_VALID_CONFIG -> {
+                FileLogger.d(TAG, "No valid server configured, skipping")
+                return
+            }
+
+            BootDecision.Outcome.NO_VPN_PERMISSION -> {
+                FileLogger.w(TAG, "VPN permission not granted after update")
+                return
+            }
+
+            BootDecision.Outcome.START -> {
+                FileLogger.i(TAG, "=== RESTARTING VPN AFTER APP UPDATE ===")
+                startVpnService(context)
+            }
         }
-
-        // Check config
-        val config = ServerRepository.getActiveServer(context)
-        if (config == null || !config.isValid) {
-            FileLogger.d(TAG, "No valid server configured, skipping")
-            return
-        }
-
-        // Check VPN permission
-        val vpnIntent = VpnService.prepare(context)
-        if (vpnIntent != null) {
-            FileLogger.w(TAG, "VPN permission not granted after update")
-            return
-        }
-
-        FileLogger.i(TAG, "=== RESTARTING VPN AFTER APP UPDATE ===")
-        startVpnService(context)
     }
 
     private fun startVpnService(context: Context) {

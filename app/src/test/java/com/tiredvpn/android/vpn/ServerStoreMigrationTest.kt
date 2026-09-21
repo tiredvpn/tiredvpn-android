@@ -24,7 +24,7 @@ import org.robolectric.annotation.Config
  * copy replaced the live list and took the active-server key with it.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ServerStoreMigrationTest {
 
     private lateinit var context: Context

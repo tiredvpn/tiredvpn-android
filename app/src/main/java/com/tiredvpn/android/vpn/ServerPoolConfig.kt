@@ -147,6 +147,33 @@ object ServerPoolConfig {
     }
 
     /**
+     * The entries a pool file would hold, or none when no file should be
+     * written at all.
+     *
+     * The rule that matters is the second check: [entries] drops servers with
+     * no usable address, so a pool of two where one is a stale hostname
+     * collapses to a single entry, and a one-entry pool file is worse than
+     * none — it costs a file read and tells the core something it already
+     * knows from `-server`.
+     *
+     * The first check is a short-circuit, not a second rule. A pool of fewer
+     * than two cannot produce two entries either way, so removing it changes
+     * no answer this function gives — only whether [entries] runs at all.
+     * Worth knowing before writing a test for it: there is nothing observable
+     * to assert, which is why ServerPoolConfigTest does not claim otherwise.
+     *
+     * "Empty" means the caller deletes any file left over from a previous,
+     * larger pool. Split out from the service so the boundary can be tested;
+     * TiredVpnService.preparePoolConfig owns the filesystem side and nothing
+     * else.
+     */
+    fun entriesForPoolFile(pool: List<VpnConfig>, resolvedById: Map<String, String>): List<Entry> {
+        if (pool.size < 2) return emptyList()
+        val entries = entries(pool, resolvedById)
+        return if (entries.size < 2) emptyList() else entries
+    }
+
+    /**
      * Turn the pool into `[[servers]]` entries.
      *
      * @param resolvedById pre-resolved "ip:port" per server id. The TUN path

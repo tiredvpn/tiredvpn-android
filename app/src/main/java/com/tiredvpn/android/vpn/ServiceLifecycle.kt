@@ -10,11 +10,12 @@ package com.tiredvpn.android.vpn
  * turns a transient failure into "the VPN never comes back until the user taps
  * connect again".
  *
- * BootReceiver is the exception and is deliberately not in that list: it logs
- * both flags and then gates only on the `connect_on_boot` setting, so a reboot
- * starts the VPN whenever that setting is on, whatever the last teardown was.
- * Whether a reboot should honour the last session's state or the setting is a
- * product question, not a bug in this table — but the table does not cover it.
+ * BootReceiver is not in that list because it only reads them, but it is the
+ * reason the distinctions above have to be exact: it turns the two flags into
+ * BootPolicy.LastSession and refuses to raise the tunnel after a reboot when
+ * the answer is NOT_WANTED. So a teardown that clears a flag it should have
+ * left standing does not just lose a restart — it decides, silently and
+ * permanently, that the user wanted the VPN off.
  */
 internal enum class StopIntent {
     /** The user asked for it: ACTION_DISCONNECT, ACTION_FORCE_RESET. */
@@ -91,4 +92,83 @@ internal object StickyRestart {
 
     fun decide(shouldBeConnected: Boolean, hasValidConfig: Boolean): Decision =
         if (shouldBeConnected && hasValidConfig) Decision.RECONNECT else Decision.STOP
+}
+
+/**
+ * Whether BootReceiver starts the VPN, and if not, which gate stopped it.
+ *
+ * Both paths ask what the previous session was — a VPN the user switched off
+ * stays off, whatever the restart was — and they differ in exactly one rung:
+ * a reboot also obeys `connect_on_boot`, an app update does not consult it at
+ * all. The user asked for the reboot and did not ask for the update, and an
+ * update that silently switches the VPN on for someone who had it off is the
+ * same defect from the other side. What the flags mean is BootPolicy's
+ * question; see also the note on BootReceiver in [StopIntent].
+ *
+ * The last two inputs are suppliers rather than values because their order
+ * matters as much as their answers: reading the active server unlocks an
+ * EncryptedSharedPreferences, and asking for VPN consent is a binder call.
+ * Neither should happen on a device where auto-start is simply off.
+ */
+internal object BootDecision {
+
+    enum class Outcome {
+        /** Every gate passed: start the service and arm the watchdog. */
+        START,
+
+        /** `connect_on_boot` is off. Only reachable from the boot path. */
+        AUTOSTART_OFF,
+
+        /**
+         * Nothing was running before the update, so nothing is restored. Only
+         * reachable from the app-update path.
+         */
+        NOT_RUNNING_BEFORE,
+
+        /** No server, or one that fails [VpnConfig.isValid]. */
+        NO_VALID_CONFIG,
+
+        /**
+         * VpnService.prepare returned an intent, i.e. our consent is gone.
+         * Every start path would fail anyway, so we do not try.
+         */
+        NO_VPN_PERMISSION,
+    }
+
+    /**
+     * @param connectOnBoot     the user's `connect_on_boot` preference
+     * @param lastSessionWanted whether the previous session ended for a reason
+     *        other than the user switching the VPN off; see BootPolicy, which
+     *        reads that from the two persistent flags. A reboot restores what
+     *        was running, not what the setting alone permits.
+     */
+    fun afterBoot(
+        connectOnBoot: Boolean,
+        lastSessionWanted: Boolean,
+        hasValidConfig: () -> Boolean,
+        hasVpnPermission: () -> Boolean,
+    ): Outcome = when {
+        !connectOnBoot -> Outcome.AUTOSTART_OFF
+        !lastSessionWanted -> Outcome.NOT_RUNNING_BEFORE
+        !hasValidConfig() -> Outcome.NO_VALID_CONFIG
+        !hasVpnPermission() -> Outcome.NO_VPN_PERMISSION
+        else -> Outcome.START
+    }
+
+    /**
+     * An app update is not a boot: it never asks `connect_on_boot`, because the
+     * user did not ask for the restart, and an update that silently switches
+     * the VPN on for someone who had it off is the boot defect from the other
+     * side. Only the previous session decides.
+     */
+    fun afterAppUpdate(
+        lastSessionWanted: Boolean,
+        hasValidConfig: () -> Boolean,
+        hasVpnPermission: () -> Boolean,
+    ): Outcome = when {
+        !lastSessionWanted -> Outcome.NOT_RUNNING_BEFORE
+        !hasValidConfig() -> Outcome.NO_VALID_CONFIG
+        !hasVpnPermission() -> Outcome.NO_VPN_PERMISSION
+        else -> Outcome.START
+    }
 }

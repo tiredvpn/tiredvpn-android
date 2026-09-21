@@ -22,7 +22,7 @@ import java.io.ByteArrayInputStream
  * thread, and handed to the parser.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class RestoreFileTest {
 
     private lateinit var context: Context

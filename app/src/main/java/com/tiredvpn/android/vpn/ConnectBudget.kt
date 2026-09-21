@@ -39,12 +39,26 @@ internal object ConnectBudget {
     const val CORE_WORST_CASE_MS = CORE_MAX_ENDPOINT_ATTEMPTS * PER_CANDIDATE_MS
 
     /**
-     * Read timeout on the control socket. Must outlast one full Connect, since
-     * the core answers only once the scan is done, and must stay below
-     * [CONNECT_TIMEOUT_MS] so the outer fence is the one that reports failure.
+     * Read timeout on the control socket between connects — the ceiling the
+     * long-lived status reader sits at, so a wedged core cannot block it
+     * forever.
+     *
+     * During a connect this is a ceiling and not the budget: every read on that
+     * path takes the smaller of this and what [ConnectDeadline] says is left of
+     * [CONNECT_TIMEOUT_MS]. Two 50s reads inside a 60s attempt do not fit, and
+     * before the deadline existed they did not have to — a blocking read runs
+     * to the socket's own timeout no matter what the coroutine around it thinks.
      */
     const val CONTROL_SOCKET_READ_TIMEOUT_MS = CORE_WORST_CASE_MS + 4_000L
 
     /** The whole connect: the core's worst case plus TUN setup and handshake. */
     const val CONNECT_TIMEOUT_MS = CORE_WORST_CASE_MS + 14_000L
+
+    /**
+     * The least budget a second `set_fd` attempt is worth starting with: one
+     * pre-flight probe plus one transport attempt. With less than this the
+     * retry cannot reach a verdict, so it is only a longer "Connecting…" before
+     * the same answer.
+     */
+    const val HANDSHAKE_RETRY_MIN_BUDGET_MS = CORE_PROBE_TIMEOUT_MS + CORE_CONNECT_TIMEOUT_MS
 }

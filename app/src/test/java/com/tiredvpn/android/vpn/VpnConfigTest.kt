@@ -8,7 +8,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class VpnConfigTest {
 
     private fun validConfig() = VpnConfig(
@@ -59,36 +59,90 @@ class VpnConfigTest {
 
     // --- JSON round-trip ---
 
+    /** Every field, each at a value the defaults would not produce. */
+    private fun everyField() = VpnConfig(
+        id = "test-id-123",
+        name = "My Server",
+        serverAddress = "1.2.3.4",
+        serverPort = 443,
+        secret = "secretXYZ",
+        strategy = "reality",
+        enableQuic = false,
+        quicPort = 8443,
+        coverHost = "example.com",
+        rttMasking = true,
+        rttProfile = "siberia",
+        fallbackEnabled = false,
+        debugLogging = true,
+        lastLatencyMs = 42,
+        connectionMode = "proxy",
+        proxyPort = 9090,
+        shaperPreset = "youtube_streaming",
+        shaperSeed = 7L,
+        echEnabled = true,
+        echConfig = "AEr+DQBG",
+        echPublicName = "ech.example.net",
+        serverAddressV6 = "[2001:db8::1]:995",
+        preferIpv6 = true,
+        fallbackV4 = false,
+        tunnelIpv6 = "dual",
+        serverSelectionPolicy = "latency",
+        quicSniFrag = true,
+        mtu = 1380,
+        customDns = "9.9.9.9",
+    )
+
     @Test
     fun `toJson and fromJson round-trip preserves all fields`() {
-        val original = VpnConfig(
-            id = "test-id-123",
-            name = "My Server",
-            serverAddress = "1.2.3.4",
-            serverPort = 443,
-            secret = "secretXYZ",
-            strategy = "reality",
-            enableQuic = false,
-            quicPort = 8443,
-            coverHost = "example.com",
-            rttMasking = true,
-            rttProfile = "siberia",
-            fallbackEnabled = false,
-            debugLogging = true,
-            lastLatencyMs = 42,
-            connectionMode = "proxy",
-            proxyPort = 9090,
-            portHoppingEnabled = true,
-            portHopRangeStart = 48000,
-            portHopRangeEnd = 60000,
-            portHopIntervalMs = 30_000L,
-            portHopStrategy = "fibonacci",
-            portHopSeed = "abcdef12"
-        )
+        val original = everyField()
 
         val restored = VpnConfig.fromJson(original.toJson())
 
         assertEquals(original, restored)
+    }
+
+    /**
+     * The round-trip above only covers the fields it happens to name, and the
+     * pair it exercises is the one the server store writes and reads: a field
+     * added to the data class but missed in [VpnConfig.toJson] is silently
+     * dropped on every restart, and the test still passes because it never
+     * heard of that field either.
+     *
+     * So the field list is taken from the class rather than retyped. Java
+     * reflection, not Kotlin's - kotlin-reflect is not on the test classpath,
+     * and a data class gives every constructor property a backing field with
+     * the property's name.
+     */
+    @Test
+    fun `every field of the data class is written to JSON and set above`() {
+        val declared = VpnConfig::class.java.declaredFields
+            .filterNot { java.lang.reflect.Modifier.isStatic(it.modifiers) }
+            .map { it.name }
+            .toSet()
+
+        // Positive control (rule 2): reflection that found nothing would pass
+        // every assertion below.
+        assertTrue("reflection found no fields at all", declared.size > 20)
+        assertTrue(declared.containsAll(listOf("serverAddress", "secret", "customDns")))
+
+        val written = everyField().toJson().keys().asSequence().toSet()
+        assertEquals("fields the JSON does not carry", emptySet<String>(), declared - written)
+        assertEquals("JSON keys no field answers to", emptySet<String>(), written - declared)
+
+        // And the sample really does move every one of them off its default,
+        // or the round-trip test proves nothing about the ones it skipped. The
+        // three identifying fields have no default to differ from.
+        val sample = everyField()
+        val defaults = VpnConfig(serverAddress = "1.2.3.4", serverPort = 443, secret = "secretXYZ")
+        val untouched = declared.filterNot { name ->
+            val field = VpnConfig::class.java.getDeclaredField(name).apply { isAccessible = true }
+            field.get(sample) != field.get(defaults)
+        }
+        assertEquals(
+            "left at its default value, so the round-trip says nothing about it",
+            listOf("secret", "serverAddress", "serverPort"),
+            untouched.sorted(),
+        )
     }
 
     // --- fromJson defaults ---
@@ -114,20 +168,7 @@ class VpnConfigTest {
         assertEquals(-1L, config.lastLatencyMs)
         assertEquals("tun", config.connectionMode)
         assertEquals(8080, config.proxyPort)
-        assertFalse(config.portHoppingEnabled)
-        assertEquals("random", config.portHopStrategy)
-    }
-
-    @Test
-    fun `fromJson with empty portHopSeed returns null`() {
-        val json = JSONObject().apply {
-            put("serverAddress", "10.0.0.1")
-            put("serverPort", 993)
-            put("secret", "s")
-            put("portHopSeed", "")
-        }
-
-        assertNull(VpnConfig.fromJson(json).portHopSeed)
+        assertEquals(ServerPoolConfig.DEFAULT_POLICY, config.serverSelectionPolicy)
     }
 
     @Test

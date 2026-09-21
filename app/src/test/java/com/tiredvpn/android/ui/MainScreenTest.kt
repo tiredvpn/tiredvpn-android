@@ -34,7 +34,7 @@ import org.robolectric.shadows.ShadowVpnService
  * that matter here are the ones where the tap leads nowhere.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class MainScreenTest {
 
     private lateinit var context: Context

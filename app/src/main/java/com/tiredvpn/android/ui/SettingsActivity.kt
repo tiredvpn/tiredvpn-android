@@ -32,6 +32,7 @@ import com.tiredvpn.android.databinding.ActivitySettingsBinding
 import com.tiredvpn.android.importer.ConfigCodec
 import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.util.SharedFiles
+import com.tiredvpn.android.util.StoreWriteError
 import com.tiredvpn.android.vpn.ServerRepository
 import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnState
@@ -108,13 +109,6 @@ class SettingsActivity : BaseActivity() {
             "chrome_browsing" to "Chrome Browsing",
             "random_per_session" to "Random (per session)"
         )
-
-        // Port hop strategies accepted by the core: random / sequential / fibonacci.
-        private val PORT_HOP_STRATEGIES = listOf(
-            "random" to "Random",
-            "sequential" to "Sequential",
-            "fibonacci" to "Fibonacci"
-        )
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -132,6 +126,28 @@ class SettingsActivity : BaseActivity() {
         loadSettings()
         updateBatteryOptimizationStatus()
     }
+
+    /**
+     * Store one per-server setting, and say so when the store refuses.
+     *
+     * Every writer on this screen used to drop the boolean saveServer returns
+     * and then redraw the row from the config it had just built in memory, so a
+     * refused write and a successful one were the same picture: the dialog
+     * closed, the new value appeared, and the old one was back on the next
+     * launch. The callers gate their redraw on this, so the value on screen is
+     * the value in storage.
+     *
+     * A switch that was toggled stays where the finger left it - putting it
+     * back from here would re-enter the listener that called us. The toast is
+     * the report; the next [loadSettings] corrects the position.
+     *
+     * @return true when the write landed.
+     */
+    private fun persist(config: VpnConfig): Boolean = StoreWriteError.unless(
+        ServerRepository.saveServer(this, config),
+        this,
+        R.string.store_save_failed,
+    )
 
     private fun loadSettings() {
         val prefs = getSharedPreferences("tiredvpn_settings", MODE_PRIVATE)
@@ -198,7 +214,6 @@ class SettingsActivity : BaseActivity() {
             binding.protocolValue.text = getString(R.string.protocol_auto)
             binding.rttValue.text = getString(R.string.value_disabled)
             binding.coverHostValue.text = getString(R.string.not_set)
-            binding.portHoppingValue.text = getString(R.string.port_hop_disabled)
             binding.shaperValue.text = getString(R.string.traffic_shaper_off)
             binding.echValue.text = getString(R.string.value_disabled)
             binding.quicSniFragSwitch.isChecked = false
@@ -213,13 +228,6 @@ class SettingsActivity : BaseActivity() {
     }
 
     private fun updateObfuscationDisplay(config: VpnConfig) {
-        // Port hopping
-        binding.portHoppingValue.text = if (config.portHoppingEnabled) {
-            "${config.portHopRangeStart}-${config.portHopRangeEnd}"
-        } else {
-            getString(R.string.port_hop_disabled)
-        }
-
         // Traffic shaper
         binding.shaperValue.text = SHAPER_PRESETS.find { it.first == config.shaperPreset }?.second
             ?: getString(R.string.traffic_shaper_off)
@@ -268,8 +276,6 @@ class SettingsActivity : BaseActivity() {
         binding.fallbackRow.alpha = alpha
 
         // Obfuscation
-        binding.portHoppingRow.isEnabled = enabled
-        binding.portHoppingRow.alpha = alpha
         binding.shaperRow.isEnabled = enabled
         binding.shaperRow.alpha = alpha
         binding.echRow.isEnabled = enabled
@@ -360,11 +366,6 @@ class SettingsActivity : BaseActivity() {
             if (ServerRepository.getActiveServer(this) != null) showCoverHostDialog()
         }
 
-        // Port hopping settings
-        binding.portHoppingRow.setOnClickListener {
-            if (ServerRepository.getActiveServer(this) != null) showPortHoppingDialog()
-        }
-
         // Traffic shaper settings
         binding.shaperRow.setOnClickListener {
             if (ServerRepository.getActiveServer(this) != null) showShaperDialog()
@@ -379,7 +380,7 @@ class SettingsActivity : BaseActivity() {
         binding.quicSniFragSwitch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.quicSniFragSwitch.isEnabled) {
-                ServerRepository.saveServer(this, config.copy(quicSniFrag = isChecked))
+                persist(config.copy(quicSniFrag = isChecked))
             }
         }
 
@@ -392,7 +393,7 @@ class SettingsActivity : BaseActivity() {
         binding.preferIpv6Switch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.preferIpv6Switch.isEnabled) {
-                ServerRepository.saveServer(this, config.copy(preferIpv6 = isChecked))
+                persist(config.copy(preferIpv6 = isChecked))
             }
         }
 
@@ -400,7 +401,7 @@ class SettingsActivity : BaseActivity() {
         binding.fallbackV4Switch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.fallbackV4Switch.isEnabled) {
-                ServerRepository.saveServer(this, config.copy(fallbackV4 = isChecked))
+                persist(config.copy(fallbackV4 = isChecked))
             }
         }
 
@@ -408,7 +409,7 @@ class SettingsActivity : BaseActivity() {
         binding.tunnelIpv6Switch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.tunnelIpv6Switch.isEnabled) {
-                ServerRepository.saveServer(this, config.copy(tunnelIpv6 = if (isChecked) "dual" else "off"))
+                persist(config.copy(tunnelIpv6 = if (isChecked) "dual" else "off"))
             }
         }
 
@@ -437,7 +438,7 @@ class SettingsActivity : BaseActivity() {
         binding.fallbackSwitch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.fallbackSwitch.isEnabled && config.fallbackEnabled != isChecked) {
-                ServerRepository.saveServer(this, config.copy(fallbackEnabled = isChecked))
+                persist(config.copy(fallbackEnabled = isChecked))
             }
         }
 
@@ -445,7 +446,7 @@ class SettingsActivity : BaseActivity() {
         binding.debugLoggingSwitch.setOnCheckedChangeListener { _, isChecked ->
             val config = ServerRepository.getActiveServer(this)
             if (config != null && binding.debugLoggingSwitch.isEnabled) {
-                ServerRepository.saveServer(this, config.copy(debugLogging = isChecked))
+                persist(config.copy(debugLogging = isChecked))
             }
         }
 
@@ -585,8 +586,7 @@ class SettingsActivity : BaseActivity() {
             .setSingleChoiceItems(names, currentIndex) { dialog, which ->
                 val selectedStrategy = values[which]
                 val newConfig = config.copy(strategy = selectedStrategy)
-                ServerRepository.saveServer(this, newConfig)
-                binding.protocolValue.text = names[which]
+                if (persist(newConfig)) binding.protocolValue.text = names[which]
                 dialog.dismiss()
             }
             .show()
@@ -612,8 +612,7 @@ class SettingsActivity : BaseActivity() {
                 } else {
                     config.copy(rttMasking = true, rttProfile = values[which])
                 }
-                ServerRepository.saveServer(this, newConfig)
-                updateAdvancedSettingsDisplay(newConfig)
+                if (persist(newConfig)) updateAdvancedSettingsDisplay(newConfig)
                 dialog.dismiss()
             }
             .show()
@@ -652,8 +651,7 @@ class SettingsActivity : BaseActivity() {
             .setView(layout)
             .setItems(presets) { dialog, which ->
                 val newConfig = config.copy(coverHost = presets[which])
-                ServerRepository.saveServer(this, newConfig)
-                updateAdvancedSettingsDisplay(newConfig)
+                if (persist(newConfig)) updateAdvancedSettingsDisplay(newConfig)
                 dialog.dismiss()
             }
             .setPositiveButton("Custom") { dialog, _ ->
@@ -662,8 +660,7 @@ class SettingsActivity : BaseActivity() {
                     Toast.makeText(this, R.string.invalid_host, Toast.LENGTH_SHORT).show()
                 } else {
                     val newConfig = config.copy(coverHost = host)
-                    ServerRepository.saveServer(this, newConfig)
-                    updateAdvancedSettingsDisplay(newConfig)
+                    if (persist(newConfig)) updateAdvancedSettingsDisplay(newConfig)
                 }
                 dialog.dismiss()
             }
@@ -700,104 +697,6 @@ class SettingsActivity : BaseActivity() {
     private fun isValidIpAddress(value: String): Boolean =
         InputValidation.isIpv4Literal(value)
 
-    private fun showPortHoppingDialog() {
-        val config = ServerRepository.getActiveServer(this) ?: return
-
-        val layout = dialogContainer()
-
-        val enabledSwitch = com.google.android.material.materialswitch.MaterialSwitch(this).apply {
-            text = getString(R.string.port_hopping)
-            isChecked = config.portHoppingEnabled
-        }
-        layout.addView(enabledSwitch)
-
-        val (startLayout, startEdit) = textField(
-            getString(R.string.port_hop_range_start),
-            config.portHopRangeStart.toString(),
-            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
-        )
-        val (endLayout, endEdit) = textField(
-            getString(R.string.port_hop_range_end),
-            config.portHopRangeEnd.toString(),
-            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
-        )
-        val (intervalLayout, intervalEdit) = textField(
-            getString(R.string.port_hop_interval_hint),
-            (config.portHopIntervalMs / 1000L).toString(),
-            inputTypeFlags = InputType.TYPE_CLASS_NUMBER
-        )
-        val (seedLayout, seedEdit) = textField(
-            getString(R.string.port_hop_seed),
-            config.portHopSeed ?: "",
-            helper = getString(R.string.port_hop_seed_hint)
-        )
-
-        // Strategy spinner-like: use a read-only field that opens a sub-dialog
-        var selectedHopStrategy = config.portHopStrategy
-        val (strategyLayout, strategyEdit) = textField(
-            getString(R.string.port_hop_strategy),
-            PORT_HOP_STRATEGIES.find { it.first == selectedHopStrategy }?.second ?: selectedHopStrategy
-        )
-        strategyEdit.isFocusable = false
-        strategyEdit.isClickable = true
-        strategyEdit.setOnClickListener {
-            val names = PORT_HOP_STRATEGIES.map { it.second }.toTypedArray()
-            val values = PORT_HOP_STRATEGIES.map { it.first }
-            val idx = values.indexOf(selectedHopStrategy).coerceAtLeast(0)
-            MaterialAlertDialogBuilder(this)
-                .setTitle(R.string.port_hop_strategy)
-                .setSingleChoiceItems(names, idx) { d, which ->
-                    selectedHopStrategy = values[which]
-                    strategyEdit.setText(names[which])
-                    d.dismiss()
-                }
-                .show()
-        }
-
-        listOf(startLayout, endLayout, intervalLayout, strategyLayout, seedLayout).forEach { layout.addView(it) }
-
-        fun setDetailVisibility(visible: Boolean) {
-            val vis = if (visible) View.VISIBLE else View.GONE
-            listOf(startLayout, endLayout, intervalLayout, strategyLayout, seedLayout).forEach { it.visibility = vis }
-        }
-        setDetailVisibility(config.portHoppingEnabled)
-        enabledSwitch.setOnCheckedChangeListener { _, checked -> setDetailVisibility(checked) }
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.port_hopping)
-            .setView(layout)
-            .setPositiveButton(R.string.save) { _, _ ->
-                val enabled = enabledSwitch.isChecked
-                if (!enabled) {
-                    val newConfig = config.copy(portHoppingEnabled = false)
-                    ServerRepository.saveServer(this, newConfig)
-                    updateObfuscationDisplay(newConfig)
-                    return@setPositiveButton
-                }
-                val start = startEdit.text?.toString()?.trim()?.toIntOrNull()
-                val end = endEdit.text?.toString()?.trim()?.toIntOrNull()
-                val intervalSec = intervalEdit.text?.toString()?.trim()?.toLongOrNull()
-                if (start == null || end == null || start !in 1024..65535 || end !in 1024..65535 || start >= end) {
-                    Toast.makeText(this, R.string.invalid_port_range, Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                val intervalMs = ((intervalSec ?: 60L).coerceAtLeast(1L)) * 1000L
-                val seed = seedEdit.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-                val newConfig = config.copy(
-                    portHoppingEnabled = true,
-                    portHopRangeStart = start,
-                    portHopRangeEnd = end,
-                    portHopIntervalMs = intervalMs,
-                    portHopStrategy = selectedHopStrategy,
-                    portHopSeed = seed
-                )
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
-    }
-
     private fun showShaperDialog() {
         val config = ServerRepository.getActiveServer(this) ?: return
 
@@ -824,8 +723,7 @@ class SettingsActivity : BaseActivity() {
             .setPositiveButton(R.string.save) { _, _ ->
                 val seed = seedEdit.text?.toString()?.trim()?.toLongOrNull() ?: 0L
                 val newConfig = config.copy(shaperPreset = selectedPreset, shaperSeed = seed)
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
+                if (persist(newConfig)) updateObfuscationDisplay(newConfig)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -887,8 +785,7 @@ class SettingsActivity : BaseActivity() {
                     echConfig = echConfig,
                     echPublicName = publicName
                 )
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
+                if (persist(newConfig)) updateObfuscationDisplay(newConfig)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -917,8 +814,7 @@ class SettingsActivity : BaseActivity() {
                     return@setPositiveButton
                 }
                 val newConfig = config.copy(serverAddressV6 = v6)
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
+                if (persist(newConfig)) updateObfuscationDisplay(newConfig)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -950,8 +846,7 @@ class SettingsActivity : BaseActivity() {
                     return@setPositiveButton
                 }
                 val newConfig = config.copy(mtu = mtu)
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
+                if (persist(newConfig)) updateObfuscationDisplay(newConfig)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -978,8 +873,7 @@ class SettingsActivity : BaseActivity() {
                     return@setPositiveButton
                 }
                 val newConfig = config.copy(customDns = dns)
-                ServerRepository.saveServer(this, newConfig)
-                updateObfuscationDisplay(newConfig)
+                if (persist(newConfig)) updateObfuscationDisplay(newConfig)
             }
             .setNegativeButton(R.string.cancel, null)
             .show()
@@ -1021,8 +915,7 @@ class SettingsActivity : BaseActivity() {
 
                 // Save new mode
                 val newConfig = config.copy(connectionMode = selectedMode)
-                ServerRepository.saveServer(this, newConfig)
-                loadSettings()
+                if (persist(newConfig)) loadSettings()
 
                 // Reconnect when the service actually reports Disconnected. The
                 // old 1.5 s timer was a guess: a CONNECT that arrives mid-teardown
@@ -1085,8 +978,7 @@ class SettingsActivity : BaseActivity() {
                     return@setPositiveButton
                 }
                 val newConfig = config.copy(proxyPort = port)
-                ServerRepository.saveServer(this, newConfig)
-                loadSettings()
+                if (persist(newConfig)) loadSettings()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()

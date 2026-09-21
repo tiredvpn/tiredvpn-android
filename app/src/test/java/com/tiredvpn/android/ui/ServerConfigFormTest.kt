@@ -24,7 +24,7 @@ import org.robolectric.annotation.Config
  * real Save button, and ask [ServerRepository] what was written.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ServerConfigFormTest {
 
     private lateinit var context: Context

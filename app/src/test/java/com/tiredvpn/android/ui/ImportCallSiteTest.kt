@@ -40,7 +40,7 @@ import java.io.File
  * [ServerRepository] what was actually stored.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ImportCallSiteTest {
 
     @get:Rule

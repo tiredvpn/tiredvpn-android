@@ -32,7 +32,7 @@ import org.robolectric.annotation.Config
  * through real rebinds and then read the text of the real flag view.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ServerAdapterTest {
 
     private lateinit var parent: FrameLayout

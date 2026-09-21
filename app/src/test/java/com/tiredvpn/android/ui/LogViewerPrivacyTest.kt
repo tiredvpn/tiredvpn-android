@@ -29,7 +29,7 @@ import java.io.File
  * hand over before it hands it over.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class LogViewerPrivacyTest {
 
     private lateinit var context: Context

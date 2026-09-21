@@ -23,7 +23,7 @@ import org.robolectric.annotation.Config
  * failure this file exists to catch.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [35])
 class ConfigImporterTest {
 
     private lateinit var context: Context
