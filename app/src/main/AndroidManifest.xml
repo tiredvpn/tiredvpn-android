@@ -29,8 +29,23 @@
     <!-- Camera for QR scanning -->
     <uses-permission android:name="android.permission.CAMERA" />
 
-    <!-- Install APK updates from app -->
+    <!-- Install APK updates from app.
+
+         This is what Google Play does not allow for apps distributed through the
+         store, so a build made with -PselfUpdate=false strips it from the merged
+         manifest; see the StripSelfUpdatePermissions task in app/build.gradle.kts.
+         It cannot be removed with tools:node="${placeholder}" — the manifest
+         merger validates that attribute before placeholders are substituted. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Foreground service type for the APK download (WorkManager setForeground).
+
+         Declared in every build, unlike the permission above. The type is a
+         property of WorkManager's shared SystemForegroundService, so stripping it
+         per build would mean the service advertises a type the app has no
+         permission for — and any future foreground worker would then fail on
+         API 34+. A build without self-update simply never starts the service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -177,6 +192,15 @@
                 android:value="vpn" />
         </service>
 
+        <!-- WorkManager's foreground-work host. UpdateWorker calls setForeground()
+             while downloading an APK, and from API 34 on the platform refuses to
+             start a foreground service whose type is not declared. WorkManager
+             ships this service without a type, so the type is merged in here. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
         <!-- Boot Receiver for auto-connect - MUST be exported to receive system broadcasts -->
         <receiver
             android:name=".receiver.BootReceiver"
@@ -188,9 +212,15 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <!-- Direct boot (before unlock) - requires directBootAware="true" -->
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-                <!-- Quick boot on some devices -->
+                <!-- Quick boot on some devices.
+
+                     com.htc.intent.action.QUICKBOOT_POWERON used to be here too.
+                     It is a vendor action and is not in the platform's protected
+                     broadcast list, so any installed app could send it straight
+                     to this exported receiver and have the VPN brought up. The
+                     three actions left are all protected: only the system can
+                     send them. -->
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.REBOOT" />
                 <!-- App updated - restart VPN if was running -->
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
