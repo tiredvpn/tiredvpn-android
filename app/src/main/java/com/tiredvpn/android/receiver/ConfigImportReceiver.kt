@@ -77,7 +77,9 @@ class ConfigImportReceiver : BroadcastReceiver() {
             return
         }
 
-        val result = ConfigImporter.apply(context, plan)
+        // A companion app provisioning a node does not get to decide which node
+        // the user connects through; only an empty list selects itself.
+        val result = ConfigImporter.apply(context, plan, mayChangeActiveServer = false)
         showToast(
             context,
             "Imported: ${result.added} added, ${result.updated} updated, ${result.skipped} skipped"

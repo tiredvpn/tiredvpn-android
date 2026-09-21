@@ -165,6 +165,34 @@ class ImportCallSiteTest {
     }
 
     @Test
+    fun `an external link does not move the user onto the sender's server`() {
+        // One tired:// link and one tap on Import was enough to repoint the VPN
+        // at whoever sent the link, on a device that already had servers. The
+        // dialog says nothing about that, so it has to not happen.
+        ServerRepository.saveServer(
+            context,
+            VpnConfig(name = "Mine", serverAddress = "mine.example", serverPort = 995, secret = "k"),
+        )
+        val mine = ServerRepository.getActiveServer(context)!!.id
+
+        startImportActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link("theirs.example"))))
+        confirm()
+
+        assertEquals(2, stored().size)
+        assertEquals(mine, ServerRepository.getActiveServer(context)?.id)
+    }
+
+    @Test
+    fun `an external link on a device with no servers does become the active one`() {
+        // The control: the rule above must not be implemented by never pointing
+        // at anything, which would leave a fresh install with nothing selected.
+        startImportActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link("first.example"))))
+        confirm()
+
+        assertEquals("first.example", ServerRepository.getActiveServer(context)?.serverAddress)
+    }
+
+    @Test
     fun `a link shared in from another app is imported`() {
         val shared = Intent(Intent.ACTION_SEND)
             .setType("text/plain")

@@ -48,6 +48,26 @@ class ConfigImportReceiverTest {
         assertEquals("s3cr3t", saved.secret)
     }
 
+    @Test
+    fun `the receiver leaves the active server alone when the user already chose one`() {
+        // A companion app provisioning an extra node must not also decide which
+        // node the user connects through.
+        val context = RuntimeEnvironment.getApplication()
+        ServerRepository.saveServer(
+            context,
+            VpnConfig(name = "Mine", serverAddress = "mine.example", serverPort = 995, secret = "k"),
+        )
+        val mine = ServerRepository.getActiveServer(context)!!.id
+
+        ConfigImportReceiver().onReceive(
+            context,
+            Intent(ConfigImportReceiver.ACTION_IMPORT_CONFIG).putExtra("json", "{$minimalV4}"),
+        )
+
+        assertEquals(2, ServerRepository.getServers(context).size)
+        assertEquals(mine, ServerRepository.getActiveServer(context)?.id)
+    }
+
     // --- IPv6 endpoint ---
 
     @Test
