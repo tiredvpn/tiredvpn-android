@@ -9,9 +9,6 @@ sealed class VpnState {
         val attempts: Int = 1,
         val mode: String = "tun",
         val proxyAddress: String? = null,
-        // Port hopping info
-        val currentPort: Int? = null,
-        val portHoppingEnabled: Boolean = false
     ) : VpnState()
     data class Error(val message: String) : VpnState()
 }

@@ -342,9 +342,29 @@ class VpnCoreCallSiteTest {
             "withTimeoutOrNull around a blocking readLine cancels a coroutine and leaves the socket reading",
             service.contains("withTimeoutOrNull(15000)")
         )
+        // The number handed to readLine is the socket option, so it has to be
+        // the real budget. Since ConnectDeadline landed it is no longer the
+        // bare constant: it is what is left of the attempt, capped by the
+        // socket's standing ceiling. Both halves are asserted, because either
+        // one alone brings back a read nobody is measuring — an uncapped
+        // remainder outlives the socket's contract, and the bare ceiling
+        // outlives the attempt.
+        val sendTunFd = bodyAfter(service, "private suspend fun sendTunFd(")
         assertTrue(
-            "the set_fd read must name the budget it actually uses",
-            service.contains("channel.readLine(SET_FD_READ_TIMEOUT)")
+            "the set_fd read must be bounded by what is left of the attempt",
+            sendTunFd.contains("budget.requireSocketTimeoutMs(")
+        )
+        assertTrue(
+            "and by the socket's standing ceiling",
+            sendTunFd.contains("SET_FD_READ_TIMEOUT.toLong()")
+        )
+        assertTrue(
+            "the value computed from both is the one the read gets",
+            sendTunFd.contains("channel.readLine(readMs)")
+        )
+        assertFalse(
+            "an untimed readLine() here is the blocking read this rule exists to stop",
+            Regex("""channel\.readLine\(\s*\)""").containsMatchIn(sendTunFd)
         )
         assertTrue(
             "the timed read must set the socket option, not just a coroutine deadline",
@@ -634,102 +654,18 @@ class VpnCoreCallSiteTest {
         assertTrue("isLibraryLoaded is read now, through isAvailable", native.contains("val isAvailable: Boolean"))
     }
 
-    @Test
-    fun `the service no longer claims port hops that did not happen`() {
-        val service = source("TiredVpnService.kt")
-        assertFalse(
-            "the core has no port_hop command; the old handler wrote it, ignored the answer, " +
-                "and then reported Connected(currentPort = N)",
-            service.contains("port_hop")
-        )
-        assertFalse("nothing may be wired to the unreachable hop callback", service.contains("onReconnectNeeded"))
-        // The class itself stays: whoever implements the core side next needs it.
-        assertTrue(sourceOrNull("PortHopper.kt") != null)
-    }
-
     /**
-     * The rest of the hop path, which the test above does not reach.
-     *
-     * Removing the `port_hop` write left the machinery standing: the service
-     * still builds a PortHopperConfig and a ConnectionManager, and
-     * ConnectionManager still has a hop checker, a forced hop and a reset.
-     * None of them is called. A single line — `connectionManager?.
-     * startHopChecker(scope)` — would put the whole lie back, and it contains
-     * no string the test above looks for.
-     *
-     * So the rule is stated where it can be checked: the hopper's output
-     * reaches nothing, in any file.
-     */
-    @Test
-    fun `no caller anywhere revives the hop path`() {
-        val sources = allSources()
-
-        // Positive control (rule 2): the scan has to be looking at the files
-        // that declare these, or it proves nothing by finding no callers.
-        assertTrue("ConnectionManager.kt missing from the scan", sources.containsKey("ConnectionManager.kt"))
-        assertTrue("PortHopper.kt missing from the scan", sources.containsKey("PortHopper.kt"))
-        assertTrue(
-            "the scan is not reading ConnectionManager's declarations",
-            sources.getValue("ConnectionManager.kt").contains("fun startHopChecker(")
-        )
-
-        val forbidden = listOf(
-            // Starts the loop that would hop.
-            "startHopChecker",
-            // Advances the hopper and returns an endpoint to dial.
-            "forceHop",
-            "resetPortHopper",
-            // Reads the hopper's output, which is where a UI claim comes from.
-            "getCurrentEndpoint()",
-            "getCurrentPort()",
-            "getPortHopperStats",
-            "getTimeUntilNextHopMs()",
-            // Installs the callback the old lie was reported through.
-            "onReconnectNeeded",
-        )
-
-        for (member in forbidden) {
-            val callers = sources
-                .filterKeys { it != "ConnectionManager.kt" }
-                .filterValues { it.contains(member) }
-                .keys
-            assertEquals(
-                "ConnectionManager.$member has a caller again in $callers; the core still answers " +
-                    "`unknown command` to port_hop, so a hop reported to the user did not happen",
-                emptySet<String>(),
-                callers
-            )
-        }
-
-        // `stopHopChecker` is the one member the service is allowed to call:
-        // stopping a checker that was never started is a no-op and cannot
-        // claim anything. Pinned to exactly one call site so it cannot quietly
-        // become the place a start creeps back in beside.
-        assertEquals(
-            "stopHopChecker is allowed once, in initConnectionManager, and nowhere else",
-            1,
-            occurrences(sources.getValue("TiredVpnService.kt"), "stopHopChecker()")
-        )
-        assertTrue(
-            "the allowed call must still be the defensive one in initConnectionManager",
-            bodyAfter(sources.getValue("TiredVpnService.kt"), "private fun initConnectionManager(")
-                .contains("connectionManager?.stopHopChecker()")
-        )
-    }
-
-    /**
-     * The other half of the same lie: the core can hop by itself, and the app
-     * never asks it to.
+     * The core can hop by itself, and the app must not ask it to.
      *
      * `cmd/tiredvpn` takes `-port-hop`, `-port-hop-start`, `-port-hop-end`,
      * `-port-hop-strategy` and `-port-hop-seed`, and `client.Config` drives
-     * `StartPortHopChecker` from them. Nothing in this app puts any of them on
-     * the command line — so a user who turns port hopping on in Settings gets
-     * a Kotlin PortHopper nothing reads and a core that was never told.
+     * `StartPortHopChecker` from them. The client side of the feature is gone —
+     * see PortHoppingRemovedTest — so a flag here would turn half of it back
+     * on: the core would rotate the port and nothing in the app would know.
      *
      * Asserted as "absent" deliberately. The day a flag is added, this test
-     * fails and whoever adds it has to decide what the Kotlin PortHopper is
-     * still for: two generators disagreeing about the port is worse than one.
+     * fails and whoever adds it has to bring back the UI and the config field
+     * in the same change, rather than shipping a hop the user cannot see.
      */
     @Test
     fun `the core is not told to hop either`() {
@@ -749,8 +685,8 @@ class VpnCoreCallSiteTest {
 
         val passers = sources.filterValues { it.contains("-port-hop") }.keys
         assertEquals(
-            "a port-hopping flag reaches the core from $passers; see PortHopperDivergenceTest " +
-                "before letting the Kotlin PortHopper run alongside it",
+            "a port-hopping flag reaches the core from $passers; the client side of this " +
+                "feature was removed, so a flag here would turn half of it back on",
             emptySet<String>(),
             passers
         )
@@ -984,8 +920,11 @@ class VpnCoreCallSiteTest {
                 bodyAfter(service, name).contains("releaseWakeLock()")
             )
         }
-        for (name in listOf("private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
-            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {")) {
+        // Matched on the name alone: the rule is about what these two functions
+        // do, and it must not lapse quietly the next time one of them takes
+        // another parameter. bodyAfter still fails loudly if either is gone.
+        for (name in listOf("private suspend fun connectTunMode(",
+            "private suspend fun connectProxyMode(")) {
             assertFalse(
                 "$name must not hand the CPU back while its tunnel is up",
                 bodyAfter(service, name).contains("releaseWakeLock()")
@@ -1255,9 +1194,10 @@ class VpnCoreCallSiteTest {
         }
 
         // Both connect paths take ownership before creating anything global.
+        // Matched on the name, not the full signature - see the wake-lock rule.
         for (header in listOf(
-            "private suspend fun connectTunMode(config: VpnConfig, generation: Int) {",
-            "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {",
+            "private suspend fun connectTunMode(",
+            "private suspend fun connectProxyMode(",
         )) {
             val body = bodyAfter(service, header)
             val handover = body.indexOf("awaitCoreHandover(generation)")

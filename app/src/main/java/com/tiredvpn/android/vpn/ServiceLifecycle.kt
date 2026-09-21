@@ -10,11 +10,12 @@ package com.tiredvpn.android.vpn
  * turns a transient failure into "the VPN never comes back until the user taps
  * connect again".
  *
- * BootReceiver is the exception and is deliberately not in that list: it logs
- * both flags and then gates only on the `connect_on_boot` setting, so a reboot
- * starts the VPN whenever that setting is on, whatever the last teardown was.
- * Whether a reboot should honour the last session's state or the setting is a
- * product question, not a bug in this table — but the table does not cover it.
+ * BootReceiver is not in that list because it only reads them, but it is the
+ * reason the distinctions above have to be exact: it turns the two flags into
+ * BootPolicy.LastSession and refuses to raise the tunnel after a reboot when
+ * the answer is NOT_WANTED. So a teardown that clears a flag it should have
+ * left standing does not just lose a restart — it decides, silently and
+ * permanently, that the user wanted the VPN off.
  */
 internal enum class StopIntent {
     /** The user asked for it: ACTION_DISCONNECT, ACTION_FORCE_RESET. */
@@ -96,13 +97,13 @@ internal object StickyRestart {
 /**
  * Whether BootReceiver starts the VPN, and if not, which gate stopped it.
  *
- * The two paths do not ask the same questions, and the difference is the thing
- * worth pinning. After a reboot the `connect_on_boot` setting decides on its
- * own: the VPN comes up whether or not it was running when the device went
- * down. After an app update it is the other way round — the setting is not
- * consulted at all, and the VPN comes back only if it was up before. Both are
- * defensible and neither is written down anywhere except in the order of the
- * `if`s; see the note on BootReceiver in [StopIntent].
+ * Both paths ask what the previous session was — a VPN the user switched off
+ * stays off, whatever the restart was — and they differ in exactly one rung:
+ * a reboot also obeys `connect_on_boot`, an app update does not consult it at
+ * all. The user asked for the reboot and did not ask for the update, and an
+ * update that silently switches the VPN on for someone who had it off is the
+ * same defect from the other side. What the flags mean is BootPolicy's
+ * question; see also the note on BootReceiver in [StopIntent].
  *
  * The last two inputs are suppliers rather than values because their order
  * matters as much as their answers: reading the active server unlocks an
@@ -134,24 +135,38 @@ internal object BootDecision {
         NO_VPN_PERMISSION,
     }
 
+    /**
+     * @param connectOnBoot     the user's `connect_on_boot` preference
+     * @param lastSessionWanted whether the previous session ended for a reason
+     *        other than the user switching the VPN off; see BootPolicy, which
+     *        reads that from the two persistent flags. A reboot restores what
+     *        was running, not what the setting alone permits.
+     */
     fun afterBoot(
         connectOnBoot: Boolean,
+        lastSessionWanted: Boolean,
         hasValidConfig: () -> Boolean,
         hasVpnPermission: () -> Boolean,
     ): Outcome = when {
         !connectOnBoot -> Outcome.AUTOSTART_OFF
+        !lastSessionWanted -> Outcome.NOT_RUNNING_BEFORE
         !hasValidConfig() -> Outcome.NO_VALID_CONFIG
         !hasVpnPermission() -> Outcome.NO_VPN_PERMISSION
         else -> Outcome.START
     }
 
+    /**
+     * An app update is not a boot: it never asks `connect_on_boot`, because the
+     * user did not ask for the restart, and an update that silently switches
+     * the VPN on for someone who had it off is the boot defect from the other
+     * side. Only the previous session decides.
+     */
     fun afterAppUpdate(
-        shouldBeConnected: Boolean,
-        wasConnected: Boolean,
+        lastSessionWanted: Boolean,
         hasValidConfig: () -> Boolean,
         hasVpnPermission: () -> Boolean,
     ): Outcome = when {
-        !shouldBeConnected && !wasConnected -> Outcome.NOT_RUNNING_BEFORE
+        !lastSessionWanted -> Outcome.NOT_RUNNING_BEFORE
         !hasValidConfig() -> Outcome.NO_VALID_CONFIG
         !hasVpnPermission() -> Outcome.NO_VPN_PERMISSION
         else -> Outcome.START

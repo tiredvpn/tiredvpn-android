@@ -4,6 +4,7 @@ import android.app.Activity
 import android.widget.Toast
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.tiredvpn.android.R
+import com.tiredvpn.android.util.StoreWriteError
 
 /**
  * The one dialog every import path goes through.
@@ -53,6 +54,21 @@ object ImportPreview {
                     mayChangeActiveServer = !fromExternalSource,
                 )
                 Toast.makeText(activity, summary(activity, result), Toast.LENGTH_LONG).show()
+                // A second toast rather than a line inside the summary: the
+                // summary counts what the payload contained, and a store that
+                // refused the write is a different kind of news with a cause
+                // worth naming.
+                if (result.failed > 0) {
+                    Toast.makeText(
+                        activity,
+                        activity.getString(
+                            R.string.store_import_failed,
+                            result.failed,
+                            StoreWriteError.reason(activity),
+                        ),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
                 onDone(result)
             }
             .setNegativeButton(android.R.string.cancel) { _, _ -> onDone(null) }

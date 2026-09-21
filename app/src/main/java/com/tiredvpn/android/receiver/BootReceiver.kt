@@ -148,17 +148,21 @@ class BootReceiver : BroadcastReceiver() {
         // Check if user enabled auto-connect on boot (default true for TV devices)
         val connectOnBoot = prefs.getBoolean(KEY_CONNECT_ON_BOOT, true)
 
-        // Logged, not gated on: a reboot honours the setting, not the last
-        // session's state. See BootDecision.
-        if (connectOnBoot) {
-            val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
-            val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
-            FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
-        }
+        // Both halves of the question, in one place. `connect_on_boot` says
+        // whether the user allows a boot to raise the tunnel at all; the two
+        // persistent flags say whether the session that ended was theirs to
+        // end. The receiver used to read the flags, log them and ignore them,
+        // so a user who switched the VPN off and rebooted got it back.
+        val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
+        val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
+
+        FileLogger.d(TAG, "Boot check: connectOnBoot=$connectOnBoot, vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
 
         when (
             BootDecision.afterBoot(
                 connectOnBoot = connectOnBoot,
+                lastSessionWanted = lastSession == BootPolicy.LastSession.WANTED,
                 hasValidConfig = { ServerRepository.getActiveServer(context)?.isValid == true },
                 // VpnService.prepare() returns null if permission is already granted
                 hasVpnPermission = { VpnService.prepare(context) == null },
@@ -166,6 +170,11 @@ class BootReceiver : BroadcastReceiver() {
         ) {
             BootDecision.Outcome.AUTOSTART_OFF -> {
                 FileLogger.d(TAG, "Connect on boot disabled by user, skipping")
+                return
+            }
+
+            BootDecision.Outcome.NOT_RUNNING_BEFORE -> {
+                FileLogger.i(TAG, "Previous session was ended by the user, not reconnecting after boot")
                 return
             }
 
@@ -180,8 +189,6 @@ class BootReceiver : BroadcastReceiver() {
                 return
             }
 
-            BootDecision.Outcome.NOT_RUNNING_BEFORE -> return
-
             BootDecision.Outcome.START -> {
                 FileLogger.i(TAG, "=== STARTING VPN AFTER BOOT ===")
                 startVpnService(context)
@@ -192,20 +199,25 @@ class BootReceiver : BroadcastReceiver() {
     private fun handleAppUpdated(context: Context) {
         val prefs = context.getSharedPreferences(CREDENTIAL_PREFS_NAME, Context.MODE_PRIVATE)
 
-        // Check if VPN was running before app update
+        // Check if VPN was running before app update. Same question as the boot
+        // path asks, so it is asked through the same object rather than
+        // open-coded twice - the two readings had already been drifting, this
+        // one being the stricter.
         val vpnShouldBeConnected = VpnWatchdogWorker.shouldVpnBeConnected(context)
         val vpnWasConnected = prefs.getBoolean(KEY_VPN_WAS_CONNECTED, false)
+        val lastSession = BootPolicy.lastSession(vpnWasConnected, vpnShouldBeConnected)
 
-        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected")
+        FileLogger.d(TAG, "App updated: vpnShouldBeConnected=$vpnShouldBeConnected, vpnWasConnected=$vpnWasConnected, lastSession=$lastSession")
 
         when (
             BootDecision.afterAppUpdate(
-                shouldBeConnected = vpnShouldBeConnected,
-                wasConnected = vpnWasConnected,
+                lastSessionWanted = lastSession == BootPolicy.LastSession.WANTED,
                 hasValidConfig = { ServerRepository.getActiveServer(context)?.isValid == true },
                 hasVpnPermission = { VpnService.prepare(context) == null },
             )
         ) {
+            BootDecision.Outcome.AUTOSTART_OFF -> return
+
             BootDecision.Outcome.NOT_RUNNING_BEFORE -> {
                 FileLogger.d(TAG, "VPN was not connected before update, skipping")
                 return
@@ -220,8 +232,6 @@ class BootReceiver : BroadcastReceiver() {
                 FileLogger.w(TAG, "VPN permission not granted after update")
                 return
             }
-
-            BootDecision.Outcome.AUTOSTART_OFF -> return
 
             BootDecision.Outcome.START -> {
                 FileLogger.i(TAG, "=== RESTARTING VPN AFTER APP UPDATE ===")

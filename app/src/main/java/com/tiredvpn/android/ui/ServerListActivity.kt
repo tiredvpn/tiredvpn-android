@@ -21,6 +21,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import com.tiredvpn.android.util.PingManager
+import com.tiredvpn.android.util.StoreWriteError
 
 class ServerListActivity : BaseActivity() {
     private lateinit var binding: ActivityServerLocationsBinding
@@ -58,9 +59,18 @@ class ServerListActivity : BaseActivity() {
             null,
             lifecycleScope, // Pass lifecycleScope
             onServerClick = { server ->
-                ServerRepository.setActiveServerId(this, server.id)
-                refreshList()
-                finish() // Go back to Main
+                // Leaving the screen on a refused write is what made the choice
+                // look taken: Main reads the pointer back and shows the server
+                // that is still active.
+                if (StoreWriteError.unless(
+                        ServerRepository.setActiveServerId(this, server.id),
+                        this,
+                        R.string.store_active_failed,
+                    )
+                ) {
+                    refreshList()
+                    finish() // Go back to Main
+                }
             },
             onServerLongClick = { server ->
                 showServerOptions(server)
@@ -207,7 +217,15 @@ class ServerListActivity : BaseActivity() {
             .setTitle("Delete Server")
             .setMessage("Are you sure you want to delete ${server.name}?")
             .setPositiveButton("Delete") { _, _ ->
-                ServerRepository.deleteServer(this, server.id)
+                // refreshList still runs on a refusal: the row is redrawn from
+                // storage, so the server the user tried to delete reappears.
+                // That plus the toast is the honest picture; silently redrawing
+                // it with no explanation was the defect.
+                StoreWriteError.unless(
+                    ServerRepository.deleteServer(this, server.id),
+                    this,
+                    R.string.store_delete_failed,
+                )
                 refreshList()
             }
             .setNegativeButton("Cancel", null)

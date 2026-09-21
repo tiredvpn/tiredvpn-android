@@ -25,8 +25,6 @@ import com.tiredvpn.android.native.NativeProcess
 import com.tiredvpn.android.native.NativeProcessJNI
 import com.tiredvpn.android.native.TiredVpnNative
 import com.tiredvpn.android.native.TiredVpnProcess
-import com.tiredvpn.android.porthopping.HopStrategy
-import com.tiredvpn.android.porthopping.PortHopperConfig
 import com.tiredvpn.android.receiver.BootReceiver
 import com.tiredvpn.android.ui.MainActivity
 import kotlinx.coroutines.*
@@ -66,6 +64,22 @@ class TiredVpnService : VpnService() {
          * and leaves the socket reading.
          */
         private const val SET_FD_READ_TIMEOUT = CONTROL_SOCKET_READ_TIMEOUT
+
+        /**
+         * Names for the three waits a connect is made of, carried by
+         * [ConnectDeadlineExceeded] and shown to the user.
+         *
+         * They are separate because the faults are: the core never opened its
+         * socket, the core opened it and never answered `connect`, the core
+         * answered `connect` and then never finished dialling. One sentence for
+         * all three ("Connection timed out") cost real diagnosis time.
+         */
+        private const val STEP_CORE_STARTUP = "core startup"
+        private const val STEP_CORE_CONNECT = "core handshake"
+        private const val STEP_HANDSHAKE = "server handshake"
+
+        /** Pause between the two `set_fd` attempts. Counted against the budget. */
+        private const val HANDSHAKE_RETRY_DELAY_MS = 1_000L
 
         /**
          * Read deadline for one protect-socket client. The core connects,
@@ -279,7 +293,6 @@ class TiredVpnService : VpnService() {
     @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var connectionManager: ConnectionManager? = null  // Port hopping manager
 
     // Connection info from Go binary response
     private var connectedStrategy: String = ""
@@ -507,53 +520,6 @@ class TiredVpnService : VpnService() {
     }
 
     /**
-     * Initialize ConnectionManager with port hopping configuration.
-     */
-    private fun initConnectionManager(config: VpnConfig) {
-        // Stop any existing hop checker
-        connectionManager?.stopHopChecker()
-
-        // Create port hopping config if enabled
-        val portHopConfig = if (config.portHoppingEnabled) {
-            // Convert hex seed string to bytes if provided
-            val seedBytes = config.portHopSeed?.let { seedHex ->
-                try {
-                    // Use hex string as ASCII bytes (same as Go)
-                    seedHex.toByteArray(Charsets.US_ASCII)
-                } catch (e: Exception) {
-                    FileLogger.w(TAG, "Failed to parse port hop seed: ${e.message}")
-                    null
-                }
-            }
-
-            PortHopperConfig(
-                enabled = true,
-                portRangeStart = config.portHopRangeStart,
-                portRangeEnd = config.portHopRangeEnd,
-                hopIntervalMs = config.portHopIntervalMs,
-                strategy = HopStrategy.fromString(config.portHopStrategy),
-                seed = seedBytes
-            )
-        } else {
-            null
-        }
-
-        connectionManager = ConnectionManager(config, portHopConfig)
-
-        // No reconnect callback is wired here on purpose.
-        //
-        // The hop path was never reachable — ConnectionManager.startHopChecker
-        // is called from nowhere — and the handler it used to point at lied
-        // about the outcome: it wrote a `port_hop` command the core does not
-        // implement (parseClientArgs has no such case; the control server
-        // answers "unknown command"), never read the reply, and then set
-        // VpnState.Connected(currentPort = N) and a "Connected (port N)"
-        // notification. Turning the feature on would have shown the user a
-        // successful hop that did not happen. PortHopper itself is untouched:
-        // whoever wires it up next has to implement the core side first.
-    }
-
-    /**
      * Start a connection attempt.
      *
      * [supersedes] is for callers that decided to connect some time ago and
@@ -600,9 +566,6 @@ class TiredVpnService : VpnService() {
         // and disconnect.
         acquireWakeLock()
 
-        // Initialize ConnectionManager with port hopping if enabled
-        initConnectionManager(config)
-
         // Auto-reset scope if coroutine body hasn't started after 2 attempts
         connectAttemptsSinceBodyEntered++
         if (connectAttemptsSinceBodyEntered > 2) {
@@ -638,14 +601,20 @@ class TiredVpnService : VpnService() {
             // (success, timeout, error) is real coroutine execution, not a wedge.
             disarmConnectWatchdog()
             try {
-                FileLogger.i(TAG, "=== CONNECT START === mode=${config.connectionMode}, portHopping=${config.portHoppingEnabled}")
+                FileLogger.i(TAG, "=== CONNECT START === mode=${config.connectionMode}, strategy=${config.strategy}")
                 _state.value = VpnState.Connecting
 
-                // Overall connection timeout - 30 seconds max (REDUCED from 60s for faster failure detection)
+                // One point of reference for the whole attempt, started at the
+                // same instant as the coroutine fence and carrying the same
+                // number. The fence alone could not keep it: every blocking
+                // socket read below used to name its own timeout and run to it
+                // after the fence had already fired, which is how a 60s budget
+                // produced a 110s "Connecting…".
+                val deadline = ConnectDeadline(System.currentTimeMillis(), CONNECTION_TIMEOUT)
                 withTimeout(CONNECTION_TIMEOUT) {
                     when (config.connectionMode) {
                         "proxy" -> connectProxyMode(config, generation)
-                        else -> connectTunMode(config, generation)
+                        else -> connectTunMode(config, generation, deadline)
                     }
                 }
             } catch (e: TimeoutCancellationException) {
@@ -654,6 +623,16 @@ class TiredVpnService : VpnService() {
                 _state.value = VpnState.Error("Connection timed out")
                 cleanupFailedConnection(generation)
                 // Schedule auto-reconnect after timeout
+                scheduleAutoReconnect(config)
+            } catch (e: ConnectDeadlineExceeded) {
+                // The budget ran out inside a step that knows which step it was.
+                // Reported instead of the coroutine fence firing later, and with
+                // the step named: "waiting for the core to start" and "waiting
+                // for it to answer set_fd" are different faults.
+                FileLogger.e(TAG, "Connect budget spent at ${e.step} after ${e.elapsedMs}ms of ${e.totalMs}ms")
+                clearPhase()
+                _state.value = VpnState.Error(getString(R.string.connect_timed_out_at, e.step))
+                cleanupFailedConnection(generation)
                 scheduleAutoReconnect(config)
             } catch (e: CancellationException) {
                 FileLogger.i(TAG, "Connection cancelled")
@@ -1082,7 +1061,7 @@ class TiredVpnService : VpnService() {
         FileLogger.d(TAG, "forceResetCore: done")
     }
 
-    private suspend fun connectTunMode(config: VpnConfig, generation: Int) {
+    private suspend fun connectTunMode(config: VpnConfig, generation: Int, deadline: ConnectDeadline) {
         val controlPath = "${filesDir.absolutePath}/control.sock"
         val protectPath = "${filesDir.absolutePath}/protect.sock"
         FileLogger.d(TAG, "Control socket path: $controlPath")
@@ -1113,6 +1092,13 @@ class TiredVpnService : VpnService() {
         resolvedPool[config.id] = resolvedEndpoint
         for (member in ServerPoolConfig.selectPool(ServerRepository.getServers(this), config)) {
             if (member.id == config.id) continue
+            // InetAddress.getAllByName has no timeout of its own, so the guard
+            // is between resolutions rather than around one: a pool of five
+            // behind a dead resolver must not spend the whole attempt here.
+            if (deadline.isExpired(System.currentTimeMillis())) {
+                FileLogger.w(TAG, "Pool member ${member.name} left out: connect budget spent while resolving")
+                break
+            }
             val resolved = resolveServerEndpoint(member.serverEndpoint)
             if (resolved == null) {
                 // Left out rather than passed through as a name: an
@@ -1147,7 +1133,7 @@ class TiredVpnService : VpnService() {
         // 2. Wait for socket and connect
         setPhase(getString(R.string.phase_control_socket))
         FileLogger.i(TAG, "STEP 2: Connecting to control socket...")
-        val tunConfig = connectToControlSocket(controlPath)
+        val tunConfig = connectToControlSocket(controlPath, deadline)
             ?: throw RuntimeException("Failed to get tunnel config from server")
 
         FileLogger.i(TAG, "STEP 2: Got tunnel config: IP=${tunConfig.ip}, DNS=${tunConfig.dns}, MTU=${tunConfig.mtu}")
@@ -1183,11 +1169,20 @@ class TiredVpnService : VpnService() {
             handshakeAttempt++
             setPhase(getString(R.string.phase_handshake))
             FileLogger.i(TAG, "STEP 4: Sending TUN fd=$tunFd to tiredvpn (attempt $handshakeAttempt/$maxHandshakeRetries)...")
-            finalIp = sendTunFd(tunFd)
+            finalIp = sendTunFd(tunFd, deadline)
 
             if (finalIp == null && handshakeAttempt < maxHandshakeRetries) {
-                FileLogger.w(TAG, "STEP 4: Handshake failed, retrying after 1s delay...")
-                delay(1000) // Wait 1 second before retry
+                // A retry is worth starting only while the core could still
+                // reach a verdict inside what is left. Otherwise it is the same
+                // failure, announced later — which is the whole defect this
+                // deadline exists to remove.
+                val left = deadline.remainingMs(System.currentTimeMillis())
+                if (left < ConnectBudget.HANDSHAKE_RETRY_MIN_BUDGET_MS + HANDSHAKE_RETRY_DELAY_MS) {
+                    FileLogger.w(TAG, "STEP 4: Handshake failed and only ${left}ms of budget left, not retrying")
+                    break
+                }
+                FileLogger.w(TAG, "STEP 4: Handshake failed, retrying after ${HANDSHAKE_RETRY_DELAY_MS}ms (${left}ms of budget left)...")
+                delay(HANDSHAKE_RETRY_DELAY_MS)
             }
         }
 
@@ -1221,7 +1216,7 @@ class TiredVpnService : VpnService() {
                 }
                 tunFd = newVpnFd.fd
 
-                val newFinalIp = sendTunFd(tunFd)
+                val newFinalIp = sendTunFd(tunFd, deadline)
                 if (newFinalIp != null) {
                     finalIp = newFinalIp
                     activeTunnelConfig = newTunConfig.copy(ip = finalIp)
@@ -1989,12 +1984,19 @@ class TiredVpnService : VpnService() {
         ).also { it.start() }
     }
 
-    private suspend fun connectToControlSocket(socketPath: String): TunnelConfig? {
+    private suspend fun connectToControlSocket(
+        socketPath: String,
+        budget: ConnectDeadline,
+    ): TunnelConfig? {
         FileLogger.d(TAG, "connectToControlSocket: waiting for socket at $socketPath")
 
-        // Wait for socket to appear
+        // Wait for socket to appear. The step's own ceiling still applies - a
+        // core that has not opened its socket in 30s is not going to - but the
+        // attempt's remaining budget is the smaller of the two whenever the
+        // steps before this one were slow.
         val socketFile = File(socketPath)
-        val deadline = System.currentTimeMillis() + CONTROL_SOCKET_TIMEOUT
+        val waitBudget = budget.budgetMs(System.currentTimeMillis(), CONTROL_SOCKET_TIMEOUT.toLong())
+        val deadline = System.currentTimeMillis() + waitBudget
         var waitMs = 0L
 
         while (!socketFile.exists() && System.currentTimeMillis() < deadline) {
@@ -2017,7 +2019,8 @@ class TiredVpnService : VpnService() {
         currentCoroutineContext().ensureActive()
 
         if (!socketFile.exists()) {
-            FileLogger.e(TAG, "connectToControlSocket: socket NOT created within ${CONTROL_SOCKET_TIMEOUT}ms")
+            FileLogger.e(TAG, "connectToControlSocket: socket NOT created within ${waitBudget}ms")
+            budget.requireMs(System.currentTimeMillis(), STEP_CORE_STARTUP)
             return null
         }
         FileLogger.d(TAG, "connectToControlSocket: socket appeared after ${waitMs}ms")
@@ -2052,9 +2055,20 @@ class TiredVpnService : VpnService() {
             // sink before it starts reading commands, so a keepalive can arrive
             // between our write and its answer; treating that line as the
             // response failed the connect on a healthy core.
+            //
+            // The read deadline is what is left of the attempt, capped by the
+            // socket's standing ceiling, and it is recomputed per line: an
+            // event that arrives first must not buy the next read a fresh full
+            // timeout. The number handed to readLine is the socket option, so
+            // it is the real one.
             var response: String? = null
             while (response == null) {
-                val line = channel.readLine() ?: throw Exception("No response from control socket")
+                val readMs = minOf(
+                    budget.requireSocketTimeoutMs(System.currentTimeMillis(), STEP_CORE_CONNECT).toLong(),
+                    CONTROL_SOCKET_READ_TIMEOUT.toLong(),
+                ).toInt()
+                val line = channel.readLine(readMs)
+                    ?: throw Exception("No response from control socket within ${readMs}ms")
                 if (ControlSocketProtocol.isEvent(line)) {
                     FileLogger.d(TAG, "connectToControlSocket: skipping event line: $line")
                     continue
@@ -2076,6 +2090,11 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "connectToControlSocket: Server rejected: $error")
                 null
             }
+        } catch (e: ConnectDeadlineExceeded) {
+            // Not a failure of this step: the attempt as a whole is over, and
+            // the caller reports which step spent it. Folding it into `null`
+            // here would turn a stated verdict back into "failed, somehow".
+            throw e
         } catch (e: Exception) {
             FileLogger.e(TAG, "connectToControlSocket: EXCEPTION", e)
             null
@@ -2090,7 +2109,7 @@ class TiredVpnService : VpnService() {
      * 1. Send JSON command with fd attached via SCM_RIGHTS in ONE write
      * 2. Receive response: {"status":"connected",...}
      */
-    private suspend fun sendTunFd(fd: Int): String? {
+    private suspend fun sendTunFd(fd: Int, budget: ConnectDeadline): String? {
         FileLogger.d(TAG, "sendTunFd: START fd=$fd")
         try {
             val channel = controlChannel ?: run {
@@ -2115,22 +2134,31 @@ class TiredVpnService : VpnService() {
 
             // Attach + write + detach as one transaction against the other four
             // writers, so nobody else's command can leave with our descriptor.
+            // What is left of the attempt, never more than the socket's
+            // standing ceiling. Claimed before the write, so a budget already
+            // spent is reported instead of arming a read nobody is waiting for.
+            val readMs = minOf(
+                budget.requireSocketTimeoutMs(System.currentTimeMillis(), STEP_HANDSHAKE).toLong(),
+                SET_FD_READ_TIMEOUT.toLong(),
+            ).toInt()
+
             FileLogger.d(TAG, "sendTunFd: sending set_fd with SCM_RIGHTS...")
             channel.send("""{"command":"set_fd"}""", fileDescriptor)
-            FileLogger.d(TAG, "sendTunFd: set_fd sent, waiting for response (${SET_FD_READ_TIMEOUT}ms)...")
+            FileLogger.d(TAG, "sendTunFd: set_fd sent, waiting for response (${readMs}ms)...")
 
             // Read confirmation. The old code wrapped a blocking readLine() in
             // withTimeoutOrNull(15000); cancelling a coroutine does not touch a
             // socket, so the read ran to the socket's own timeout and the 15s
             // was decoration. The number below IS the socket option, and it is
-            // the real budget: set_fd is what makes the core run a full
-            // Connect, which is exactly what CONTROL_SOCKET_READ_TIMEOUT sizes.
+            // now also bounded by the attempt: set_fd is what makes the core run
+            // a full Connect, and two of those at the socket's own ceiling do
+            // not fit inside one connect budget. They used not to have to.
             val response = withContext(Dispatchers.IO) {
-                channel.readLine(SET_FD_READ_TIMEOUT)
+                channel.readLine(readMs)
             }
 
             if (response == null) {
-                FileLogger.e(TAG, "sendTunFd: TIMEOUT - no response from tiredvpn after ${SET_FD_READ_TIMEOUT}ms")
+                FileLogger.e(TAG, "sendTunFd: TIMEOUT - no response from tiredvpn after ${readMs}ms")
                 FileLogger.e(TAG, "sendTunFd: tiredvpn core started=$coreStarted")
                 return null
             }
@@ -2173,6 +2201,9 @@ class TiredVpnService : VpnService() {
 
                 return null
             }
+        } catch (e: ConnectDeadlineExceeded) {
+            // The attempt is over, not this step. See connectToControlSocket.
+            throw e
         } catch (e: Exception) {
             FileLogger.e(TAG, "sendTunFd: EXCEPTION", e)
             return null
@@ -2652,11 +2683,42 @@ class TiredVpnService : VpnService() {
         lastNetworkAvailableTime = System.currentTimeMillis()
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
-            private var currentNetwork: Network? = null
+            /**
+             * Every validated non-VPN network that is up, and which of them
+             * carries traffic. Replaces a single field holding whatever fired
+             * last — see [NetworkInUse] for the two decisions that got wrong.
+             */
+            private val networksUp = NetworkInUse<Network>()
             private var hadNetworkLoss = false
 
+            /** This network's transport, read from its capabilities. */
+            private fun kindOf(network: Network): NetworkInUse.Kind {
+                val caps = try {
+                    connectivityManager.getNetworkCapabilities(network)
+                } catch (e: Exception) {
+                    null
+                } ?: return NetworkInUse.Kind.OTHER
+                return NetworkInUse.kindOf(
+                    ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                    wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                    cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                )
+            }
+
+            private fun isValidated(network: Network): Boolean = try {
+                connectivityManager.getNetworkCapabilities(network)
+                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false
+            } catch (e: Exception) {
+                false
+            }
+
             override fun onAvailable(network: Network) {
-                FileLogger.i(TAG, "=== NETWORK AVAILABLE: $network (current: $currentNetwork, hadLoss: $hadNetworkLoss) ===")
+                val previousInUse = networksUp.inUse
+                val previousKind = networksUp.inUseKind
+                val change = networksUp.available(network, kindOf(network), isValidated(network))
+                val inUse = networksUp.inUse
+
+                FileLogger.i(TAG, "=== NETWORK AVAILABLE: $network (in use: $inUse, was: $previousInUse, up: ${networksUp.size}, hadLoss: $hadNetworkLoss) ===")
                 lastNetworkAvailableTime = System.currentTimeMillis()
 
                 // ITERATION 3: Stop network watchdog - we have network now
@@ -2667,8 +2729,13 @@ class TiredVpnService : VpnService() {
 
                 // BUG FIX 1: Check if network ACTUALLY changed (by IP address, not just Network ID)
                 // Android sometimes changes Network ID even though it's the same WiFi/cellular
+                //
+                // Only the network in use is fingerprinted. Recording the
+                // addresses of a background link here is how the idle LTE
+                // interface coming up looked like the Wi-Fi's address changing,
+                // and cost a reconnect on a connection that was fine.
                 var networkActuallyChanged = false
-                try {
+                if (network == inUse) try {
                     val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
                     val linkProps = connectivityManager.getLinkProperties(network)
                     linkProps?.let { props ->
@@ -2688,7 +2755,7 @@ class TiredVpnService : VpnService() {
                             FileLogger.d(TAG, "First network initialization: [$addresses]")
                         } else {
                             // Same network, just different Network ID
-                            FileLogger.d(TAG, "Network ID changed (${currentNetwork} -> $network) but IP same: [$addresses]")
+                            FileLogger.d(TAG, "Network ID changed (${previousInUse} -> $network) but IP same: [$addresses]")
                         }
 
                         lastLinkProperties = addresses
@@ -2697,19 +2764,34 @@ class TiredVpnService : VpnService() {
                     FileLogger.w(TAG, "Failed to get link properties", e)
                 }
 
+                // A better network appearing moves traffic onto it, and that is
+                // a change whether or not the addresses we had recorded differ:
+                // they belonged to the network we just left. Without this the
+                // switch was noticed only by the two-second poll.
+                val switchedWhileUp = change == NetworkInUse.Change.SWITCHED && previousInUse != null
+
                 // Trigger reconnect if:
                 // 1. We had a network loss and now network is back (only if not already handled by networkRecoveryJob)
                 // 2. Network ACTUALLY switched (IP address changed, not just Network ID)
+                // 3. Traffic moved to a different network that was already up
                 // Use isNetworkLost as guard: networkRecoveryJob sets it to false before triggering reconnect,
                 // so if it's already false here, the recovery was already handled — skip duplicate trigger.
-                val needsReconnect = (hadNetworkLoss && isNetworkLost) || networkActuallyChanged
+                val needsReconnect =
+                    (hadNetworkLoss && isNetworkLost) || networkActuallyChanged || switchedWhileUp
 
                 // Grace period: after fresh connection NetworkCallback fires onAvailable
                 // for all existing networks immediately — suppress spurious reconnect signals
                 if (needsReconnect && !hadNetworkLoss && System.currentTimeMillis() - connectionTime < 5_000L) {
                     FileLogger.d(TAG, "onAvailable: Within 5s grace period post-connect, suppressing spurious reconnect")
-                    currentNetwork = network
                     return
+                }
+
+                if (switchedWhileUp) {
+                    FileLogger.i(
+                        TAG,
+                        "Traffic moved from $previousInUse (${previousKind?.wireName}) to " +
+                            "$inUse (${networksUp.inUseKind?.wireName})"
+                    )
                 }
 
                 // ITERATION 3: CRITICAL - Send explicit network_available signal to Go
@@ -2738,17 +2820,47 @@ class TiredVpnService : VpnService() {
                         triggerReconnectAfterNetworkRecovery()
                     }
                 }
-                currentNetwork = network
             }
 
             override fun onLost(network: Network) {
                 // The callback is registered on a NetworkRequest that matches
                 // every validated non-VPN network, so this fires for the
                 // background LTE link going away while Wi-Fi is perfectly
-                // alive. Reacting to that cleared currentNetwork and started
-                // the whole recovery machinery for nothing.
-                if (!NetworkLossPolicy.isRelevant(network, currentNetwork, checkNetworkAvailability())) {
-                    FileLogger.d(TAG, "Network lost: $network, but it is not the one in use ($currentNetwork) and connectivity remains - ignoring")
+                // alive. Reacting to that started the whole recovery machinery
+                // for nothing.
+                //
+                // The question the policy answers has not changed; what it is
+                // asked about has. It used to be handed the network of the last
+                // onAvailable, which after LTE registered behind live Wi-Fi was
+                // LTE - so Wi-Fi's own loss read as "not the one in use".
+                val inUseBefore = networksUp.inUse
+                val kindBefore = networksUp.inUseKind
+                val change = networksUp.lost(network)
+
+                if (!NetworkLossPolicy.isRelevant(network, inUseBefore, checkNetworkAvailability())) {
+                    FileLogger.d(TAG, "Network lost: $network, but it is not the one in use ($inUseBefore) and connectivity remains - ignoring")
+                    return
+                }
+
+                if (change == NetworkInUse.Change.SWITCHED) {
+                    // The link that carried traffic went away and another one
+                    // is already up: a handover, not an outage. Treated as one
+                    // here rather than two seconds later, when the poll notices
+                    // - and deliberately without the loss machinery, which
+                    // exists for having no network at all.
+                    val reason = NetworkTransition.reason(
+                        kindBefore?.wireName.orEmpty(),
+                        networksUp.inUseKind?.wireName.orEmpty(),
+                    )
+                    FileLogger.i(
+                        TAG,
+                        "=== NETWORK IN USE CHANGED: $network (${kindBefore?.wireName}) went away, " +
+                            "traffic moves to ${networksUp.inUse} (${networksUp.inUseKind?.wireName})" +
+                            (if (reason.isEmpty()) "" else ", reason=$reason") + " ==="
+                    )
+                    if (_state.value is VpnState.Connected) {
+                        sendNetworkChangedCommand(forceReconnect = false, isCritical = true, reason = reason)
+                    }
                     return
                 }
 
@@ -2756,7 +2868,6 @@ class TiredVpnService : VpnService() {
                 // Mark that we lost network - this allows fast reconnect without TCP checks
                 hadNetworkLoss = true
                 isNetworkLost = true
-                currentNetwork = null
 
                 // ITERATION 3: Start watchdog timer for long disconnects
                 // If offline >45s, force full VPN restart
@@ -2774,6 +2885,25 @@ class TiredVpnService : VpnService() {
                 val hasValidated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
 
                 FileLogger.d(TAG, "Network capabilities changed: $network (internet=$hasInternet, validated=$hasValidated)")
+
+                // A network becoming validated can move traffic onto it, and
+                // losing validation can move it off. Both arrive here and
+                // nowhere else, so the ranking has to be told. Acting on the
+                // move is left to onAvailable and to the poll - the gate would
+                // discard the second report anyway, and a capabilities update
+                // is the weakest of the three signals.
+                if (networksUp.available(
+                        network,
+                        NetworkInUse.kindOf(
+                            ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                            wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                            cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                        ),
+                        validated = hasValidated,
+                    ) == NetworkInUse.Change.SWITCHED
+                ) {
+                    FileLogger.i(TAG, "Capabilities moved traffic onto ${networksUp.inUse} (${networksUp.inUseKind?.wireName})")
+                }
 
                 if (hasInternet && hasValidated && hadNetworkLoss) {
                     FileLogger.i(TAG, "Capabilities improved after loss - sending network_available signal")
@@ -2797,8 +2927,9 @@ class TiredVpnService : VpnService() {
 
                 FileLogger.i(TAG, "Network link properties changed: $network, addresses: [$addresses]")
 
-                // Only trigger reconnect if this is our current network AND addresses actually changed
-                if (network == currentNetwork) {
+                // Only trigger reconnect if this is the network traffic uses
+                // AND addresses actually changed
+                if (network == networksUp.inUse) {
                     if (addresses != lastLinkProperties) {
                         FileLogger.i(TAG, "IP addresses changed from [$lastLinkProperties] to [$addresses]")
                         lastLinkProperties = addresses

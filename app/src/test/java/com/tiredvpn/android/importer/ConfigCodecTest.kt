@@ -346,12 +346,6 @@ class ConfigCodecTest {
         debugLogging = true,
         connectionMode = "proxy",
         proxyPort = 9090,
-        portHoppingEnabled = true,
-        portHopRangeStart = 40000,
-        portHopRangeEnd = 41000,
-        portHopIntervalMs = 15_000L,
-        portHopStrategy = "fibonacci",
-        portHopSeed = "deadbeef",
         shaperPreset = "youtube_streaming",
         shaperSeed = 42L,
         echEnabled = true,
@@ -361,10 +355,51 @@ class ConfigCodecTest {
         preferIpv6 = true,
         fallbackV4 = false,
         tunnelIpv6 = "dual",
+        serverSelectionPolicy = "latency",
         quicSniFrag = true,
         mtu = 1380,
         customDns = "9.9.9.9",
     )
+
+    /**
+     * [everything] is the sample the three tests below compare against, so a
+     * field it forgets is a field none of them checks — and the regression
+     * they exist to catch is exactly a field one path knows and the other does
+     * not. The list is therefore taken from the class, not retyped.
+     *
+     * Java reflection: kotlin-reflect is not on the test classpath, and a data
+     * class gives every constructor property a backing field of the same name.
+     * `id` and `lastLatencyMs` are excused - no sender sets either, and the
+     * tests below copy around them.
+     */
+    @Test
+    fun `the sample really does set every field a sender can set`() {
+        val declared = VpnConfig::class.java.declaredFields
+            .filterNot { java.lang.reflect.Modifier.isStatic(it.modifiers) }
+            .map { it.name }
+
+        // Positive control (rule 2): reflection that found nothing would pass.
+        assertTrue("reflection found no fields at all", declared.size > 20)
+        assertTrue(declared.contains("serverSelectionPolicy"))
+
+        val defaults = VpnConfig(
+            serverAddress = everything.serverAddress,
+            serverPort = everything.serverPort,
+            secret = everything.secret,
+        )
+        val missed = declared.filterNot { name ->
+            name == "id" || name == "lastLatencyMs" ||
+                name == "serverAddress" || name == "serverPort" || name == "secret" ||
+                VpnConfig::class.java.getDeclaredField(name).apply { isAccessible = true }
+                    .let { it.get(everything) != it.get(defaults) }
+        }
+        assertEquals(
+            "these are still at their default, so the link/JSON comparison below " +
+                "would not notice one path losing them",
+            emptyList<String>(),
+            missed.sorted(),
+        )
+    }
 
     @Test
     fun `a link carries every field a JSON config carries`() {
@@ -406,7 +441,7 @@ class ConfigCodecTest {
                 "fallback":false,"debug":true,"server_v6":"[2001:db8::1]:995",
                 "prefer_ipv6":true,"fallback_v4":false,"tun_ipv6":"dual",
                 "ech":true,"ech_config":"AEr+DQBG","shaper":"youtube_streaming",
-                "hop":true,"hop_start":40000,"quic_sni_frag":true,"dns":"9.9.9.9"}"""
+                "quic_sni_frag":true,"dns":"9.9.9.9"}"""
         ).servers.single().config
 
         val camel = ConfigCodec.parse(
@@ -415,8 +450,8 @@ class ConfigCodecTest {
                 "rttProfile":"siberia","fallbackEnabled":false,"debugLogging":true,
                 "serverAddressV6":"[2001:db8::1]:995","preferIpv6":true,"fallbackV4":false,
                 "tunnelIpv6":"dual","echEnabled":true,"echConfig":"AEr+DQBG",
-                "shaperPreset":"youtube_streaming","portHoppingEnabled":true,
-                "portHopRangeStart":40000,"quicSniFrag":true,"customDns":"9.9.9.9"}"""
+                "shaperPreset":"youtube_streaming","quicSniFrag":true,
+                "customDns":"9.9.9.9"}"""
         ).servers.single().config
 
         assertEquals(camel.copy(id = snake.id), snake)

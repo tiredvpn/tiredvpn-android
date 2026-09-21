@@ -7,85 +7,82 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Whether the VPN comes back by itself, which until now was decided by a
- * ladder of `if`s inside a BroadcastReceiver and asserted nowhere.
+ * The ladder of gates an automatic start runs, which until now was a run of
+ * `if`s inside a BroadcastReceiver and asserted nowhere.
  *
- * The two paths ask different questions and the difference is not an
- * oversight — it is just undocumented. A reboot obeys the `connect_on_boot`
- * setting and ignores whether the tunnel was up; an app update obeys whether
- * the tunnel was up and ignores the setting. Both are pinned below, so the
- * next person to "make them consistent" has to say which way.
+ * Scope, against BootPolicyTest next door: that file owns what the two
+ * persistent flags *mean* and that the receiver asks rather than open-codes
+ * them. This one owns what is done with the answer — which gate stops a start,
+ * in which order the gates are asked, and what each path refuses to consult.
+ * Nothing here reads a flag; `lastSessionWanted` arrives already decided.
+ *
+ * The two paths differ in exactly one rung. A reboot also obeys
+ * `connect_on_boot`; an app update does not consult it, because the user asked
+ * for the reboot and did not ask for the update.
  */
 class BootDecisionTest {
 
     private val granted = { true }
     private val configured = { true }
 
-    // --- after a reboot ------------------------------------------------------
+    // --- the rule the whole thing exists for ---------------------------------
 
+    /**
+     * Stated once for both paths, because it is one promise to the user and it
+     * was broken on the boot path only: `connect_on_boot` defaults to true, so
+     * every reboot undid a Disconnect.
+     */
     @Test
-    fun `a reboot with autostart on and everything in place starts the VPN`() {
+    fun `a VPN the user switched off is not restarted by a reboot or by an update`() {
         assertEquals(
-            Outcome.START,
-            BootDecision.afterBoot(connectOnBoot = true, hasValidConfig = configured, hasVpnPermission = granted),
+            Outcome.NOT_RUNNING_BEFORE,
+            BootDecision.afterBoot(
+                connectOnBoot = true,
+                lastSessionWanted = false,
+                hasValidConfig = configured,
+                hasVpnPermission = granted,
+            ),
+        )
+        assertEquals(
+            Outcome.NOT_RUNNING_BEFORE,
+            BootDecision.afterAppUpdate(
+                lastSessionWanted = false,
+                hasValidConfig = configured,
+                hasVpnPermission = granted,
+            ),
         )
     }
 
     @Test
-    fun `autostart off stops the reboot path`() {
+    fun `a session that was live when it ended comes back both ways`() {
+        assertEquals(
+            Outcome.START,
+            BootDecision.afterBoot(
+                connectOnBoot = true,
+                lastSessionWanted = true,
+                hasValidConfig = configured,
+                hasVpnPermission = granted,
+            ),
+        )
+        assertEquals(
+            Outcome.START,
+            BootDecision.afterAppUpdate(
+                lastSessionWanted = true,
+                hasValidConfig = configured,
+                hasVpnPermission = granted,
+            ),
+        )
+    }
+
+    // --- the one rung that differs -------------------------------------------
+
+    @Test
+    fun `autostart off stops the reboot path even for a session that was live`() {
         assertEquals(
             Outcome.AUTOSTART_OFF,
-            BootDecision.afterBoot(connectOnBoot = false, hasValidConfig = configured, hasVpnPermission = granted),
-        )
-    }
-
-    @Test
-    fun `a reboot without a usable server does not start`() {
-        assertEquals(
-            Outcome.NO_VALID_CONFIG,
-            BootDecision.afterBoot(connectOnBoot = true, hasValidConfig = { false }, hasVpnPermission = granted),
-        )
-    }
-
-    @Test
-    fun `a reboot without VPN consent does not start`() {
-        assertEquals(
-            Outcome.NO_VPN_PERMISSION,
-            BootDecision.afterBoot(connectOnBoot = true, hasValidConfig = configured, hasVpnPermission = { false }),
-        )
-    }
-
-    /**
-     * The asymmetry, stated. A reboot starts the VPN even though nothing was
-     * running when the device went down — the setting is the whole decision.
-     * The app-update path below does the opposite with the same inputs.
-     */
-    @Test
-    fun `a reboot ignores whether the tunnel was up before`() {
-        assertEquals(
-            Outcome.START,
-            BootDecision.afterBoot(connectOnBoot = true, hasValidConfig = configured, hasVpnPermission = granted),
-        )
-        assertEquals(
-            Outcome.NOT_RUNNING_BEFORE,
-            BootDecision.afterAppUpdate(
-                shouldBeConnected = false,
-                wasConnected = false,
-                hasValidConfig = configured,
-                hasVpnPermission = granted,
-            ),
-        )
-    }
-
-    // --- after an app update -------------------------------------------------
-
-    @Test
-    fun `an update restores a tunnel that was up`() {
-        assertEquals(
-            Outcome.START,
-            BootDecision.afterAppUpdate(
-                shouldBeConnected = true,
-                wasConnected = false,
+            BootDecision.afterBoot(
+                connectOnBoot = false,
+                lastSessionWanted = true,
                 hasValidConfig = configured,
                 hasVpnPermission = granted,
             ),
@@ -93,43 +90,53 @@ class BootDecisionTest {
     }
 
     /**
-     * Either flag is enough. They are written by different parts of the app —
-     * `vpn_should_be_connected` by the watchdog, `vpn_was_connected` by the
-     * service — and a teardown can clear one without the other.
+     * The update path cannot consult the setting even by accident: it has no
+     * parameter to consult it with. Checked by signature rather than by
+     * behaviour, because a behavioural test can only try the values that exist.
      */
     @Test
-    fun `either flag on its own is enough to restore`() {
+    fun `an update does not consult connect on boot`() {
+        val parameters = BootDecision::class.java.methods
+            .single { it.name == "afterAppUpdate" }
+            .parameterTypes
+
         assertEquals(
-            Outcome.START,
-            BootDecision.afterAppUpdate(
-                shouldBeConnected = false,
-                wasConnected = true,
-                hasValidConfig = configured,
-                hasVpnPermission = granted,
-            ),
+            "afterAppUpdate takes lastSessionWanted and the two gates, nothing else",
+            3,
+            parameters.size,
+        )
+        assertEquals(
+            "the one Boolean it takes is the previous session, not a preference",
+            1,
+            parameters.count { it == Boolean::class.javaPrimitiveType },
+        )
+
+        // Positive control (rule 2): counting parameters says nothing unless
+        // the same count can tell the two signatures apart. The boot path
+        // takes the same three plus connectOnBoot.
+        assertEquals(
+            4,
+            BootDecision::class.java.methods.single { it.name == "afterBoot" }.parameterTypes.size,
         )
     }
 
+    // --- the remaining gates, on both paths ----------------------------------
+
     @Test
-    fun `an update leaves a tunnel that was down alone`() {
+    fun `no usable server stops either path`() {
         assertEquals(
-            Outcome.NOT_RUNNING_BEFORE,
-            BootDecision.afterAppUpdate(
-                shouldBeConnected = false,
-                wasConnected = false,
-                hasValidConfig = configured,
+            Outcome.NO_VALID_CONFIG,
+            BootDecision.afterBoot(
+                connectOnBoot = true,
+                lastSessionWanted = true,
+                hasValidConfig = { false },
                 hasVpnPermission = granted,
             ),
         )
-    }
-
-    @Test
-    fun `an update without a usable server does not start`() {
         assertEquals(
             Outcome.NO_VALID_CONFIG,
             BootDecision.afterAppUpdate(
-                shouldBeConnected = true,
-                wasConnected = true,
+                lastSessionWanted = true,
                 hasValidConfig = { false },
                 hasVpnPermission = granted,
             ),
@@ -137,12 +144,20 @@ class BootDecisionTest {
     }
 
     @Test
-    fun `an update without VPN consent does not start`() {
+    fun `no VPN consent stops either path`() {
+        assertEquals(
+            Outcome.NO_VPN_PERMISSION,
+            BootDecision.afterBoot(
+                connectOnBoot = true,
+                lastSessionWanted = true,
+                hasValidConfig = configured,
+                hasVpnPermission = { false },
+            ),
+        )
         assertEquals(
             Outcome.NO_VPN_PERMISSION,
             BootDecision.afterAppUpdate(
-                shouldBeConnected = true,
-                wasConnected = true,
+                lastSessionWanted = true,
                 hasValidConfig = configured,
                 hasVpnPermission = { false },
             ),
@@ -152,10 +167,10 @@ class BootDecisionTest {
     // --- the order of the questions, not just their answers ------------------
 
     /**
-     * The gates are suppliers so that a device with auto-start off does no
-     * work at all. Reading the active server unlocks an
-     * EncryptedSharedPreferences through the Keystore, at boot, on every
-     * device that has the app installed.
+     * The gates are suppliers so that a device with auto-start off does no work
+     * at all. Reading the active server unlocks an EncryptedSharedPreferences
+     * through the Keystore, at boot, on every device that has the app
+     * installed; asking for VPN consent is a binder call.
      */
     @Test
     fun `autostart off asks nothing else`() {
@@ -164,6 +179,7 @@ class BootDecisionTest {
 
         BootDecision.afterBoot(
             connectOnBoot = false,
+            lastSessionWanted = true,
             hasValidConfig = { configRead = true; true },
             hasVpnPermission = { permissionAsked = true; true },
         )
@@ -172,19 +188,24 @@ class BootDecisionTest {
         assertFalse("VPN consent was queried for nothing", permissionAsked)
     }
 
-    /**
-     * Same for the update path: nothing was running, so nothing is read.
-     */
+    /** Same for a session the user ended: nothing is going to start, so nothing is read. */
     @Test
-    fun `an update that restores nothing asks nothing else`() {
+    fun `a session the user ended asks nothing else, on either path`() {
         var configRead = false
         var permissionAsked = false
+        val watchConfig = { configRead = true; true }
+        val watchPermission = { permissionAsked = true; true }
 
+        BootDecision.afterBoot(
+            connectOnBoot = true,
+            lastSessionWanted = false,
+            hasValidConfig = watchConfig,
+            hasVpnPermission = watchPermission,
+        )
         BootDecision.afterAppUpdate(
-            shouldBeConnected = false,
-            wasConnected = false,
-            hasValidConfig = { configRead = true; true },
-            hasVpnPermission = { permissionAsked = true; true },
+            lastSessionWanted = false,
+            hasValidConfig = watchConfig,
+            hasVpnPermission = watchPermission,
         )
 
         assertFalse(configRead)
@@ -201,14 +222,14 @@ class BootDecisionTest {
 
         BootDecision.afterBoot(
             connectOnBoot = true,
+            lastSessionWanted = true,
             hasValidConfig = { false },
             hasVpnPermission = { permissionAsked = true; true },
         )
         assertFalse(permissionAsked)
 
         BootDecision.afterAppUpdate(
-            shouldBeConnected = true,
-            wasConnected = true,
+            lastSessionWanted = true,
             hasValidConfig = { false },
             hasVpnPermission = { permissionAsked = true; true },
         )
@@ -226,6 +247,7 @@ class BootDecisionTest {
 
         val outcome = BootDecision.afterBoot(
             connectOnBoot = true,
+            lastSessionWanted = true,
             hasValidConfig = { configRead = true; true },
             hasVpnPermission = { permissionAsked = true; true },
         )
