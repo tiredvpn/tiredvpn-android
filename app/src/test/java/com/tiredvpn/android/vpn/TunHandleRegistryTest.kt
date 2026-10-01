@@ -153,4 +153,76 @@ class TunHandleRegistryTest {
         assertTrue(handles.all { it.closeCount == 1 })
         assertEquals(0, reg.size)
     }
+
+    // --- establishUnless: a stop racing establish() ---------------------------
+
+    @Test
+    fun `a stopped tunnel does not establish at all`() {
+        val (reg, _) = registry()
+        var created = 0
+
+        val got = reg.establishUnless(refused = { true }) { created++; Handle("never") }
+
+        assertEquals(null, got)
+        assertEquals("establish() must not even be called after a stop", 0, created)
+        assertEquals(0, reg.size)
+    }
+
+    @Test
+    fun `an open tunnel establishes and tracks the handle`() {
+        val (reg, closed) = registry()
+
+        val got = reg.establishUnless(refused = { false }) { Handle("tun") }
+
+        assertTrue(got != null)
+        assertEquals(1, reg.size)
+        assertTrue(closed.isEmpty())
+    }
+
+    /**
+     * The window the fix is for: the stop lands while establish() is running,
+     * after the teardown has already swept the ledger. Nobody else will ever
+     * close this handle, so establishUnless has to.
+     */
+    @Test
+    fun `a stop that lands during establish closes the new handle and forgets it`() {
+        val (reg, closed) = registry()
+        var stopped = false
+        val tun = Handle("late")
+
+        val got = reg.establishUnless(refused = { stopped }) {
+            stopped = true          // disconnect() latched...
+            reg.releaseAll()        // ...and swept a ledger that did not hold us yet
+            tun
+        }
+
+        assertEquals(null, got)
+        assertEquals(1, tun.closeCount)
+        assertTrue(closed.any { it === tun })
+        assertEquals(0, reg.size)
+    }
+
+    /**
+     * The other order: the handle was tracked before the teardown swept, so
+     * the sweep closed it. Closing it again here would be the double close
+     * the ledger exists to prevent.
+     */
+    @Test
+    fun `a handle the teardown already swept is not closed a second time`() {
+        val (reg, _) = registry()
+        val tun = Handle("swept")
+        var checks = 0
+
+        val got = reg.establishUnless(refused = {
+            checks++
+            if (checks == 2) {
+                reg.releaseAll() // the sweep ran between track() and the re-check
+                true
+            } else false
+        }) { tun }
+
+        assertEquals(null, got)
+        assertEquals("closed by the sweep, exactly once", 1, tun.closeCount)
+        assertEquals(0, reg.size)
+    }
 }
