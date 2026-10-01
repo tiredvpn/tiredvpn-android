@@ -2,6 +2,7 @@ package com.tiredvpn.android.vpn
 
 import kotlinx.coroutines.sync.Mutex
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -109,6 +110,36 @@ internal class ConnectGeneration {
         if (counter.compareAndSet(expected, expected + 1)) expected + 1 else null
 
     fun isCurrent(generation: Int): Boolean = counter.get() == generation
+}
+
+/**
+ * Set by a teardown, lifted only by a start somebody asked for.
+ *
+ * [ConnectGeneration] cannot express "the user turned it off": every
+ * self-healing path — scheduleAutoReconnect, handleControlSocketBroken,
+ * handleCoreExit — opens a generation of its own, and none of them can tell
+ * whether `disconnect()` ran between its state check and its `begin()`. The
+ * state flow cannot either: the failing connect overwrote Disconnected with
+ * Error on the next line. A tap on Disconnect while the core was still
+ * answering `connect` closed the control socket under the waiting read, the
+ * attempt reported that as an ordinary failure, published Error and scheduled
+ * a reconnect, and the tunnel came back with the UI already showing it off.
+ *
+ * So the latch is one-way for everything inside the service. `disconnect()`
+ * latches it; only ACTION_CONNECT and the sticky restart of a tunnel the user
+ * still wants lift it. A check that races `disconnect()` can still read it as
+ * open, which is why the place a TUN comes into existence checks it again
+ * afterwards — see [TunHandleRegistry.establishUnless].
+ */
+internal class StopLatch {
+
+    private val latched = AtomicBoolean(false)
+
+    val isLatched: Boolean get() = latched.get()
+
+    fun latch() = latched.set(true)
+
+    fun lift() = latched.set(false)
 }
 
 /**
