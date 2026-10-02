@@ -1300,7 +1300,7 @@ class VpnCoreCallSiteTest {
     fun `cleaning up a failed connect is gated at every step, not only on entry`() {
         val service = source("TiredVpnService.kt")
         val body = bodyAfter(service, "private fun cleanupFailedConnection(generation: Int) {")
-        assertTrue("scanner cannot see the cleanup", body.contains("tunHandles.releaseAll()"))
+        assertTrue("scanner cannot see the cleanup", body.contains("tunHandles.releaseAllExcept(vpnInterface)"))
 
         // What the attempt made for itself is gated on the generation.
         for (step in listOf("cleanupFailedConnection", "TUN ledger", "endpoint pool", "wake lock")) {
@@ -1323,6 +1323,59 @@ class VpnCoreCallSiteTest {
             "unlinking protect.sock belongs to the generation that owns the name",
             body.contains("protect.sock")
         )
+    }
+
+    // --- the VPN interface outlives a reconnect --------------------------------
+
+    /**
+     * Measured on an emulator, 20 Wi-Fi/mobile switches with four pings per
+     * 200 ms from the shell uid: 9 echo requests left over wlan0/eth0 instead
+     * of the tunnel, each at a moment the VPN network was moved to a new tun.
+     * The platform repoints the per-uid rules before it adds the new routes,
+     * so every interface replacement is a window. These rules keep the
+     * interface across everything that is not a stop.
+     */
+    @Test
+    fun `a network switch hands the core the interface it already has`() {
+        val service = callSites("TiredVpnService.kt")
+        val body = bodyAfter(service, "private fun sendNetworkChangedCommand(")
+        val keep = Regex("""if \(currentVpnFd != null && isVpnInterfaceValid\(currentVpnFd\)\) \{[\s\S]*?sendNetworkChangedWithFd\(currentVpnFd\.fd, reason\)\s*return@withLock""").find(body)
+        assertTrue("a valid interface must be sent again, not replaced", keep != null)
+        assertTrue("and that check comes before any new interface is built", keep!!.range.first < body.indexOf("establishVpn("))
+    }
+
+    @Test
+    fun `a reconnect reuses the interface when the tunnel comes back the same`() {
+        val service = callSites("TiredVpnService.kt")
+        val connect = bodyAfter(service, "private suspend fun connectTunMode(config: VpnConfig, generation: Int, deadline: ConnectDeadline) {")
+        val reuse = connect.indexOf("reusableInterface(config, tunConfig)")
+        val build = connect.indexOf("establishVpn(config, tunConfig)")
+        assertTrue("connect must ask for a reusable interface", reuse >= 0)
+        assertTrue("before it builds one", reuse < build)
+        assertTrue("a built interface records what it was built for", connect.contains("interfaceBuiltFor = config to tunConfig"))
+        val adopt = connect.indexOf("adoptVpnInterface(vpnFd, step = \"\")")
+        assertTrue("whichever it is becomes current, closing the stale ones", adopt > build)
+        val helper = bodyAfter(service, "private fun reusableInterface(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {")
+        assertTrue("same profile and same tunnel only", helper.contains("interfaceBuiltFor != (config to tunConfig)"))
+        assertTrue("and only while it is still open", helper.contains("isVpnInterfaceValid("))
+    }
+
+    @Test
+    fun `only a stop closes the current interface`() {
+        val service = callSites("TiredVpnService.kt")
+        for (header in listOf(
+            "private fun cleanupFailedConnection(generation: Int) {",
+            "private suspend fun executeReconnectSequence(generation: Int): Boolean {",
+        )) {
+            val body = bodyAfter(service, header)
+            assertTrue("$header must keep the current interface", body.contains("tunHandles.releaseAllExcept(vpnInterface)"))
+            assertFalse("$header must not close it", body.contains("tunHandles.releaseAll()"))
+            assertFalse("$header must not drop it", body.contains("vpnInterface = null"))
+        }
+        val disconnect = bodyAfter(service, "private fun disconnect(intent: StopIntent) {")
+        assertTrue("disconnect still closes everything", disconnect.contains("vpnInterface = null") && disconnect.contains("tunHandles.releaseAll()"))
+        val reset = bodyAfter(service, "private fun forceResetCore(reason: String) {")
+        assertTrue("so does the clean slate", reset.contains("vpnInterface = null") && reset.contains("forceCloseTunFds()"))
     }
 
     /**
