@@ -1479,7 +1479,10 @@ class VpnCoreCallSiteTest {
         val service = callSites("TiredVpnService.kt")
         assertTrue(
             "ACTION_CONNECT lifts it before the clean slate and the connect",
-            Regex("""ACTION_CONNECT -> \{[\s\S]*?stopLatch\.lift\(\)\s*forceResetCore\(""").containsMatchIn(service)
+            // The label may list more actions than ACTION_CONNECT (the
+            // always-on start shares the branch); what matters is the order
+            // inside it.
+            Regex("""ACTION_CONNECT\b[^\n]*->\s*\{[\s\S]*?stopLatch\.lift\(\)\s*forceResetCore\(""").containsMatchIn(service)
         )
         assertTrue(
             "the sticky restart of a wanted tunnel lifts it",
