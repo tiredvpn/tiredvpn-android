@@ -1,7 +1,7 @@
 import com.android.build.api.artifact.SingleArtifact
-// Imported rather than written as java.util.Date: inside a Kotlin DSL script
-// `java` resolves to the project's java extension, not to the package.
-import java.util.Date
+// Imported rather than written out: inside a Kotlin DSL script `java`
+// resolves to the project's java extension, not to the package.
+import java.security.MessageDigest
 import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
@@ -19,24 +19,33 @@ dependencyCheck {
     analyzers.assemblyEnabled = false
 }
 
-// --- JNI auto-build: compile libtiredvpn.so from Go core when missing or stale ---
+// --- JNI core: build libtiredvpn.so only from a core checkout someone named ---
+//
+// The .so carries the whole VPN, so which core went into an APK has to be a
+// decision, not an accident. This task used to fall back to ../tiredvpn and
+// then to /tmp/tiredvpn-core, a clone build-jni.sh made once and never
+// updated; a .so copied in by hand without a stamp was silently replaced from
+// there. Debug APKs shipped a core nobody had chosen, twice, and the people
+// testing them found out from behaviour, not from the build.
+//
+// Now the core comes from -PtiredvpnCoreDir=/path/to/tiredvpn (also accepted
+// from ~/.gradle/gradle.properties), or from a jniLibs directory whose
+// .core-revision stamp, written by scripts/build-jni.sh, still matches every
+// .so byte for byte. Anything else stops the packaging with a message saying
+// what to do. Unit tests and lint do not package native code and are not
+// affected.
 
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
-/** Where the .so records which core checkout it was built from. */
+/** Written by scripts/build-jni.sh next to the libraries it built. */
 val jniRevisionStamp = jniLibsDir.file(".core-revision").asFile
+
+val jniAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
 
 /**
  * Identify the core checkout in [dir], or null when it cannot be identified.
- *
- * Null is the ordinary case, not a failure: `scripts/build-jni.sh` clones the
- * core itself when the directory is missing, and CI runs that script directly
- * with its own --core-dir before Gradle is ever invoked. Both leave Gradle
- * without a checkout to interrogate.
- *
- * A dirty tree is recorded as such, so two builds from the same commit with
- * uncommitted edits in between compare equal and do not trigger an endless
- * rebuild — the mismatch that matters is the commit moving.
+ * Same format as scripts/build-jni.sh writes into the stamp: a dirty tree is
+ * recorded as such, so uncommitted edits are visible after the fact.
  */
 fun coreRevision(dir: File): String? {
     if (!dir.isDirectory) return null
@@ -62,65 +71,71 @@ fun coreRevision(dir: File): String? {
         ?.let { "version:$it" }
 }
 
+fun sha256Of(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(1 shl 16)
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) break
+            digest.update(buffer, 0, n)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+/** key=value lines; a stamp from before the checksums has none and is not trusted. */
+fun readCoreStamp(file: File): Map<String, String>? {
+    if (!file.isFile) return null
+    return file.readLines()
+        .mapNotNull { line -> line.split('=', limit = 2).takeIf { it.size == 2 } }
+        .associate { (k, v) -> k.trim() to v.trim() }
+}
+
+/**
+ * Why the libraries in jniLibs cannot be trusted, or null when the stamp
+ * matches every one of them.
+ */
+fun jniCoreProblem(): String? {
+    val stamp = readCoreStamp(jniRevisionStamp)
+        ?: return "no ${jniRevisionStamp.name} stamp in ${jniLibsDir.asFile}"
+    if (stamp["revision"].isNullOrEmpty()) return "the stamp names no core revision (written by an older build-jni.sh?)"
+    for (abi in jniAbis) {
+        val so = jniLibsDir.dir(abi).file("libtiredvpn.so").asFile
+        if (!so.isFile) return "$abi/libtiredvpn.so is missing"
+        val recorded = stamp[abi] ?: return "the stamp has no checksum for $abi"
+        if (sha256Of(so) != recorded) return "$abi/libtiredvpn.so is not the file the stamp describes (replaced by hand?)"
+    }
+    return null
+}
+
+val explicitCoreDir: String? = providers.gradleProperty("tiredvpnCoreDir").orNull
+
+// Checked up front: a misspelt path must not degrade into "use what is there".
+if (explicitCoreDir != null && coreRevision(File(explicitCoreDir)) == null) {
+    throw GradleException("-PtiredvpnCoreDir=$explicitCoreDir is not a tiredvpn core checkout (no git HEAD, no VERSION file)")
+}
+
 val buildJni by tasks.registering(Exec::class) {
-    description = "Build libtiredvpn.so from Go core for all Android architectures"
+    description = "Build libtiredvpn.so from the core checkout named by -PtiredvpnCoreDir"
     group = "build"
 
-    // Resolve Go core directory:
-    //   1. -PtiredvpnCoreDir=...
-    //   2. ../tiredvpn (sibling dir)
-    //   3. /tmp/tiredvpn-core (fallback)
-    val coreDir = providers.gradleProperty("tiredvpnCoreDir").orNull
-        ?: rootProject.layout.projectDirectory.dir("../tiredvpn").asFile
-            .takeIf { it.resolve("go.mod").exists() }?.absolutePath
-        ?: "/tmp/tiredvpn-core"
-
-    // Rebuild when the .so is missing, and when the core has moved since the .so
-    // was built. Existence alone used to be the whole test, so a developer with
-    // a months-old .so shipped a months-old core out of a release build without
-    // a single line in the log saying so.
+    // Without a named checkout there is nothing this task may build from;
+    // requireJniCore decides whether what is already there can be packaged.
     onlyIf {
-        val so = jniLibsDir.dir("arm64-v8a").file("libtiredvpn.so").asFile
-        if (!so.exists()) {
-            logger.lifecycle("buildJni: libtiredvpn.so is missing, building it")
-            return@onlyIf true
-        }
-
-        val current = coreRevision(File(coreDir))
-        val stamped = jniRevisionStamp.takeIf { it.isFile }?.readText()?.trim()
-
+        val dir = explicitCoreDir ?: return@onlyIf false
+        val current = coreRevision(File(dir)) ?: return@onlyIf false // rejected at configuration
+        val problem = jniCoreProblem()
+        val stamped = readCoreStamp(jniRevisionStamp)?.get("revision")
         when {
-            current == null -> {
-                // Cannot compare. Say so where it will be read, with the date of
-                // what is actually about to be packaged.
-                logger.warn(
-                    "\n" + "=".repeat(78) + "\n" +
-                        "buildJni: REUSING AN UNVERIFIED libtiredvpn.so\n" +
-                        "  built:    ${Date(so.lastModified())}\n" +
-                        "  recorded: ${stamped ?: "<no .core-revision stamp>"}\n" +
-                        "  no core checkout at $coreDir, so its revision cannot be compared.\n" +
-                        "  Pass -PtiredvpnCoreDir=/path/to/tiredvpn to check it, or delete\n" +
-                        "  app/src/main/jniLibs to force a rebuild.\n" +
-                        "=".repeat(78)
-                )
-                false
-            }
-
-            stamped == null -> {
-                logger.lifecycle(
-                    "buildJni: libtiredvpn.so has no recorded core revision, rebuilding from $current"
-                )
+            problem != null -> {
+                logger.lifecycle("buildJni: rebuilding from $current: $problem")
                 true
             }
-
             stamped != current -> {
-                logger.lifecycle(
-                    "buildJni: core moved since the .so was built " +
-                        "($stamped -> $current), rebuilding"
-                )
+                logger.lifecycle("buildJni: core moved since the .so was built ($stamped -> $current), rebuilding")
                 true
             }
-
             else -> {
                 logger.lifecycle("buildJni: libtiredvpn.so is current ($current)")
                 false
@@ -129,22 +144,8 @@ val buildJni by tasks.registering(Exec::class) {
     }
 
     workingDir = rootProject.layout.projectDirectory.asFile
-    commandLine("bash", "scripts/build-jni.sh", "--core-dir", coreDir,
+    commandLine("bash", "scripts/build-jni.sh", "--core-dir", explicitCoreDir ?: "",
         "--output-dir", "app/src/main/jniLibs")
-
-    doLast {
-        // Read the revision now, not at configuration time: when the core was
-        // absent, build-jni.sh has only just cloned it.
-        val built = coreRevision(File(coreDir))
-        if (built == null) {
-            jniRevisionStamp.delete()
-            logger.warn("buildJni: built the .so but could not identify $coreDir, no stamp written")
-        } else {
-            jniRevisionStamp.parentFile.mkdirs()
-            jniRevisionStamp.writeText(built + "\n")
-            logger.lifecycle("buildJni: recorded core revision $built")
-        }
-    }
 
     doFirst {
         // Resolve NDK: env var → ANDROID_HOME/ndk dir → error
@@ -159,13 +160,78 @@ val buildJni by tasks.registering(Exec::class) {
             }
             ?: error("Set ANDROID_NDK_HOME or install NDK via SDK Manager")
 
-        logger.lifecycle("buildJni: coreDir=$coreDir, ndkHome=$ndkHome")
+        logger.lifecycle("buildJni: coreDir=$explicitCoreDir, ndkHome=$ndkHome")
         environment("ANDROID_NDK_HOME", ndkHome)
     }
 }
 
-tasks.named("preBuild") {
+/**
+ * Put the core revision into the APK as assets/core-revision.txt, so the
+ * question "which core is in this build" has an answer after the fact.
+ *
+ * Never fails: unit tests merge assets too and do not need a core. A build
+ * without a verified core gets "unverified: <reason>" here, and
+ * requireJniCore stops it before anything native is packaged.
+ */
+abstract class CoreRevisionAsset : DefaultTask() {
+    @get:OutputDirectory
+    abstract val assetDir: DirectoryProperty
+
+    @get:Internal
+    abstract val content: Property<String>
+
+    @TaskAction
+    fun write() {
+        val out = assetDir.get().asFile
+        out.mkdirs()
+        out.resolve("core-revision.txt").writeText(content.get())
+    }
+}
+
+val coreRevisionAsset = tasks.register<CoreRevisionAsset>("coreRevisionAsset") {
     dependsOn(buildJni)
+    outputs.upToDateWhen { false }
+    assetDir.set(layout.buildDirectory.dir("generated/coreRevision/assets"))
+    content.set(provider {
+        val problem = jniCoreProblem()
+        if (problem != null) {
+            "unverified: $problem\n"
+        } else {
+            val stamp = readCoreStamp(jniRevisionStamp).orEmpty()
+            "revision=${stamp["revision"]}\nversion=${stamp["version"] ?: "unknown"}\n"
+        }
+    })
+}
+
+val requireJniCore by tasks.registering {
+    description = "Refuse to package native code from a core nobody named"
+    group = "verification"
+    dependsOn(buildJni)
+    outputs.upToDateWhen { false }
+    doLast {
+        val problem = jniCoreProblem()
+        if (problem != null) {
+            throw GradleException(
+                "\n" + "=".repeat(78) + "\n" +
+                    "No verified Go core to package: $problem.\n" +
+                    "\n" +
+                    "Name the core checkout to build it from:\n" +
+                    "  ./gradlew assembleDebug -PtiredvpnCoreDir=/path/to/tiredvpn\n" +
+                    "or build the libraries yourself, which also writes the stamp:\n" +
+                    "  ./scripts/build-jni.sh --core-dir /path/to/tiredvpn\n" +
+                    "Copying a libtiredvpn.so into app/src/main/jniLibs by hand is not enough.\n" +
+                    "=".repeat(78)
+            )
+        }
+        val stamp = readCoreStamp(jniRevisionStamp).orEmpty()
+        logger.lifecycle("requireJniCore: packaging core ${stamp["revision"]} (${stamp["version"] ?: "unknown version"})")
+    }
+}
+
+// Native libraries are merged by merge<Variant>NativeLibs; that is the step a
+// core has to be verified for, and the only one.
+tasks.matching { it.name.matches(Regex("merge\\w*NativeLibs")) }.configureEach {
+    dependsOn(requireJniCore)
 }
 
 // --- Distribution switch ---
@@ -356,6 +422,7 @@ android {
 
 androidComponents {
     onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(coreRevisionAsset, CoreRevisionAsset::assetDir)
         if (!selfUpdateEnabled) {
             val strip = tasks.register<StripSelfUpdatePermissions>(
                 "strip${variant.name.replaceFirstChar { it.uppercase() }}SelfUpdatePermissions"
