@@ -225,4 +225,57 @@ class TunHandleRegistryTest {
         assertEquals("closed by the sweep, exactly once", 1, tun.closeCount)
         assertEquals(0, reg.size)
     }
+
+    // --- handOver: one interface left after every successful handover ---------
+
+    /**
+     * The leak this exists for: every reconnect that ended in a new interface
+     * tracked one more handle and released none, so after N handovers the
+     * ledger held N+1 open interfaces.
+     */
+    @Test
+    fun `after N handovers exactly one handle is left and every earlier one is closed once`() {
+        val (reg, _) = registry()
+        val handles = (0..6).map { Handle("tun$it") }
+
+        reg.handOver(handles[0])
+        for (i in 1 until handles.size) {
+            reg.track(handles[i])            // establishVpn tracks the new interface
+            val closed = reg.handOver(handles[i])
+            assertEquals("handover $i closes exactly the previous interface", 1, closed)
+        }
+
+        assertEquals(1, reg.size)
+        assertEquals("the current interface is never closed", 0, handles.last().closeCount)
+        assertTrue("every earlier interface closed exactly once", handles.dropLast(1).all { it.closeCount == 1 })
+    }
+
+    @Test
+    fun `a handover also closes interfaces an earlier attempt left behind`() {
+        val (reg, _) = registry()
+        val orphans = listOf(Handle("a"), Handle("b"))
+        orphans.forEach { reg.track(it) }
+        val current = Handle("current")
+
+        val closed = reg.handOver(current)   // not tracked yet: handOver tracks it
+
+        assertEquals(2, closed)
+        assertEquals(1, reg.size)
+        assertEquals(0, current.closeCount)
+        assertTrue(orphans.all { it.closeCount == 1 })
+    }
+
+    @Test
+    fun `a handle a teardown already took is not closed again by a handover`() {
+        val (reg, _) = registry()
+        val old = Handle("old")
+        reg.track(old)
+        reg.releaseAll()                      // disconnect swept it
+        val current = Handle("current")
+
+        reg.handOver(current)
+
+        assertEquals("closed by the sweep only", 1, old.closeCount)
+        assertEquals(1, reg.size)
+    }
 }

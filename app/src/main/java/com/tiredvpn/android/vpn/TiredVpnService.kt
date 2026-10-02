@@ -1298,6 +1298,10 @@ class TiredVpnService : VpnService() {
         }
 
         FileLogger.i(TAG, "STEP 5: Connection complete, updating state...")
+        // The core is on this interface now; every other one in the ledger
+        // belongs to an earlier attempt or a reconnect that never released it.
+        // Null means a stop has already swept the ledger; nothing to adopt.
+        vpnInterface?.let { adoptVpnInterface(it, step = "connect") }
         // A stop that landed after the interface came up has closed it through
         // the ledger; publishing Connected now would paint a dead tunnel live.
         if (stopLatch.isLatched) throw CancellationException("tunnel stopped before it was published")
@@ -1384,7 +1388,7 @@ class TiredVpnService : VpnService() {
         if (vpnFd == null) {
             throw RuntimeException("Failed to establish VPN interface for proxy")
         }
-        vpnInterface = vpnFd
+        adoptVpnInterface(vpnFd, step = "proxy connect")
 
         // 4. Update state
         val proxyAddress = "127.0.0.1:${config.proxyPort}"
@@ -3609,16 +3613,10 @@ class TiredVpnService : VpnService() {
                 // Send network_changed command with new fd
                 sendNetworkChangedWithFd(newVpnFd.fd, reason)
 
-                // NOW close old interface AFTER new one is active
-                oldVpnFd?.let { oldVpn ->
-                    FileLogger.d(TAG, "Closing old VPN interface fd=${oldVpn.fd}")
-                    // Drop it from the ledger first: once closed, its number can
-                    // be reused by anyone, and a later sweep must not reach it.
-                    tunHandles.forget(oldVpn)
-                    try { oldVpn.close() } catch (e: Exception) {
-                        FileLogger.w(TAG, "Error closing old VPN interface: ${e.message}")
-                    }
-                }
+                // NOW close the old interface, AFTER the new one is active -
+                // and with it anything else an earlier attempt left behind.
+                oldVpnFd?.let { FileLogger.d(TAG, "Closing old VPN interface fd=${it.fd}") }
+                adoptVpnInterface(newVpnFd, step = "network change")
 
             } catch (e: Exception) {
                 FileLogger.w(TAG, "Failed to handle network change: ${e.message}", e)
@@ -3991,6 +3989,22 @@ class TiredVpnService : VpnService() {
             // it after the lock is released.
             return false
         }
+    }
+
+    /**
+     * [vpnFd] is the interface the core now runs on: make it current and close
+     * every other one we still hold.
+     *
+     * Only forceResetCore() used to empty the ledger. Every reconnect that
+     * ended in a new interface added one to it and released nothing, so a
+     * process showed one /dev/tun descriptor per successful reconnect plus the
+     * core's copy (2, 3, 4, 5 after as many switches), each holding a dead
+     * tunN up. Closing goes through the ledger, so nothing is closed twice.
+     */
+    private fun adoptVpnInterface(vpnFd: ParcelFileDescriptor, step: String) {
+        vpnInterface = vpnFd
+        val closed = tunHandles.handOver(vpnFd)
+        if (closed > 0) FileLogger.i(TAG, "$step: closed $closed earlier TUN fd(s), fd=${vpnFd.fd} is the only one left")
     }
 
     /**
