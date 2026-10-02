@@ -97,12 +97,15 @@
              or replaced, and writes nothing until the user taps Import. The ADB
              receiver below keeps its signature permission for silent automation;
              this activity is the path that works from `adb shell`, which holds no
-             signature permissions and never received those broadcasts at all. -->
+             signature permissions and never received those broadcasts at all.
+             No noHistory: with it, anything that covers the confirmation (a
+             notification, a permission prompt, another app) finishes this
+             activity, the dialog leaks and the import is lost. The activity
+             finishes itself when the dialog is answered. -->
         <activity
             android:name=".ui.ImportActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:noHistory="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.TiredVPN.Transparent">
             <!-- tired:// from a browser or messenger -->
