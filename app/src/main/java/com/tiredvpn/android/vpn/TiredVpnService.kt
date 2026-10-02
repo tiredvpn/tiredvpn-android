@@ -335,6 +335,13 @@ class TiredVpnService : VpnService() {
      */
     @Volatile private var activeTunnelConfig: TunnelConfig? = null
 
+    /**
+     * What [vpnInterface] was built from. A reconnect that negotiates the same
+     * tunnel for the same server profile hands the core this interface again
+     * instead of building a new one; see [reusableInterface].
+     */
+    @Volatile private var interfaceBuiltFor: Pair<VpnConfig, TunnelConfig>? = null
+
     // Written by the control-socket event listener and read by the
     // network-change coroutine, so neither may cache them.
     @Volatile private var currentVpnIp6: String = ""  // Negotiated dual-stack v6 ("" = v4-only session)
@@ -932,10 +939,14 @@ class TiredVpnService : VpnService() {
             }
         }
 
-        // Close VPN interface (through the ledger, so it is closed exactly once)
+        // Keep the current VPN interface, close only the rest. A failed attempt
+        // is followed by a retry or by disconnect(), which closes everything;
+        // until then the interface keeps the VPN network up, so traffic waits
+        // in the tunnel instead of leaving over the physical network. With the
+        // core's own copy now closed on stop, closing ours here really did
+        // take the VPN down between attempts.
         if (!stillOurs(generation, "TUN ledger")) return
-        vpnInterface = null
-        tunHandles.releaseAll()
+        tunHandles.releaseAllExcept(vpnInterface)
 
         // The endpoint pool lists every server the user dials; it is rebuilt on
         // the next connect, so nothing needs it once the core has stopped —
@@ -1123,6 +1134,7 @@ class TiredVpnService : VpnService() {
 
         // 7. Drop the current interface; step 8 closes it along with our orphans.
         vpnInterface = null
+        interfaceBuiltFor = null
 
         // 8. Close the TUN descriptors we still own. One pass is enough now:
         // the ledger already holds every descriptor this service established,
@@ -1240,12 +1252,23 @@ class TiredVpnService : VpnService() {
         // the user's DNS on the first network switch.
         activeTunnelConfig = tunConfig
 
-        // 3. Create VPN interface with server-provided config
+        // 3. Create VPN interface with server-provided config - or keep the
+        // one we have, when it was built for exactly this.
         setPhase(getString(R.string.phase_creating_tunnel))
-        FileLogger.i(TAG, "STEP 3: Creating VPN interface...")
-        val vpnFd = establishVpn(config, tunConfig)
-            ?: throw RuntimeException("Failed to establish VPN interface")
-        vpnInterface = vpnFd
+        val reused = reusableInterface(config, tunConfig)
+        val vpnFd = if (reused != null) {
+            FileLogger.i(TAG, "STEP 3: Keeping the current VPN interface, fd=${reused.fd}")
+            reused
+        } else {
+            FileLogger.i(TAG, "STEP 3: Creating VPN interface...")
+            val created = establishVpn(config, tunConfig)
+                ?: throw RuntimeException("Failed to establish VPN interface")
+            interfaceBuiltFor = config to tunConfig
+            created
+        }
+        // Anything else still in the ledger is an interface nobody uses any
+        // more: earlier attempts, a superseded connect.
+        adoptVpnInterface(vpnFd, step = "STEP 3")
         FileLogger.i(TAG, "STEP 3: VPN interface created, fd=${vpnFd.fd}")
 
         // Diagnostic: check if our VPN is now the active network
@@ -3498,7 +3521,7 @@ class TiredVpnService : VpnService() {
           // still swapping interfaces.
           networkChangeMutex.withLock {
             try {
-                FileLogger.i(TAG, "=== NETWORK CHANGED - Recreating TUN interface ===")
+                FileLogger.i(TAG, "=== NETWORK CHANGED ===")
 
                 // A network_changed command needs someone to read it.
                 if (!coreStarted) {
@@ -3524,7 +3547,30 @@ class TiredVpnService : VpnService() {
                 val currentIp = if (currentVpnIp.isNotEmpty()) currentVpnIp else TunnelConfig.DEFAULT_TUN_IP
                 FileLogger.i(TAG, "Using current VPN IP: $currentIp")
 
-                // Create new VPN interface (old one may be invalid after network change)
+                // Keep the interface we have. It does not belong to any
+                // network - the core reconnects its own protected socket - so
+                // a Wi-Fi/LTE switch does not invalidate it, and replacing it
+                // is what opened a leak: the platform moves the VPN's uid
+                // routing rules to the new tun and only then adds its routes,
+                // and a packet sent between the two finds no route in the
+                // VPN table and goes out over the physical network. Seen as
+                // single pings with the bare-network TTL right at the switch.
+                // The core gets the same interface again: its descriptor goes
+                // over SCM_RIGHTS as a fresh copy, the core swaps its old copy
+                // for it and re-dials, and the tun device itself never
+                // changes. Sending it with a descriptor, rather than none,
+                // also keeps the message on its own: the core reads one
+                // command per recvmsg, and a bare JSON line can arrive glued
+                // to the network_available sent just before it. A new
+                // interface is built only when the current one is gone.
+                val currentVpnFd = vpnInterface
+                if (currentVpnFd != null && isVpnInterfaceValid(currentVpnFd)) {
+                    FileLogger.i(TAG, "VPN interface still valid (fd=${currentVpnFd.fd}), keeping it")
+                    sendNetworkChangedWithFd(currentVpnFd.fd, reason)
+                    return@withLock
+                }
+                FileLogger.w(TAG, "VPN interface is gone, recreating it")
+
                 val config = ServerRepository.getActiveServer(this@TiredVpnService) ?: return@withLock
 
                 // Rebuild from what the core actually negotiated, not from
@@ -3575,6 +3621,7 @@ class TiredVpnService : VpnService() {
                 // Atomically swap interfaces
                 val oldVpnFd = vpnInterface
                 vpnInterface = newVpnFd
+                interfaceBuiltFor = config to tunConfig
                 FileLogger.i(TAG, "VPN interface swapped atomically")
 
                 // Send network_changed command with new fd
@@ -3849,11 +3896,13 @@ class TiredVpnService : VpnService() {
                 // to whoever owns the core, not to whoever passed a check a
                 // moment ago.
 
-                // 5. Close VPN interface (through the ledger: closed once, ours only).
+                // 5. Keep the VPN interface for the connect that follows (it is
+                // handed to the new core if the tunnel comes back the same, see
+                // reusableInterface); close only stale ones. Closing it here
+                // took the VPN network down for the whole reconnect.
                 if (!stillOurs(generation, "step 5")) return@withContext
-                FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Close VPN interface")
-                vpnInterface = null
-                tunHandles.releaseAll()
+                FileLogger.d(TAG, "executeReconnectSequence: Step 5 - Keep VPN interface, close stale ones")
+                tunHandles.releaseAllExcept(vpnInterface)
 
                 FileLogger.d(TAG, "executeReconnectSequence: Critical cleanup completed, exiting NonCancellable context")
             }
@@ -3972,6 +4021,24 @@ class TiredVpnService : VpnService() {
         vpnInterface = vpnFd
         val closed = tunHandles.handOver(vpnFd)
         if (closed > 0) FileLogger.i(TAG, "$step: closed $closed earlier TUN fd(s), fd=${vpnFd.fd} is the only one left")
+    }
+
+    /**
+     * The current interface, when a connect may hand it to the core instead of
+     * building a new one: it is still open, and it was built for the same
+     * server profile and the same negotiated tunnel.
+     *
+     * Building a new interface on every reconnect is what leaked traffic. The
+     * platform moves the VPN network to the new tun by repointing the per-uid
+     * routing rules first and adding the routes after; a packet sent between
+     * the two finds no route in the VPN table and leaves over Wi-Fi or mobile.
+     * On an emulator that was 8-9 pings per 20 network switches, sent with the
+     * bare network's address. With the same interface there is nothing to move.
+     */
+    private fun reusableInterface(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {
+        val current = vpnInterface ?: return null
+        if (interfaceBuiltFor != (config to tunConfig)) return null
+        return current.takeIf { isVpnInterfaceValid(it) }
     }
 
     /**
@@ -4229,6 +4296,7 @@ class TiredVpnService : VpnService() {
         // sweep ran unguarded here and could close the core's dup, which is
         // what turned a disconnect into a fdsan SIGABRT.
         vpnInterface = null
+        interfaceBuiltFor = null
         val closedOnDisconnect = tunHandles.releaseAll()
         FileLogger.d(TAG, "VPN interface closed ($closedOnDisconnect TUN fd(s))")
 
