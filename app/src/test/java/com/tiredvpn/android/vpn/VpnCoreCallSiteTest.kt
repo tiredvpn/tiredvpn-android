@@ -170,6 +170,54 @@ class VpnCoreCallSiteTest {
         assertTrue(source("VpnWatchdogWorker.kt").contains("class VpnWatchdogWorker"))
     }
 
+    // --- the system's own start request ---------------------------------------
+
+    /**
+     * Reproduced on an emulator with the 1.11.0 release: switching always-on
+     * on in Settings started the service with `android.net.VpnService` as the
+     * action, onStartCommand logged it and did nothing, and the VPN stayed
+     * down. With "Block connections without VPN" that is a device with no
+     * network until the user opens the app.
+     */
+    @Test
+    fun `an always-on start connects like a tap on Connect`() {
+        val body = bodyAfter(
+            callSites("TiredVpnService.kt"),
+            "override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {"
+        )
+        val branch = Regex("""ACTION_CONNECT,\s*SERVICE_INTERFACE\s*->\s*\{""").find(body)
+        assertTrue("SERVICE_INTERFACE must share the connect branch", branch != null)
+        val rest = body.substring(branch!!.range.last)
+        val connectAt = rest.indexOf("connect(config)")
+        assertTrue("the shared branch must connect", connectAt >= 0)
+        assertTrue(
+            "and it must be the connect branch, not a later one",
+            connectAt < rest.indexOf("ACTION_DISCONNECT ->")
+        )
+    }
+
+    /**
+     * The platform skips its start when our VPN is already established but not
+     * while it is being set up (Vpn.startAlwaysOnVpn says as much), so the
+     * request can land mid-connect. It must not run the clean slate a tap runs.
+     */
+    @Test
+    fun `an always-on start leaves a live or coming tunnel alone`() {
+        val body = bodyAfter(
+            callSites("TiredVpnService.kt"),
+            "override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {"
+        )
+        val guard = Regex("""if \(intent\.action == SERVICE_INTERFACE\) \{\s*if \(_state\.value is VpnState\.Connected \|\|""").find(body)
+        assertTrue("the always-on start must check for an existing tunnel first", guard != null)
+        val reset = body.indexOf("forceResetCore(")
+        assertTrue("before the clean slate", guard!!.range.first < reset)
+        assertTrue(
+            "and return from inside the guard, without touching it",
+            Regex("""VpnState\.Connecting && connectionJob\?\.isActive == true\)\s*\)\s*\{\s*FileLogger\.i\(TAG, ""\)\s*return START_STICKY\s*\}""")
+                .containsMatchIn(body.substring(guard.range.first, reset))
+        )
+    }
+
     // --- 1.1 persistent flags belong to the user's intent --------------------
 
     @Test

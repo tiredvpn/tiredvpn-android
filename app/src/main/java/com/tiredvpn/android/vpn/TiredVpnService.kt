@@ -443,7 +443,26 @@ class TiredVpnService : VpnService() {
         if (intent == null) return handleStickyRestart()
 
         when (intent.action) {
-            ACTION_CONNECT -> {
+            // SERVICE_INTERFACE is how the system starts an always-on VPN:
+            // when always-on is switched on, after a package update, after
+            // unlock. It used to fall through this when() and leave the
+            // service up with no tunnel, which under "Block connections
+            // without VPN" is a phone with no network at all. It asks for the
+            // same thing a tap on Connect does.
+            ACTION_CONNECT, SERVICE_INTERFACE -> {
+                if (intent.action == SERVICE_INTERFACE) {
+                    // The platform skips the start when our VPN is already
+                    // established, but not while it is being set up, so this
+                    // can arrive mid-connect. Unlike a tap, it must never tear
+                    // down a tunnel that exists or is on its way.
+                    if (_state.value is VpnState.Connected ||
+                        (_state.value is VpnState.Connecting && connectionJob?.isActive == true)
+                    ) {
+                        FileLogger.i(TAG, "onStartCommand: always-on start while ${_state.value}, nothing to do")
+                        return START_STICKY
+                    }
+                    FileLogger.i(TAG, "onStartCommand: started by the system (always-on), connecting")
+                }
                 val config = ServerRepository.getActiveServer(this)
                 FileLogger.d(TAG, "onStartCommand: config=${if (config != null) "present, valid=${config.isValid}" else "null"}")
                 if (config != null && config.isValid) {
