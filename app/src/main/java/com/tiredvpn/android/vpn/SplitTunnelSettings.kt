@@ -51,6 +51,24 @@ object SplitTunnelSettings {
             .apply()
     }
 
+    /**
+     * The packages to pass to addAllowedApplication in include mode.
+     *
+     * [ownPackage] is always left out. In exclude mode the service keeps its
+     * own traffic outside the tunnel with addDisallowedApplication(packageName),
+     * and that is what makes the core's connections safe in the instant
+     * between connect() and protect(): they start outside the VPN anyway. In
+     * include mode that call is not allowed, so if the user had ticked this
+     * app the core's SYNs would go into the tunnel before protect() marked
+     * them. Companions of a tunnelled Google app are added as before.
+     */
+    fun includeList(selected: Set<String>, ownPackage: String, googleCompanions: Collection<String>): Set<String> {
+        val out = LinkedHashSet(selected)
+        if (selected.any { it.startsWith("com.google.android") }) out += googleCompanions
+        out.remove(ownPackage)
+        return out
+    }
+
     // Convenience overloads that resolve prefs from a Context.
 
     fun getMode(context: Context, profileId: String?): String =
