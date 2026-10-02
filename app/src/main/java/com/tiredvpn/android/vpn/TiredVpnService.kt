@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.net.Network
@@ -90,6 +91,7 @@ class TiredVpnService : VpnService() {
 
         /** Ceiling on simultaneously live protect handlers. */
         private const val MAX_PROTECT_CLIENTS = 32
+        private const val PROTECT_THREADS = 4
 
         /** requestCode for the VPN notification's content intent. */
         private const val NOTIFICATION_REQUEST_CODE = 0
@@ -158,6 +160,19 @@ class TiredVpnService : VpnService() {
      * stream — is behind this adapter, so [ControlChannel] can be exercised
      * without one.
      */
+    private class LocalSocketProtectTransport(private val socket: LocalSocket) : ProtectTransport {
+        override fun read(buf: ByteArray, off: Int, len: Int): Int = socket.inputStream.read(buf, off, len)
+        override fun write(bytes: ByteArray) {
+            socket.outputStream.write(bytes)
+            socket.outputStream.flush()
+        }
+        override fun shutdown() {
+            try { socket.shutdownInput() } catch (_: Exception) {}
+            try { socket.shutdownOutput() } catch (_: Exception) {}
+        }
+        override fun close() { socket.close() }
+    }
+
     private class LocalSocketTransport(private val socket: LocalSocket) : ControlTransport {
         override val input: java.io.InputStream get() = socket.inputStream
         override val output: java.io.OutputStream get() = socket.outputStream
@@ -250,9 +265,19 @@ class TiredVpnService : VpnService() {
     @Volatile
     private var protectServerSocket: LocalSocket? = null
 
-    /** Live protect-client descriptors, so a stop can wake their readers. */
-    private val protectClientFds =
-        java.util.Collections.synchronizedList(mutableListOf<java.io.FileDescriptor>())
+    /** Live protect sessions, so a stop can wake them. */
+    private val protectSessions =
+        java.util.Collections.synchronizedSet(mutableSetOf<ProtectSession>())
+
+    /**
+     * Threads of the protect server and its handlers, apart from
+     * Dispatchers.IO. One of them sits in accept(); the rest serve requests,
+     * which the core sends one at a time (protector.mu in internal/protect).
+     */
+    private val protectExecutor = java.util.concurrent.Executors.newFixedThreadPool(PROTECT_THREADS) { r ->
+        Thread(r, "TiredVpnProtect").apply { isDaemon = true }
+    }
+    private val protectDispatcher = protectExecutor.asCoroutineDispatcher()
 
     /**
      * Which protect server owns `protect.sock` right now.
@@ -1669,6 +1694,12 @@ class TiredVpnService : VpnService() {
      * Go side sends fd as 4-byte little-endian int, we call VpnService.protect(fd).
      * Returns 0 on success, 1 on failure.
      * Uses FILESYSTEM namespace (not abstract) so Go can connect to it.
+     *
+     * Runs on [protectDispatcher], not on Dispatchers.IO. That pool is shared
+     * with everything else in the service, and it has been eaten whole by
+     * wedged native calls before; a protect handler queued behind them starts
+     * after the core's 5-second wait has expired, and protect() then marks
+     * whatever socket has since been given the same number.
      */
     private fun startProtectServer(socketPath: String) {
         // Close and cancel any existing protect server, in that order
@@ -1682,7 +1713,7 @@ class TiredVpnService : VpnService() {
         // Remove old socket file
         File(socketPath).delete()
 
-        protectServerJob = scope.launch {
+        protectServerJob = scope.launch(protectDispatcher) {
             var serverSocket: LocalSocket? = null
             try {
                 // Create socket and bind to FILESYSTEM namespace
@@ -1696,23 +1727,25 @@ class TiredVpnService : VpnService() {
 
                 // Published so stopProtectServer can close the listening
                 // descriptor. Cancelling the Job cannot interrupt the blocking
-                // Os.accept below, so the finally never ran, the thread stayed
-                // wedged on Dispatchers.IO and the descriptor stayed open —
-                // one of each per reconnect.
+                // accept below, so the finally never ran, the thread stayed
+                // wedged and the descriptor stayed open — one of each per
+                // reconnect.
                 protectServerSocket = serverSocket
 
-                // Get the file descriptor and start listening
-                val fd = serverSocket.fileDescriptor
-                android.system.Os.listen(fd, 5)
+                // A LocalServerSocket over the descriptor we just bound
+                // (it calls listen()), so accepted connections come back as
+                // LocalSockets: setSoTimeout works on every API level, which
+                // replaces the pre-API-29 coroutine that closed the descriptor
+                // under the handler, and later on getAncillaryFileDescriptors
+                // is how a descriptor sent with the request is received.
+                val listener = LocalServerSocket(serverSocket.fileDescriptor)
 
                 FileLogger.d(TAG, "Protect server listening on $socketPath (FILESYSTEM namespace)")
 
                 while (isActive) {
-                    val clientFd = try {
-                        // Accept connection using Os API
-                        android.system.Os.accept(fd, null)
-                    } catch (e: android.system.ErrnoException) {
-                        if (e.errno == android.system.OsConstants.EINTR) continue
+                    val client = try {
+                        listener.accept()
+                    } catch (e: java.io.IOException) {
                         // EINVAL (shutdown) and EBADF (close) are the normal
                         // exits: stopProtectServer took the listening socket
                         // out from under us on purpose, in that order.
@@ -1720,63 +1753,39 @@ class TiredVpnService : VpnService() {
                         break
                     }
 
-                    // Bound the number of live handlers. Each one blocks in
-                    // Os.read, and a client that connects and says nothing
-                    // holds its thread for the read timeout; unbounded, a
-                    // stuck peer could take the IO pool with it.
-                    if (protectClientFds.size >= MAX_PROTECT_CLIENTS) {
-                        FileLogger.w(TAG, "Protect: too many live handlers (${protectClientFds.size}), dropping connection")
-                        try { android.system.Os.close(clientFd) } catch (_: Exception) {}
+                    // Bound the number of live handlers. Each one blocks in a
+                    // read for up to the read timeout, and with a small pool
+                    // a pile of silent clients would delay the real requests.
+                    if (protectSessions.size >= MAX_PROTECT_CLIENTS) {
+                        FileLogger.w(TAG, "Protect: too many live handlers (${protectSessions.size}), dropping connection")
+                        try { client.close() } catch (_: Exception) {}
                         continue
                     }
-                    protectClientFds.add(clientFd)
+
+                    // Without a deadline a silent client blocks its thread
+                    // forever: the read has none of its own.
+                    try {
+                        client.soTimeout = PROTECT_CLIENT_READ_TIMEOUT_MS.toInt()
+                    } catch (e: Exception) {
+                        FileLogger.w(TAG, "Protect: cannot set read timeout: ${e.message}")
+                    }
+                    val session = ProtectSession(LocalSocketProtectTransport(client)) { fd -> protect(fd) }
+                    protectSessions.add(session)
 
                     launch {
-                        // Without a deadline a silent client blocks its thread
-                        // forever: the read below has none of its own.
-                        // SO_RCVTIMEO through Os is API 29; below that the only
-                        // lever is closing the descriptor, which makes the
-                        // blocked read return.
-                        // Exactly one of the two paths below may close this
-                        // descriptor. Closing a number twice is what the TUN
-                        // ledger exists to prevent elsewhere: between the two
-                        // closes the number can be handed to something else.
-                        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-                        fun closeOnce(why: String) {
-                            if (closed.compareAndSet(false, true)) {
-                                try { android.system.Os.close(clientFd) } catch (_: Exception) {}
-                            } else {
-                                FileLogger.d(TAG, "Protect: fd already closed ($why)")
-                            }
-                        }
-
-                        var closer: Job? = null
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            try {
-                                android.system.Os.setsockoptTimeval(
-                                    clientFd,
-                                    android.system.OsConstants.SOL_SOCKET,
-                                    android.system.OsConstants.SO_RCVTIMEO,
-                                    android.system.StructTimeval.fromMillis(PROTECT_CLIENT_READ_TIMEOUT_MS)
-                                )
-                            } catch (e: Exception) {
-                                FileLogger.w(TAG, "Protect: cannot set read timeout: ${e.message}")
-                            }
-                        } else {
-                            closer = launch {
-                                delay(PROTECT_CLIENT_READ_TIMEOUT_MS)
-                                FileLogger.w(TAG, "Protect: client silent for ${PROTECT_CLIENT_READ_TIMEOUT_MS}ms, closing fd (pre-API-29 path)")
-                                closeOnce("timeout")
-                            }
-                        }
                         try {
-                            handleProtectClientFd(clientFd)
+                            when (session.run()) {
+                                ProtectSession.Outcome.PROTECTED -> FileLogger.d(TAG, "Protected fd=${session.requestedFd}")
+                                ProtectSession.Outcome.REFUSED -> FileLogger.w(TAG, "Failed to protect fd=${session.requestedFd}")
+                                ProtectSession.Outcome.PROBE -> FileLogger.d(TAG, "Protect: test connection (no data)")
+                                ProtectSession.Outcome.SHORT_READ -> FileLogger.w(TAG, "Protect: incomplete request")
+                                ProtectSession.Outcome.STOPPED -> FileLogger.d(TAG, "Protect: server stopped before the request was served")
+                                ProtectSession.Outcome.WRITE_FAILED -> FileLogger.w(TAG, "Protect: fd=${session.requestedFd} protected, answer not delivered")
+                            }
                         } catch (e: Exception) {
                             FileLogger.w(TAG, "Protect client error", e)
                         } finally {
-                            closer?.cancel()
-                            protectClientFds.remove(clientFd)
-                            closeOnce("handler done")
+                            protectSessions.remove(session)
                         }
                     }
                 }
@@ -1797,53 +1806,12 @@ class TiredVpnService : VpnService() {
     }
 
     /**
-     * Handle a single protect client connection using raw file descriptor.
-     * Protocol: Read 4-byte little-endian fd, call protect(), send 1-byte response (0=ok, 1=fail).
-     * Note: Go's InitAndroidProtector() does a test connection (connect+close) without sending data.
-     */
-    private fun handleProtectClientFd(clientFd: java.io.FileDescriptor) {
-        // Read fd as 4-byte little-endian int
-        val fdBytes = ByteArray(4)
-        val byteBuf = java.nio.ByteBuffer.wrap(fdBytes)
-        var totalRead = 0
-        while (totalRead < 4) {
-            val n = android.system.Os.read(clientFd, byteBuf)
-            if (n <= 0) {
-                // 0-byte read means client closed connection (Go's test connection)
-                if (totalRead == 0) {
-                    FileLogger.d(TAG, "Protect: test connection (no data)")
-                } else {
-                    FileLogger.w(TAG, "Protect: incomplete read, got $totalRead/4 bytes")
-                }
-                return  // Don't send error for test connections
-            }
-            totalRead += n
-        }
-
-        // Little-endian to int
-        val fd = (fdBytes[0].toInt() and 0xFF) or
-                 ((fdBytes[1].toInt() and 0xFF) shl 8) or
-                 ((fdBytes[2].toInt() and 0xFF) shl 16) or
-                 ((fdBytes[3].toInt() and 0xFF) shl 24)
-
-        // Call VpnService.protect()
-        val success = protect(fd)
-        if (success) {
-            FileLogger.d(TAG, "Protected fd=$fd")
-            android.system.Os.write(clientFd, java.nio.ByteBuffer.wrap(byteArrayOf(0)))
-        } else {
-            FileLogger.w(TAG, "Failed to protect fd=$fd")
-            android.system.Os.write(clientFd, java.nio.ByteBuffer.wrap(byteArrayOf(1)))
-        }
-    }
-
-    /**
      * Stop the protect server.
      *
-     * Order matters and is the whole fix: the blocking `Os.accept` has to be
+     * Order matters and is the whole fix: the blocking accept has to be
      * woken before anything else can proceed. Cancelling the Job first, as the
      * old code did, cancels nothing a syscall can see — the coroutine stayed
-     * parked in accept, its `finally` never ran, and both the IO thread and the
+     * parked in accept, its `finally` never ran, and both the thread and the
      * descriptor leaked once per reconnect.
      *
      * `shutdown` and then `close`, in that order, because on Linux `close()`
@@ -1852,9 +1820,13 @@ class TiredVpnService : VpnService() {
      * `shutdown(SHUT_RDWR)` on a listening socket is what Linux answers with
      * EINVAL out of accept. Closing afterwards releases the descriptor.
      *
+     * Client sessions are only woken, never closed here: each one closes its
+     * own descriptor in its own `finally`, so no number is freed while a
+     * handler may still use it (see [ProtectSession]).
+     *
      * No join: every caller runs on the service's main thread, and waiting for
-     * an IO coroutine there trades a descriptor leak for an ANR. Waking the
-     * loop is what matters; the coroutine then unwinds on its own.
+     * a handler there trades a descriptor leak for an ANR. Waking the loop is
+     * what matters; the coroutine then unwinds on its own.
      */
     private fun stopProtectServer() {
         val socket = protectServerSocket
@@ -1864,15 +1836,10 @@ class TiredVpnService : VpnService() {
         } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
 
-        // Client handlers are parked in Os.read; closing their descriptors is
-        // the only thing that wakes them.
-        val clients = protectClientFds.toList()
-        protectClientFds.clear()
-        for (clientFd in clients) {
-            try { android.system.Os.close(clientFd) } catch (_: Exception) {}
-        }
-        if (clients.isNotEmpty()) {
-            FileLogger.d(TAG, "Protect: closed ${clients.size} live client fd(s)")
+        val sessions = synchronized(protectSessions) { protectSessions.toList() }
+        for (session in sessions) session.wake()
+        if (sessions.isNotEmpty()) {
+            FileLogger.d(TAG, "Protect: woke ${sessions.size} live client(s)")
         }
 
         protectServerJob?.cancel()
@@ -4109,15 +4076,21 @@ class TiredVpnService : VpnService() {
             "include" -> {
                 // Only selected apps use VPN
                 // Note: when using addAllowedApplication, we can't use addDisallowedApplication
-                val appsToAllow = LinkedHashSet(selectedApps)
-
                 // If any Google app is tunneled, also tunnel Google Play Services and
                 // friends, otherwise their offloaded signaling/STUN stays off-tunnel
                 // and WebRTC calls (Google Meet) hang on ICE. Companions that aren't
                 // installed are skipped by the per-package try/catch below.
-                if (selectedApps.any { it.startsWith("com.google.android") }) {
-                    appsToAllow += GOOGLE_COMPANION_PACKAGES
-                    FileLogger.i(TAG, "Google app in allowlist, adding companions: $GOOGLE_COMPANION_PACKAGES")
+                // Our own package never goes in: see SplitTunnelSettings.includeList.
+                val appsToAllow = SplitTunnelSettings.includeList(selectedApps, packageName, GOOGLE_COMPANION_PACKAGES)
+                if (packageName in selectedApps) {
+                    FileLogger.w(TAG, "Split tunneling: own package was in the include list, left out")
+                }
+                if (appsToAllow.isEmpty()) {
+                    // Nothing left to allow: an empty allow-list means "every
+                    // app", ourselves included. Fall back to the exclude path,
+                    // which the caller finishes with addDisallowedApplication.
+                    FileLogger.w(TAG, "Split tunneling: include list empty after filtering, tunnelling all apps except this one")
+                    return false
                 }
 
                 for (pkg in appsToAllow) {
@@ -4424,6 +4397,11 @@ class TiredVpnService : VpnService() {
 
         // Final scope cancellation for safety (in case disconnect() was already called)
         scope.cancel()
+        // disconnect() stopped the protect server and woke its sessions; the
+        // pool's threads finish what they are on and exit. shutdown() does
+        // not interrupt them, which is the point: interrupting a blocked
+        // socket call is not something to rely on.
+        protectExecutor.shutdown()
         super.onDestroy()
     }
 

@@ -436,14 +436,76 @@ class VpnCoreCallSiteTest {
             "closing has to come first: cancelling a Job does not interrupt a blocking Os.accept",
             closeAt < cancelAt
         )
-        assertTrue("live client descriptors must be closed too", body.contains("protectClientFds"))
+        assertTrue("live sessions must be woken", body.contains("session.wake()"))
+        assertFalse(
+            "and not closed: a session closes its own descriptor, closing it here freed the number under a live handler",
+            body.contains("Os.close(") || body.substringAfter("val sessions").contains(".close()")
+        )
     }
 
     @Test
     fun `protect clients get a read deadline and a ceiling`() {
-        val service = source("TiredVpnService.kt")
-        assertTrue("a silent client must not hold its thread forever", service.contains("SO_RCVTIMEO"))
-        assertTrue("the number of live handlers must be bounded", service.contains("MAX_PROTECT_CLIENTS"))
+        val service = callSites("TiredVpnService.kt")
+        val start = bodyAfter(service, "private fun startProtectServer(socketPath: String) {")
+        assertTrue(
+            "a silent client must not hold its thread forever: socket read timeout on every API level",
+            start.contains("client.soTimeout = PROTECT_CLIENT_READ_TIMEOUT_MS.toInt()")
+        )
+        assertFalse(
+            "no coroutine that closes the descriptor under the handler on a timer",
+            start.contains("delay(PROTECT_CLIENT_READ_TIMEOUT_MS)")
+        )
+        assertTrue("the number of live handlers must be bounded", start.contains("MAX_PROTECT_CLIENTS"))
+    }
+
+    /**
+     * Dispatchers.IO is shared with the whole service and has been exhausted
+     * by wedged native calls. A protect handler queued behind them starts
+     * after the core's 5-second wait, and protect() then marks whatever socket
+     * has the number by then.
+     */
+    @Test
+    fun `protect requests are served on their own threads`() {
+        val service = callSites("TiredVpnService.kt")
+        val start = bodyAfter(service, "private fun startProtectServer(socketPath: String) {")
+        assertTrue("the server runs on its own dispatcher", start.contains("scope.launch(protectDispatcher)"))
+        assertFalse("and nothing in it falls back to Dispatchers.IO", start.contains("Dispatchers.IO"))
+        assertTrue(
+            "a fixed pool of PROTECT_THREADS",
+            service.contains("Executors.newFixedThreadPool(PROTECT_THREADS)") &&
+                service.contains("val protectDispatcher = protectExecutor.asCoroutineDispatcher()")
+        )
+        val threads = Regex("""PROTECT_THREADS = (\d+)""").find(service)?.groupValues?.get(1)?.toInt()
+        assertTrue("2 to 4 threads: one sits in accept()", threads != null && threads in 2..4)
+        assertTrue("every request goes through a ProtectSession", start.contains("ProtectSession(LocalSocketProtectTransport(client))"))
+        val destroy = bodyAfter(service, "override fun onDestroy() {")
+        assertTrue("the pool is shut down with the service", destroy.contains("protectExecutor.shutdown()"))
+    }
+
+    /**
+     * What makes the window between connect() and protect() harmless today:
+     * the service's own uid is outside its tunnel. In exclude mode that is
+     * addDisallowedApplication(packageName); in include mode the allow-list
+     * must never contain this app.
+     */
+    @Test
+    fun `the app's own traffic stays outside its tunnel in both split modes`() {
+        val service = callSites("TiredVpnService.kt")
+        assertEquals(
+            "both builders (tun and proxy) exclude this app when no allow-list is used",
+            2, Regex("""if \(!usesAllowedApps\) \{\s*builder\.addDisallowedApplication\(packageName\)""").findAll(service).count()
+        )
+        val apply = bodyAfter(service, "private fun applySplitTunneling(builder: Builder, profileId: String?): Boolean {")
+        val include = apply.substring(apply.indexOf("SplitTunnelSettings.includeList(").coerceAtLeast(0))
+        assertTrue(
+            "the include branch builds its list through includeList with this app's package",
+            apply.contains("SplitTunnelSettings.includeList(selectedApps, packageName, GOOGLE_COMPANION_PACKAGES)")
+        )
+        assertTrue(
+            "an allow-list emptied by the filter falls back to the exclude path",
+            Regex("""if \(appsToAllow\.isEmpty\(\)\) \{[\s\S]*?return false""").containsMatchIn(include)
+        )
+        assertFalse("no allow-list is built by hand any more", apply.contains("LinkedHashSet(selectedApps)"))
     }
 
     @Test
