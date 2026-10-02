@@ -17,6 +17,11 @@ dependencyCheck {
     failBuildOnCVSS = 9.0f
     formats = listOf("JSON", "HTML")
     analyzers.assemblyEnabled = false
+    // Without a key the NVD API is throttled hard: a cold download took
+    // 27 min to 1h45m in CI, and several runs at once hung for hours. CI
+    // passes both from the environment; locally the plugin defaults stay.
+    System.getenv("NVD_API_KEY")?.takeIf { it.isNotBlank() }?.let { nvd.apiKey.set(it) }
+    System.getenv("DEPENDENCY_CHECK_DATA")?.takeIf { it.isNotBlank() }?.let { data.directory.set(it) }
 }
 
 // --- JNI core: build libtiredvpn.so only from a core checkout someone named ---

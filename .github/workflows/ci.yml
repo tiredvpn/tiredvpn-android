@@ -65,6 +65,18 @@ jobs:
 
   security_scan:
     runs-on: ubuntu-latest
+    # Without this the job inherited the 6 h default: the NVD download has no
+    # timeout of its own and, unauthenticated and with several runs at once,
+    # sat in "in progress" for hours.
+    timeout-minutes: 90
+    # A newer push to the same branch makes the running scan pointless, and
+    # parallel scans compete for the same NVD rate limit.
+    concurrency:
+      group: security-scan-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      DEPENDENCY_CHECK_DATA: /home/runner/.cache/dependency-check-data
     steps:
       - uses: actions/checkout@v7
 
@@ -74,8 +86,33 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The vulnerability database is downloaded once and then only updated:
+      # every run restores the newest copy, and main saves it back.
+      - name: Restore vulnerability database
+        uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/.cache/dependency-check-data
+          key: dependency-check-data-${{ github.run_id }}
+          restore-keys: dependency-check-data-
+
+      - name: Update vulnerability database
+        id: nvd_update
+        run: ./gradlew dependencyCheckUpdate
+        timeout-minutes: 50
+        continue-on-error: true
+
+      # Only a database that finished updating is saved; a step cut off by
+      # its timeout may leave a half-written one behind.
+      - name: Save vulnerability database
+        if: github.ref == 'refs/heads/main' && steps.nvd_update.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: /home/runner/.cache/dependency-check-data
+          key: dependency-check-data-${{ github.run_id }}
+
       - name: OWASP Dependency Check
         run: ./gradlew dependencyCheckAnalyze
+        timeout-minutes: 20
         continue-on-error: true
 
       - name: Upload OWASP Report
@@ -83,7 +120,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: owasp-dependency-check
-          path: app/build/reports/dependency-check/
+          # The plugin writes dependency-check-report.{html,json} straight
+          # into reports/; the old dependency-check/ directory never existed,
+          # so no report was ever uploaded.
+          path: app/build/reports/dependency-check-report.*
           retention-days: 30
 
       - name: Trivy Filesystem Scan
