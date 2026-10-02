@@ -1442,4 +1442,29 @@ class VpnCoreCallSiteTest {
         )
         assertTrue(source("SharedFiles.kt").contains("""const val DIR_NAME = "share""""))
     }
+
+    // --- the exit of a core we already replaced -------------------------------
+
+    /**
+     * Reproduced on a phone with the 1.11.0 release, 10 wifi/mobile switches:
+     * every new attempt's start() stopped the core of the attempt before it,
+     * that core's exit was taken for the current one dying during Connecting,
+     * and the fast reconnect it scheduled stopped the new core in turn. 13-15
+     * such exits per run, attempt counter past 20, tunnel dead, UI Connected.
+     */
+    @Test
+    fun `only the current core's exit is acted on`() {
+        val service = callSites("TiredVpnService.kt")
+        val body = bodyAfter(service, "private fun launchCore(args: List<String>, label: String) {")
+        val publish = body.indexOf("tiredvpnProcess = core")
+        val start = body.indexOf("core.start()")
+        assertTrue("the core must be published", publish >= 0)
+        assertTrue("before start(), which is where the previous core's exit arrives", publish in 0 until start)
+        assertTrue(
+            "an exit counts only from the core in the field",
+            Regex("""onExit = \{ code ->\s*if \(tiredvpnProcess === core\) \{\s*handleCoreExit\(code, label\)""").containsMatchIn(body)
+        )
+        assertEquals("every core goes through launchCore", 1, occurrences(service, "NativeProcessJNI("))
+        assertEquals("both modes use it", 2, occurrences(service, "launchCore(args.drop(1), "))
+    }
 }
