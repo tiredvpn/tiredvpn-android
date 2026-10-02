@@ -228,7 +228,8 @@ class TiredVpnService : VpnService() {
      */
     private val tunHandles = TunHandleRegistry<ParcelFileDescriptor> { it.close() }
 
-    private var tiredvpnProcess: TiredVpnProcess? = null  // Can be NativeProcess or NativeProcessJNI
+    // Volatile: launchCore's exit filter reads it from the core's own thread.
+    @Volatile private var tiredvpnProcess: TiredVpnProcess? = null  // Can be NativeProcess or NativeProcessJNI
 
     /**
      * The one way in and out of the control socket. See [ControlChannel] for
@@ -1561,18 +1562,7 @@ class TiredVpnService : VpnService() {
         // The `if (true) { ... } else { NativeProcess(...) }` this replaces
         // carried an unreachable copy of the exit state machine that had
         // already started drifting from the live one.
-        tiredvpnProcess = NativeProcessJNI(
-            args = args.drop(1), // Skip binary path for JNI mode
-            onOutput = { line ->
-                FileLogger.d(TAG, "[tiredvpn-jni] $line")
-                parseConnectionInfo(line)
-            },
-            onError = { line ->
-                FileLogger.e(TAG, "[tiredvpn-jni] $line")
-                parseConnectionInfo(line)
-            },
-            onExit = { code -> handleCoreExit(code, "proxy") }
-        ).also { it.start() }
+        launchCore(args.drop(1), "proxy") // Skip binary path for JNI mode
     }
 
     /**
@@ -2046,8 +2036,27 @@ class TiredVpnService : VpnService() {
         // Android 10+ blocks execution of standalone binaries from app storage
         // JNI mode on every Android version - see startTiredVpnProxyProcess
         // for why there is no second branch here any more.
-        tiredvpnProcess = NativeProcessJNI(
-            args = args.drop(1), // Skip binary path for JNI mode
+        launchCore(args.drop(1), "tun") // Skip binary path for JNI mode
+    }
+
+    /**
+     * Start a core and make it the one whose exit the service acts on.
+     *
+     * The field is published before start(), and an exit only counts when it
+     * comes from the core in the field. Both halves are needed. start() opens
+     * with TiredVpnNative.reset(), which stops whatever core the previous
+     * attempt left running; that core's "disconnected" arrives on the old
+     * NativeProcessJNI while we are still inside start(). With the field
+     * assigned after start() it was still the current core, so its death went
+     * to handleCoreExit as "core died during Connecting", which scheduled a
+     * fast reconnect, whose start() stopped this core in turn. On a phone
+     * switching between wifi and mobile that loop never settled: 15 such
+     * exits in 10 switches, the tunnel dead and the UI showing Connected.
+     */
+    private fun launchCore(args: List<String>, label: String) {
+        lateinit var core: NativeProcessJNI
+        core = NativeProcessJNI(
+            args = args,
             onOutput = { line ->
                 FileLogger.d(TAG, "[tiredvpn-jni] $line")
                 parseConnectionInfo(line)
@@ -2056,8 +2065,16 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "[tiredvpn-jni] $line")
                 parseConnectionInfo(line)
             },
-            onExit = { code -> handleCoreExit(code, "tun") }
-        ).also { it.start() }
+            onExit = { code ->
+                if (tiredvpnProcess === core) {
+                    handleCoreExit(code, label)
+                } else {
+                    FileLogger.w(TAG, "tiredvpn-jni[$label] exit $code came from a superseded core, ignoring")
+                }
+            }
+        )
+        tiredvpnProcess = core
+        core.start()
     }
 
     private suspend fun connectToControlSocket(
