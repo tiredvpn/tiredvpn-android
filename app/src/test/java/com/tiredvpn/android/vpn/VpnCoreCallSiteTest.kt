@@ -524,6 +524,36 @@ class VpnCoreCallSiteTest {
         assertEquals("both modes use it", 2, occurrences(service, "launchCore(args.drop(1), "))
     }
 
+    // --- one TUN descriptor per live interface --------------------------------
+
+    /**
+     * Every path that makes an interface current must close the ones before
+     * it. Only forceResetCore() emptied the ledger, so successful reconnects
+     * and network switches each left a descriptor (and a dead tunN) behind.
+     */
+    @Test
+    fun `every interface that becomes current closes the ones before it`() {
+        val service = callSites("TiredVpnService.kt")
+        val adopt = bodyAfter(service, "private fun adoptVpnInterface(vpnFd: ParcelFileDescriptor, step: String) {")
+        assertTrue("adoption goes through the ledger", adopt.contains("tunHandles.handOver(vpnFd)"))
+        assertTrue("and publishes the interface", adopt.contains("vpnInterface = vpnFd"))
+
+        val connect = bodyAfter(service, "private suspend fun connectTunMode(config: VpnConfig, generation: Int, deadline: ConnectDeadline) {")
+        val adoptAt = connect.indexOf("adoptVpnInterface(it, step = \"\")")
+        assertTrue("a tun-mode connect adopts its interface", adoptAt >= 0)
+        assertTrue("before Connected is published", adoptAt < connect.indexOf("_state.value = VpnState.Connected("))
+
+        val proxy = bodyAfter(service, "private suspend fun connectProxyMode(config: VpnConfig, generation: Int) {")
+        assertTrue("a proxy-mode connect adopts its interface", proxy.contains("adoptVpnInterface(vpnFd, step = \"\")"))
+
+        val swap = bodyAfter(service, "private fun sendNetworkChangedCommand(")
+        val sent = swap.indexOf("sendNetworkChangedWithFd(newVpnFd.fd, reason)")
+        val adopted = swap.indexOf("adoptVpnInterface(newVpnFd, step = \"\")")
+        assertTrue("a network switch adopts the new interface", adopted >= 0)
+        assertTrue("after the core has been told about it", sent in 0 until adopted)
+        assertFalse("and closes nothing by hand", swap.contains("oldVpn.close()"))
+    }
+
     // --- 5 the core surviving cleanup ---------------------------------------
 
     @Test

@@ -68,6 +68,28 @@ internal class TunHandleRegistry<T : Any>(private val closer: (T) -> Unit) {
     }
 
     /**
+     * Make [current] the only handle left: track it if it is not tracked yet,
+     * close every other one and forget them. For the moment a new interface
+     * has taken over and the core is using it; whatever else is still here
+     * belongs to an attempt that is over.
+     *
+     * One pass under the lock decides what goes, so a handle is closed at most
+     * once even when a teardown runs at the same time: whoever takes it out of
+     * the ledger is the only one who may close it.
+     *
+     * @return how many handles were closed.
+     */
+    fun handOver(current: T): Int {
+        val doomed = synchronized(lock) {
+            if (tracked.none { it === current }) tracked.add(current)
+            val out = tracked.filter { it !== current }
+            tracked.removeAll { it !== current }
+            out
+        }
+        return closeEach(doomed)
+    }
+
+    /**
      * Drop a handle without closing it — for when ownership moved elsewhere or
      * something else already closed it. Prevents a later sweep from closing a
      * descriptor number that has since been reused.
