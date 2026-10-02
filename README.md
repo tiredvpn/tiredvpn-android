@@ -95,7 +95,7 @@ app/src/main/java/com/tiredvpn/android/
 
 ### Step 1: Build the Go native library
 
-Use the provided script - it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) automatically, cross-compiles for all three architectures, and places the `.so` files in the right directories:
+Use the provided script. Without arguments it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) into a fresh temporary directory, cross-compiles for all three architectures, and places the `.so` files in the right directories:
 
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.2.12479018
@@ -108,7 +108,15 @@ If you already have the Go core checked out locally:
 ./scripts/build-jni.sh --core-dir /path/to/tiredvpn
 ```
 
-The script outputs `libtiredvpn.so` into `app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/`.
+The script outputs `libtiredvpn.so` into `app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/` and writes `app/src/main/jniLibs/.core-revision` with the core revision and a checksum per library.
+
+Gradle packages native code only when that stamp matches the libraries. A `.so` copied in by hand, or one without a stamp, stops the build with an explanation. Gradle can also build the libraries itself from a checkout you name:
+
+```bash
+./gradlew assembleDebug -PtiredvpnCoreDir=/path/to/tiredvpn
+```
+
+`tiredvpnCoreDir` can live in `~/.gradle/gradle.properties` instead. The revision ends up in the APK as `assets/core-revision.txt`.
 
 ### Step 2: Build the APK
 

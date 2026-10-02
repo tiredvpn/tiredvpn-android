@@ -58,6 +58,11 @@ jobs:
       - name: Lint
         run: ./gradlew lint
 
+      - name: Core guard
+        # Packaging must refuse a libtiredvpn.so nobody can trace to a core
+        # revision; this runs the guard against fake libraries in a copy.
+        run: ./scripts/test-core-guard.sh
+
   security_scan:
     runs-on: ubuntu-latest
     steps:
