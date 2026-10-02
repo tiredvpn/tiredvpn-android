@@ -347,6 +347,13 @@ class TiredVpnService : VpnService() {
      */
     private val connectGeneration = ConnectGeneration()
 
+    /**
+     * Latched by every teardown, lifted only by ACTION_CONNECT and the sticky
+     * restart of a wanted tunnel. Nothing that heals itself may lift it — see
+     * StopLatch.
+     */
+    private val stopLatch = StopLatch()
+
     private var pendingReconnectJob: Job? = null // Track pending reconnect job to cancel it
     @Volatile private var isReconnecting = false // Atomic flag to prevent parallel reconnects
     private var lastNetworkSignalSentTime: Long = 0 // Debounce for network_available signals to Go
@@ -452,6 +459,7 @@ class TiredVpnService : VpnService() {
                     // core ALWAYS starts cleanly without needing a force-stop. Internal
                     // auto-reconnects call connect() directly (bypassing onStartCommand),
                     // so they are not affected by this.
+                    stopLatch.lift()
                     forceResetCore("connect")
                     startForeground(NOTIFICATION_ID, createNotification("Connecting..."))
                     connect(config)
@@ -466,6 +474,7 @@ class TiredVpnService : VpnService() {
             }
             ACTION_FORCE_RESET -> {
                 FileLogger.w(TAG, "onStartCommand: ACTION_FORCE_RESET")
+                stopLatch.latch()
                 forceResetCore("user force reset")
                 _state.value = VpnState.Disconnected
                 applyStopIntent(StopIntent.USER)
@@ -495,6 +504,7 @@ class TiredVpnService : VpnService() {
 
         return when (decision) {
             StickyRestart.Decision.RECONNECT -> {
+                stopLatch.lift()
                 forceResetCore("sticky restart")
                 connect(config!!)
                 START_STICKY
@@ -535,6 +545,14 @@ class TiredVpnService : VpnService() {
      * @return false when [supersedes] has been superseded and nothing started.
      */
     private fun connect(config: VpnConfig, supersedes: Int? = null): Boolean {
+        // A stopped tunnel is started again by ACTION_CONNECT, which lifts the
+        // latch first. Anything else arriving here after a stop is a
+        // self-healing path that raced it, and must not bring the VPN back.
+        if (stopLatch.isLatched) {
+            FileLogger.w(TAG, "connect: the tunnel was stopped, declining (supersedes=$supersedes)")
+            return false
+        }
+
         // Claimed before anything else, including the watchdog: declining has
         // to leave no trace, and an armed watchdog with no attempt behind it
         // kills the process.
@@ -619,6 +637,7 @@ class TiredVpnService : VpnService() {
                 }
             } catch (e: TimeoutCancellationException) {
                 FileLogger.e(TAG, "Connection timed out after ${CONNECTION_TIMEOUT/1000} seconds")
+                if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
                 _state.value = VpnState.Error("Connection timed out")
                 cleanupFailedConnection(generation)
@@ -630,16 +649,21 @@ class TiredVpnService : VpnService() {
                 // the step named: "waiting for the core to start" and "waiting
                 // for it to answer set_fd" are different faults.
                 FileLogger.e(TAG, "Connect budget spent at ${e.step} after ${e.elapsedMs}ms of ${e.totalMs}ms")
+                if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
                 _state.value = VpnState.Error(getString(R.string.connect_timed_out_at, e.step))
                 cleanupFailedConnection(generation)
                 scheduleAutoReconnect(config)
             } catch (e: CancellationException) {
                 FileLogger.i(TAG, "Connection cancelled")
-                // Don't set error state - this is intentional cancellation
+                // Don't set error state - this is intentional cancellation.
+                // When the cancel was a stop, whatever this attempt created
+                // after disconnect() had already swept is still ours to close.
+                abandonStoppedAttempt(generation)
                 return@launch
             } catch (e: Exception) {
                 FileLogger.e(TAG, "Connection failed", e)
+                if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
                 _state.value = VpnState.Error(e.message ?: "Unknown error")
                 cleanupFailedConnection(generation)
@@ -648,6 +672,30 @@ class TiredVpnService : VpnService() {
             }
         }
         FileLogger.d(TAG, "connect: job launched, isActive=${connectionJob?.isActive}, isCancelled=${connectionJob?.isCancelled}, isCompleted=${connectionJob?.isCompleted}")
+        return true
+    }
+
+    /**
+     * End an attempt that a stop or a newer attempt overtook, without
+     * reporting it.
+     *
+     * Once disconnect() has run, the attempt's failure is the stop itself —
+     * typically the control socket closed under the read waiting for the
+     * core's `connect` answer. Reporting it the ordinary way published Error
+     * over Disconnected and scheduled a reconnect. The same goes for an
+     * attempt a newer one superseded: the state and the next retry belong to
+     * the newer one. The cleanup still runs: it is gated on the generation and
+     * on core ownership, so for a superseded attempt it does nothing, and for a
+     * stopped one it closes what the attempt created after the stop had
+     * already swept.
+     *
+     * @return true when the attempt was overtaken and the caller must return.
+     */
+    private fun abandonStoppedAttempt(generation: Int): Boolean {
+        if (!stopLatch.isLatched && connectGeneration.isCurrent(generation)) return false
+        FileLogger.i(TAG, "Connect attempt (generation $generation) overtaken (stopLatched=${stopLatch.isLatched}, " +
+            "current=${connectGeneration.current}), not reporting it")
+        cleanupFailedConnection(generation)
         return true
     }
 
@@ -667,6 +715,10 @@ class TiredVpnService : VpnService() {
         // Don't auto-reconnect if user disconnected
         if (_state.value is VpnState.Disconnected) {
             FileLogger.d(TAG, "scheduleAutoReconnect: State is Disconnected, not reconnecting")
+            return
+        }
+        if (stopLatch.isLatched) {
+            FileLogger.d(TAG, "scheduleAutoReconnect: the tunnel was stopped, not reconnecting")
             return
         }
 
@@ -1226,6 +1278,9 @@ class TiredVpnService : VpnService() {
         }
 
         FileLogger.i(TAG, "STEP 5: Connection complete, updating state...")
+        // A stop that landed after the interface came up has closed it through
+        // the ledger; publishing Connected now would paint a dead tunnel live.
+        if (stopLatch.isLatched) throw CancellationException("tunnel stopped before it was published")
         clearPhase()
         _state.value = VpnState.Connected(
             strategy = connectedStrategy.ifEmpty { config.strategy },
@@ -1303,17 +1358,19 @@ class TiredVpnService : VpnService() {
         // 3. Create VPN with HTTP proxy (Android 10+)
         setPhase(getString(R.string.phase_creating_tunnel))
         FileLogger.i(TAG, "STEP 3: Creating VPN with HTTP proxy...")
-        val vpnFd = establishProxyVpn(config)
+        // Through the same gate as establishVpn: a stop racing this call must
+        // not leave an interface the ledger sweep already missed.
+        val vpnFd = tunHandles.establishUnless(refused = { stopLatch.isLatched }) { establishProxyVpn(config) }
         if (vpnFd == null) {
             throw RuntimeException("Failed to establish VPN interface for proxy")
         }
         vpnInterface = vpnFd
-        tunHandles.track(vpnFd)
 
         // 4. Update state
         val proxyAddress = "127.0.0.1:${config.proxyPort}"
         FileLogger.i(TAG, "STEP 4: Proxy mode connected at $proxyAddress")
 
+        if (stopLatch.isLatched) throw CancellationException("tunnel stopped before it was published")
         clearPhase()
         _state.value = VpnState.Connected(
             strategy = connectedStrategy.ifEmpty { config.strategy },
@@ -3588,8 +3645,8 @@ class TiredVpnService : VpnService() {
         FileLogger.d(TAG, "handleControlSocketBroken: Called (state=${_state.value})")
 
         val state = _state.value
-        if (state is VpnState.Disconnected) {
-            FileLogger.d(TAG, "handleControlSocketBroken: State is Disconnected - not reconnecting (user action)")
+        if (state is VpnState.Disconnected || stopLatch.isLatched) {
+            FileLogger.d(TAG, "handleControlSocketBroken: State is $state, stopLatched=${stopLatch.isLatched} - not reconnecting (user action)")
             return
         }
 
@@ -3905,8 +3962,15 @@ class TiredVpnService : VpnService() {
      * at the single point where a descriptor comes into existence, so no call
      * site can create one that cleanup does not know about.
      */
-    private fun establishVpn(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? =
-        establishVpnInterface(config, tunConfig)?.also { tunHandles.track(it) }
+    private fun establishVpn(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {
+        val vpnFd = tunHandles.establishUnless(refused = { stopLatch.isLatched }) {
+            establishVpnInterface(config, tunConfig)
+        }
+        if (vpnFd == null && stopLatch.isLatched) {
+            FileLogger.w(TAG, "establishVpn: refused, the tunnel was stopped")
+        }
+        return vpnFd
+    }
 
     private fun establishVpnInterface(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {
         return try {
@@ -4059,6 +4123,13 @@ class TiredVpnService : VpnService() {
      */
     private fun disconnect(intent: StopIntent) {
         FileLogger.d(TAG, "Disconnecting VPN (intent=$intent)")
+
+        // Latch before anything else. Every path that could bring the tunnel
+        // back — a connect still waiting on the core, the failure it reports
+        // when the socket below closes under it, a reconnect racing us from
+        // the event listener — checks it, and establishVpn checks it again
+        // after the interface exists, so nothing can outlive the ledger sweep.
+        stopLatch.latch()
 
         // CRITICAL: Set state to Disconnected FIRST to prevent handleControlSocketBroken race condition
         // If we close control socket before setting state, event listener will trigger reconnect

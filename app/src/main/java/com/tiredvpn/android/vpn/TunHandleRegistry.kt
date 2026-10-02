@@ -42,6 +42,32 @@ internal class TunHandleRegistry<T : Any>(private val closer: (T) -> Unit) {
     }
 
     /**
+     * Create a handle with [create] and track it, unless [refused] says no
+     * before or after.
+     *
+     * The check after is the one that matters. A teardown running on another
+     * thread can land anywhere around a slow `establish()`: if it releases the
+     * ledger before the new handle is tracked, nothing would ever close it, and
+     * an interface nobody owns keeps the VPN up with the UI showing it off. The
+     * teardown raises [refused] before it releases, so whichever side gets
+     * there second closes the handle — exactly once, because only the side
+     * that still finds it in the ledger may.
+     *
+     * @return the tracked handle, or null when refused or [create] failed.
+     */
+    fun establishUnless(refused: () -> Boolean, create: () -> T?): T? {
+        if (refused()) return null
+        val handle = create() ?: return null
+        track(handle)
+        if (refused()) {
+            val stillTracked = synchronized(lock) { tracked.removeAll { it === handle } }
+            if (stillTracked) closeEach(listOf(handle))
+            return null
+        }
+        return handle
+    }
+
+    /**
      * Drop a handle without closing it — for when ownership moved elsewhere or
      * something else already closed it. Prevents a later sweep from closing a
      * descriptor number that has since been reused.

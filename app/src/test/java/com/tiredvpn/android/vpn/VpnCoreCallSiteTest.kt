@@ -1442,4 +1442,131 @@ class VpnCoreCallSiteTest {
         )
         assertTrue(source("SharedFiles.kt").contains("""const val DIR_NAME = "share""""))
     }
+
+    // --- a stop is final until somebody starts the tunnel again ---------------
+
+    private val stopHeaders = mapOf(
+        "disconnect" to "private fun disconnect(intent: StopIntent) {",
+        "connect" to "private fun connect(config: VpnConfig, supersedes: Int? = null): Boolean {",
+        "establishVpn" to "private fun establishVpn(config: VpnConfig, tunConfig: TunnelConfig): ParcelFileDescriptor? {",
+        "scheduleAutoReconnect" to "private fun scheduleAutoReconnect(config: VpnConfig) {",
+        "handleControlSocketBroken" to "private fun handleControlSocketBroken() {",
+        "abandon" to "private fun abandonStoppedAttempt(generation: Int): Boolean {",
+    )
+
+    private fun stopBody(key: String): String =
+        bodyAfter(callSites("TiredVpnService.kt"), stopHeaders.getValue(key))
+
+    @Test
+    fun `disconnect latches before it publishes Disconnected or sweeps the ledger`() {
+        val body = stopBody("disconnect")
+        val latch = body.indexOf("stopLatch.latch()")
+        assertTrue("disconnect() must latch the stop", latch >= 0)
+        assertTrue(
+            "latched after Disconnected is published, a racing reconnect reads the state and wins",
+            latch < body.indexOf("_state.value = VpnState.Disconnected")
+        )
+        assertTrue(
+            "latched after the sweep, an interface established in between is never closed",
+            latch < body.indexOf("tunHandles.releaseAll()")
+        )
+    }
+
+    @Test
+    fun `only an explicit start lifts the stop latch`() {
+        val lifts = allSources().entries.sumOf { (_, code) -> occurrences(code, "stopLatch.lift()") }
+        assertEquals("ACTION_CONNECT and the sticky restart, nothing that heals itself", 2, lifts)
+        val service = callSites("TiredVpnService.kt")
+        assertTrue(
+            "ACTION_CONNECT lifts it before the clean slate and the connect",
+            // The label may list more actions than ACTION_CONNECT (the
+            // always-on start shares the branch); what matters is the order
+            // inside it.
+            Regex("""ACTION_CONNECT\b[^\n]*->\s*\{[\s\S]*?stopLatch\.lift\(\)\s*forceResetCore\(""").containsMatchIn(service)
+        )
+        assertTrue(
+            "the sticky restart of a wanted tunnel lifts it",
+            Regex("""Decision\.RECONNECT -> \{\s*stopLatch\.lift\(\)""").containsMatchIn(service)
+        )
+        assertTrue(
+            "ACTION_FORCE_RESET is a stop too",
+            Regex("""ACTION_FORCE_RESET -> \{[\s\S]{0,200}?stopLatch\.latch\(\)""").containsMatchIn(service)
+        )
+    }
+
+    @Test
+    fun `no TUN interface comes into existence past a stop`() {
+        val body = stopBody("establishVpn")
+        assertTrue(
+            "establishVpn must go through the gated establish, which re-checks after the interface exists",
+            Regex("""tunHandles\.establishUnless\(refused = \{ stopLatch\.isLatched \}\)""").containsMatchIn(body)
+        )
+        assertTrue("the gated establish wraps the real one", body.contains("establishVpnInterface(config, tunConfig)"))
+        val service = callSites("TiredVpnService.kt")
+        assertEquals(
+            "establishVpnInterface is reached only through establishVpn",
+            2, occurrences(service, "establishVpnInterface(")
+        )
+        assertTrue(
+            "the proxy-mode interface goes through the same gate",
+            Regex("""tunHandles\.establishUnless\(refused = \{ stopLatch\.isLatched \}\) \{ establishProxyVpn\(config\) \}""")
+                .containsMatchIn(service)
+        )
+        assertEquals("establishProxyVpn is reached only through the gate", 2, occurrences(service, "establishProxyVpn("))
+        assertFalse("nothing tracks a handle around the gate", service.contains("tunHandles.track("))
+    }
+
+    @Test
+    fun `nothing that heals itself starts a stopped tunnel`() {
+        val connect = stopBody("connect")
+        val check = connect.indexOf("if (stopLatch.isLatched)")
+        assertTrue("connect() must decline after a stop", check >= 0)
+        assertTrue(
+            "declining has to leave no trace: before the generation and the watchdog",
+            check < connect.indexOf("connectGeneration.") && check < connect.indexOf("armConnectWatchdog(")
+        )
+        for (key in listOf("scheduleAutoReconnect", "handleControlSocketBroken")) {
+            val body = stopBody(key)
+            val at = body.indexOf("stopLatch.isLatched")
+            assertTrue("$key must check the stop", at >= 0)
+            assertTrue("$key checks before taking the reconnect lock", at < body.indexOf("reconnectLock.tryAcquire()"))
+        }
+    }
+
+    /**
+     * Reproduced on the 1.11.0 release: Disconnect tapped while the core was
+     * still answering `connect`. The socket closed under the read, the attempt
+     * logged "Connection failed", published Error over Disconnected and
+     * scheduled a reconnect in 10s. Only the service dying saved it; with an
+     * interface up, the system keeps the service bound and the reconnect runs.
+     */
+    @Test
+    fun `a failed attempt that a stop overtook is not reported as a failure`() {
+        val connect = stopBody("connect")
+        for (header in listOf(
+            "catch (e: TimeoutCancellationException) {",
+            "catch (e: ConnectDeadlineExceeded) {",
+            "catch (e: Exception) {",
+        )) {
+            val start = connect.indexOf(header)
+            assertTrue("$header not found in connect()", start >= 0)
+            val next = connect.indexOf("} catch", start + header.length).let { if (it < 0) connect.length else it }
+            val block = connect.substring(start, next)
+            val abandon = block.indexOf("if (abandonStoppedAttempt(generation)) return@launch")
+            assertTrue("$header must ask whether a stop overtook the attempt", abandon >= 0)
+            assertTrue("$header asks before publishing Error", abandon < block.indexOf("_state.value = VpnState.Error"))
+            assertTrue("$header asks before scheduling a reconnect", abandon < block.indexOf("scheduleAutoReconnect("))
+        }
+        val cancelled = connect.substring(connect.indexOf("catch (e: CancellationException) {"))
+        assertTrue(
+            "a cancelled attempt still closes what it made after the stop swept",
+            cancelled.substring(0, cancelled.indexOf("return@launch")).contains("abandonStoppedAttempt(generation)")
+        )
+        val abandon = stopBody("abandon")
+        assertTrue("the helper answers from the latch", abandon.contains("stopLatch.isLatched"))
+        assertTrue("and still runs the generation-gated cleanup", abandon.contains("cleanupFailedConnection(generation)"))
+        val published = Regex("""if \(stopLatch\.isLatched\) throw CancellationException\([^)]*\)\s*clearPhase\(\)\s*_state\.value = VpnState\.Connected\(""")
+            .findAll(callSites("TiredVpnService.kt")).count()
+        assertEquals("a dead tunnel is never painted live after a stop, in tun and proxy mode", 2, published)
+    }
 }
