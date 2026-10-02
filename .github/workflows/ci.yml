@@ -110,6 +110,11 @@ jobs:
           path: /home/runner/.cache/dependency-check-data
           key: dependency-check-data-${{ github.run_id }}
 
+      # Report only, not a gate. failBuildOnCVSS = 9.0 trips on every run
+      # (kotlin-compiler, and grpc/netty pulled in by AGP, all build-time
+      # tooling), and continue-on-error swallows the failure, so this step
+      # has never blocked anything. Read the uploaded report; making it a
+      # real gate needs suppressions for the build classpath first.
       - name: OWASP Dependency Check
         run: ./gradlew dependencyCheckAnalyze
         timeout-minutes: 20
