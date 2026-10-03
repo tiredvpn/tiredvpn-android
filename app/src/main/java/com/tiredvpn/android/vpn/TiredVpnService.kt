@@ -473,6 +473,7 @@ class TiredVpnService : VpnService() {
         // watchdog kills the process itself when a native call wedges an IO
         // thread. Falling through the when() below left the service alive with
         // no foreground notification, no tunnel and no stopSelf.
+        recordSystemVpnMode()
         if (intent == null) return handleStickyRestart()
 
         when (intent.action) {
@@ -512,7 +513,11 @@ class TiredVpnService : VpnService() {
                     // auto-reconnects call connect() directly (bypassing onStartCommand),
                     // so they are not affected by this.
                     stopLatch.lift()
-                    forceResetCore("connect")
+                    // With the kill switch on, a Connect while reconnecting
+                    // (a tap, the watchdog, boot) keeps the interface: the
+                    // next connect reuses it, and traffic never finds the
+                    // VPN gone in between.
+                    forceResetCore("connect", keepInterface = killSwitchOn())
                     startForeground(NOTIFICATION_ID, createNotification("Connecting..."))
                     connect(config)
                 } else {
@@ -691,7 +696,7 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "Connection timed out after ${CONNECTION_TIMEOUT/1000} seconds")
                 if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
-                _state.value = VpnState.Error("Connection timed out")
+                reportFailedAttempt("Connection timed out")
                 cleanupFailedConnection(generation)
                 // Schedule auto-reconnect after timeout
                 scheduleAutoReconnect(config)
@@ -703,7 +708,7 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "Connect budget spent at ${e.step} after ${e.elapsedMs}ms of ${e.totalMs}ms")
                 if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
-                _state.value = VpnState.Error(getString(R.string.connect_timed_out_at, e.step))
+                reportFailedAttempt(getString(R.string.connect_timed_out_at, e.step))
                 cleanupFailedConnection(generation)
                 scheduleAutoReconnect(config)
             } catch (e: CancellationException) {
@@ -717,7 +722,7 @@ class TiredVpnService : VpnService() {
                 FileLogger.e(TAG, "Connection failed", e)
                 if (abandonStoppedAttempt(generation)) return@launch
                 clearPhase()
-                _state.value = VpnState.Error(e.message ?: "Unknown error")
+                reportFailedAttempt(e.message ?: "Unknown error")
                 cleanupFailedConnection(generation)
                 // Schedule auto-reconnect after failure
                 scheduleAutoReconnect(config)
@@ -789,8 +794,13 @@ class TiredVpnService : VpnService() {
 
         reconnectAttempts++
 
-        // Maximum number of reconnect attempts before giving up
-        if (ReconnectBackoff.exhausted(reconnectAttempts)) {
+        // Maximum number of reconnect attempts before giving up. The kill
+        // switch never gives up: the interface stays until the user disconnects.
+        val holding = killSwitchOn()
+        if (holding && reconnectAttempts == ReconnectBackoff.MAX_ATTEMPTS + 1) {
+            FileLogger.w(TAG, "scheduleAutoReconnect: $reconnectAttempts attempts, kill switch on - keeping the interface and retrying")
+        }
+        if (KillSwitch.givesUp(reconnectAttempts, holding)) {
             FileLogger.e(TAG, "scheduleAutoReconnect: Too many attempts ($reconnectAttempts), giving up")
             _state.value = VpnState.Error("Connection failed after $reconnectAttempts attempts")
             reconnectLock.release(token)
@@ -1087,8 +1097,8 @@ class TiredVpnService : VpnService() {
      * MUST be called from onStartCommand (main service thread), NOT from inside a
      * scope coroutine — the final resetScope() would cancel the calling coroutine.
      */
-    private fun forceResetCore(reason: String) {
-        FileLogger.w(TAG, "=== forceResetCore: $reason ===")
+    private fun forceResetCore(reason: String, keepInterface: Boolean = false) {
+        FileLogger.w(TAG, "=== forceResetCore: $reason (keepInterface=$keepInterface) ===")
 
         // 1. Cancel connection / reconnect coroutines
         disarmConnectWatchdog()  // explicit reset, not a wedge - don't kill for this
@@ -1132,9 +1142,13 @@ class TiredVpnService : VpnService() {
         // Forget the negotiated tunnel config: the next handshake writes a new one.
         activeTunnelConfig = null
 
-        // 7. Drop the current interface; step 8 closes it along with our orphans.
-        vpnInterface = null
-        interfaceBuiltFor = null
+        // 7. Drop the current interface; step 8 closes it along with our
+        // orphans. Unless the kill switch keeps it: then step 8 closes only
+        // the orphans, and reusableInterface() hands it to the next connect.
+        if (!keepInterface) {
+            vpnInterface = null
+            interfaceBuiltFor = null
+        }
 
         // 8. Close the TUN descriptors we still own. One pass is enough now:
         // the ledger already holds every descriptor this service established,
@@ -1705,9 +1719,6 @@ class TiredVpnService : VpnService() {
             if (!usesAllowedApps) {
                 builder.addDisallowedApplication(packageName)
             }
-
-            // Apply kill switch
-            applyKillSwitch(builder)
 
             builder.establish()
         } catch (e: Exception) {
@@ -4115,9 +4126,6 @@ class TiredVpnService : VpnService() {
                 builder.addDisallowedApplication(packageName)
             }
 
-            // Apply kill switch
-            applyKillSwitch(builder)
-
             builder.establish()
         } catch (e: Exception) {
             FileLogger.e(TAG, "Failed to establish VPN interface", e)
@@ -4188,16 +4196,37 @@ class TiredVpnService : VpnService() {
         return false
     }
 
-    private fun applyKillSwitch(builder: Builder) {
-        val prefs = getSharedPreferences("tiredvpn_settings", MODE_PRIVATE)
-        val killSwitchEnabled = prefs.getBoolean("kill_switch", false)
-
-        if (killSwitchEnabled) {
-            // Block connections without VPN by setting blocking mode
-            // This is handled by the system when VPN disconnects if we set it up properly
-            builder.setBlocking(true)
-            FileLogger.d(TAG, "Kill switch enabled - blocking mode on")
+    /**
+     * Note the system's always-on and lockdown settings for the settings
+     * screen, which cannot ask for them itself; see [SystemVpnMode].
+     */
+    private fun recordSystemVpnMode() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            SystemVpnMode.record(
+                getSharedPreferences("tiredvpn_settings", MODE_PRIVATE),
+                alwaysOn = isAlwaysOn, lockdown = isLockdownEnabled, nowMs = System.currentTimeMillis(),
+            )
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "Could not read the system VPN mode: ${e.message}")
         }
+    }
+
+    /** The in-app kill switch, read at the moment of each decision; see [KillSwitch]. */
+    private fun killSwitchOn(): Boolean =
+        getSharedPreferences("tiredvpn_settings", MODE_PRIVATE).getBoolean(KillSwitch.PREF, false)
+
+    /**
+     * Publish a failed attempt. With the kill switch holding an interface the
+     * tunnel is reconnecting, not down; see [KillSwitch.stateAfterFailedAttempt].
+     */
+    private fun reportFailedAttempt(message: String) {
+        val state = KillSwitch.stateAfterFailedAttempt(message, holding = killSwitchOn(), interfaceHeld = vpnInterface != null)
+        if (state is VpnState.Connecting) {
+            FileLogger.i(TAG, "Attempt failed ($message); kill switch keeps the interface, reconnecting")
+            setPhase(getString(R.string.phase_kill_switch_holding))
+        }
+        _state.value = state
     }
 
 

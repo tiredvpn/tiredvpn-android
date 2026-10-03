@@ -99,7 +99,7 @@
             android:layout_marginStart="56dp"
             android:background="@color/divider" />
 
-        <!-- Always-on VPN (opens system settings) -->
+        <!-- Block connections without VPN: system always-on/lockdown (opens system settings) -->
         <LinearLayout
             android:id="@+id/alwaysOnVpnRow"
             android:layout_width="match_parent"
@@ -127,14 +127,22 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/always_on_vpn"
+                    android:text="@string/block_without_vpn"
                     android:textColor="@color/text_primary_dark"
                     android:textSize="16sp" />
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/always_on_vpn_desc"
+                    android:text="@string/block_without_vpn_desc"
+                    android:textColor="@color/text_hint"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/blockWithoutVpnStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
                     android:textColor="@color/text_hint"
                     android:textSize="12sp" />
 

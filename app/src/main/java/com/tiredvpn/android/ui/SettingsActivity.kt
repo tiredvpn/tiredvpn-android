@@ -29,6 +29,8 @@ import com.google.android.material.textfield.TextInputLayout
 import android.content.pm.PackageManager
 import com.tiredvpn.android.R
 import com.tiredvpn.android.databinding.ActivitySettingsBinding
+import com.tiredvpn.android.vpn.KillSwitch
+import com.tiredvpn.android.vpn.SystemVpnMode
 import com.tiredvpn.android.importer.ConfigCodec
 import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.util.SharedFiles
@@ -121,6 +123,17 @@ class SettingsActivity : BaseActivity() {
         setupListeners()
     }
 
+    /**
+     * What the system says about always-on and lockdown for this app. Only the
+     * service can ask (API 29+), so this is its last reading, labelled as such.
+     */
+    private fun blockWithoutVpnStatus(prefs: android.content.SharedPreferences): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return getString(R.string.block_without_vpn_legacy)
+        val reading = SystemVpnMode.last(prefs) ?: return getString(R.string.block_without_vpn_unknown)
+        fun onOff(v: Boolean) = getString(if (v) R.string.block_without_vpn_on else R.string.block_without_vpn_off)
+        return getString(R.string.block_without_vpn_status, onOff(reading.alwaysOn), onOff(reading.lockdown))
+    }
+
     override fun onResume() {
         super.onResume()
         loadSettings()
@@ -155,7 +168,8 @@ class SettingsActivity : BaseActivity() {
 
         // Load saved settings
         binding.connectOnLaunchSwitch.isChecked = prefs.getBoolean("connect_on_launch", false)
-        binding.killSwitchSwitch.isChecked = prefs.getBoolean("kill_switch", false)
+        binding.killSwitchSwitch.isChecked = prefs.getBoolean(KillSwitch.PREF, false)
+        binding.blockWithoutVpnStatus.text = blockWithoutVpnStatus(prefs)
 
         // Version
         val versionName = try {
@@ -327,11 +341,11 @@ class SettingsActivity : BaseActivity() {
         binding.killSwitchSwitch.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences("tiredvpn_settings", MODE_PRIVATE)
                 .edit()
-                .putBoolean("kill_switch", isChecked)
+                .putBoolean(KillSwitch.PREF, isChecked)
                 .apply()
         }
 
-        // Always-on VPN - opens system VPN settings
+        // Block connections without VPN - the system's always-on/lockdown screen
         binding.alwaysOnVpnRow.setOnClickListener {
             try {
                 startActivity(Intent(Settings.ACTION_VPN_SETTINGS))

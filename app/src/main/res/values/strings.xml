@@ -16,6 +16,7 @@
     <string name="phase_control_socket">Negotiating</string>
     <string name="phase_creating_tunnel">Creating tunnel</string>
     <string name="phase_handshake">Handshake</string>
+    <string name="phase_kill_switch_holding">Reconnecting, kill switch holding traffic</string>
     <string name="phase_trying_strategy">Trying %s</string>
     <string name="phase_reconnecting">Reconnecting</string>
     <string name="phase_activating">Almost there</string>
@@ -90,10 +91,15 @@
     <string name="invalid_dns">Invalid DNS address</string>
 
     <string name="security">SECURITY</string>
-    <string name="kill_switch">Kill Switch</string>
-    <string name="kill_switch_desc">Block internet if VPN drops</string>
-    <string name="always_on_vpn">Always-on VPN</string>
-    <string name="always_on_vpn_desc">Auto-reconnect &amp; block without VPN</string>
+    <string name="kill_switch">Kill switch</string>
+    <string name="kill_switch_desc">Keeps the VPN up while the app reconnects, until you tap Disconnect. Traffic waits instead of going around the VPN. Does not help if the app itself is closed or killed.</string>
+    <string name="block_without_vpn">Block connections without VPN</string>
+    <string name="block_without_vpn_desc">System setting. The only protection when the app is killed or the VPN is not running at all.</string>
+    <string name="block_without_vpn_status">Always-on: %1$s, blocking: %2$s (as of the last connect)</string>
+    <string name="block_without_vpn_on">on</string>
+    <string name="block_without_vpn_off">off</string>
+    <string name="block_without_vpn_unknown">Connect once to read the current system setting</string>
+    <string name="block_without_vpn_legacy">This Android version does not tell apps whether it is on. Check it in system settings.</string>
     <string name="split_tunneling">Split Tunneling</string>
     <string name="battery_optimization">Battery Optimization</string>
     <string name="battery_optimization_check">Checking…</string>

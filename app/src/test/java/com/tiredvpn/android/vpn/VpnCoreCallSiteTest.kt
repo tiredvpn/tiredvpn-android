@@ -623,7 +623,7 @@ class VpnCoreCallSiteTest {
         val service = source("TiredVpnService.kt")
         for (fn in listOf(
             "private fun cleanupFailedConnection(generation: Int) {",
-            "private fun forceResetCore(reason: String) {",
+            "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {",
         )) {
             val body = bodyAfter(service, fn)
             assertTrue("$fn must call TiredVpnNative.cleanup()", body.contains("TiredVpnNative.cleanup()"))
@@ -1374,7 +1374,7 @@ class VpnCoreCallSiteTest {
         }
         val disconnect = bodyAfter(service, "private fun disconnect(intent: StopIntent) {")
         assertTrue("disconnect still closes everything", disconnect.contains("vpnInterface = null") && disconnect.contains("tunHandles.releaseAll()"))
-        val reset = bodyAfter(service, "private fun forceResetCore(reason: String) {")
+        val reset = bodyAfter(service, "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {")
         assertTrue("so does the clean slate", reset.contains("vpnInterface = null") && reset.contains("forceCloseTunFds()"))
     }
 
@@ -1397,7 +1397,7 @@ class VpnCoreCallSiteTest {
         val guarded = listOf(
             "private fun cleanupFailedConnection(generation: Int) {" to "withOwnedCore(generation,",
             "private suspend fun executeReconnectSequence(generation: Int): Boolean {" to "withOwnedCore(generation,",
-            "private fun forceResetCore(reason: String) {" to "withCoreReset {",
+            "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {" to "withCoreReset {",
             "private fun disconnect(intent: StopIntent) {" to "withCoreReset {",
         )
         for ((header, expected) in guarded) {
@@ -1534,6 +1534,80 @@ class VpnCoreCallSiteTest {
                 bodyAfter(service, header).substringBefore("scope.launch").contains(cancel)
             )
         }
+    }
+
+    // --- the kill switch holds the interface until Disconnect ------------------
+
+    /**
+     * The toggle used to set Builder.setBlocking(true): the descriptor's
+     * blocking mode, no traffic blocked. What it means now is that the paths
+     * which still let go of the interface while the process lives do not.
+     */
+    @Test
+    fun `the kill switch is not setBlocking any more`() {
+        val service = source("TiredVpnService.kt")
+        assertFalse("setBlocking is gone", service.contains("setBlocking("))
+        assertFalse("and its helper with it", service.contains("applyKillSwitch"))
+        assertTrue(
+            "the service reads the toggle's key",
+            service.contains("getSharedPreferences(\"tiredvpn_settings\", MODE_PRIVATE).getBoolean(KillSwitch.PREF, false)"),
+        )
+        val settings = source("SettingsActivity.kt")
+        assertTrue("the toggle writes that key", settings.contains(".putBoolean(KillSwitch.PREF, isChecked)"))
+    }
+
+    @Test
+    fun `with the kill switch on the retry loop does not give up`() {
+        val service = source("TiredVpnService.kt")
+        val body = bodyAfter(service, "private fun scheduleAutoReconnect(config: VpnConfig) {")
+        assertTrue("the toggle is read for the decision", body.contains("val holding = killSwitchOn()"))
+        val giveUp = body.indexOf("if (KillSwitch.givesUp(reconnectAttempts, holding)) {")
+        assertTrue("giving up goes through the kill switch", giveUp >= 0)
+        assertTrue("and it is the branch that tears down", giveUp < body.indexOf("disconnect(StopIntent.TECHNICAL)"))
+        assertEquals("nothing else asks the bare ceiling", 0, occurrences(service, "ReconnectBackoff.exhausted("))
+    }
+
+    @Test
+    fun `a Connect keeps the interface only when the kill switch is on`() {
+        val service = source("TiredVpnService.kt")
+        assertTrue(
+            "the clean slate on Connect is told the toggle",
+            service.contains("forceResetCore(\"connect\", keepInterface = killSwitchOn())"),
+        )
+        for (other in listOf("forceResetCore(\"sticky restart\")", "forceResetCore(\"user force reset\")")) {
+            assertTrue("$other still drops everything", service.contains(other))
+        }
+        val reset = bodyAfter(service, "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {")
+        assertTrue(
+            "the interface is dropped only when not kept",
+            Regex("""if \(!keepInterface\) \{\s*vpnInterface = null\s*interfaceBuiltFor = null\s*\}""").containsMatchIn(reset),
+        )
+        assertEquals("and nowhere else in the reset", 1, occurrences(reset, "vpnInterface = null"))
+        assertTrue("the sweep spares the current one", reset.contains("forceCloseTunFds()"))
+        assertTrue(bodyAfter(service, "private fun forceCloseTunFds() {").contains("tunHandles.releaseAllExcept(vpnInterface)"))
+    }
+
+    @Test
+    fun `a failed attempt under the kill switch reads as reconnecting`() {
+        val service = source("TiredVpnService.kt")
+        val connect = stopBody("connect")
+        for (header in listOf(
+            "catch (e: TimeoutCancellationException) {",
+            "catch (e: ConnectDeadlineExceeded) {",
+            "catch (e: Exception) {",
+        )) {
+            val start = connect.indexOf(header)
+            val next = connect.indexOf("} catch", start + header.length).let { if (it < 0) connect.length else it }
+            val block = connect.substring(start, next)
+            assertTrue("$header reports through the kill switch", block.contains("reportFailedAttempt("))
+            assertFalse("$header publishes no bare Error", block.contains("VpnState.Error("))
+        }
+        val report = bodyAfter(service, "private fun reportFailedAttempt(message: String) {")
+        assertTrue(
+            "the state comes from the policy, with the interface the attempt left",
+            report.contains("KillSwitch.stateAfterFailedAttempt(message, holding = killSwitchOn(), interfaceHeld = vpnInterface != null)"),
+        )
+        assertTrue("and is published", report.contains("_state.value = state"))
     }
 
     // --- 10 comments that describe the core ----------------------------------
@@ -1772,7 +1846,7 @@ class VpnCoreCallSiteTest {
             val block = connect.substring(start, next)
             val abandon = block.indexOf("if (abandonStoppedAttempt(generation)) return@launch")
             assertTrue("$header must ask whether a stop overtook the attempt", abandon >= 0)
-            assertTrue("$header asks before publishing Error", abandon < block.indexOf("_state.value = VpnState.Error"))
+            assertTrue("$header asks before reporting the failure", abandon < block.indexOf("reportFailedAttempt("))
             assertTrue("$header asks before scheduling a reconnect", abandon < block.indexOf("scheduleAutoReconnect("))
         }
         val cancelled = connect.substring(connect.indexOf("catch (e: CancellationException) {"))
