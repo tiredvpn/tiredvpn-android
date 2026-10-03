@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-10-03
+
+### Added
+
+- **The kill switch now holds the VPN interface until you disconnect.** The
+  tunnel interface is kept across network switches, reconnects, and the whole
+  connect retry budget, so traffic cannot leak out while the client is still
+  trying to reconnect. A "Block connections without VPN" row reflects the
+  system always-on / lockdown state so it is clear when the OS is enforcing it.
+
+### Changed
+
+- Core updated to 1.11.5. Repository-hygiene release on the core side, with no
+  change to what goes on the wire from the 1.11.x line.
+
 ## [1.11.0] - 2026-09-21
 
 ### Compatibility
