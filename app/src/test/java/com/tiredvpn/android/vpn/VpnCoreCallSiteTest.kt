@@ -1610,6 +1610,37 @@ class VpnCoreCallSiteTest {
         assertTrue("and is published", report.contains("_state.value = state"))
     }
 
+    /**
+     * The settings row for the system's "Block connections without VPN" shows
+     * what the service last read, because only the service can ask. A start
+     * that skips the reading, or a row that swaps the two flags, tells the
+     * user the wrong thing about the one protection that survives process
+     * death.
+     */
+    @Test
+    fun `the lockdown row shows what every service start read`() {
+        val service = source("TiredVpnService.kt")
+        val start = bodyAfter(service, "override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {")
+        val read = start.indexOf("recordSystemVpnMode()")
+        assertTrue("every start reads the system setting", read >= 0)
+        assertTrue("including the sticky restart", read < start.indexOf("if (intent == null) return handleStickyRestart()"))
+        val record = bodyAfter(service, "private fun recordSystemVpnMode() {")
+        assertTrue(
+            "each flag goes into its own slot",
+            record.contains("alwaysOn = isAlwaysOn, lockdown = isLockdownEnabled,"),
+        )
+
+        val settings = source("SettingsActivity.kt")
+        val load = bodyAfter(settings, "private fun loadSettings() {")
+        assertTrue("the row is filled on every load", load.contains("binding.blockWithoutVpnStatus.text = blockWithoutVpnStatus(prefs)"))
+        val status = bodyAfter(settings, "private fun blockWithoutVpnStatus(prefs: android.content.SharedPreferences): String {")
+        assertTrue("from the service's last reading", status.contains("SystemVpnMode.last(prefs) ?: return getString(R.string.block_without_vpn_unknown)"))
+        assertTrue(
+            "always-on first, lockdown second, as the string reads them",
+            status.contains("getString(R.string.block_without_vpn_status, onOff(reading.alwaysOn), onOff(reading.lockdown))"),
+        )
+    }
+
     // --- 10 comments that describe the core ----------------------------------
 
     /**
