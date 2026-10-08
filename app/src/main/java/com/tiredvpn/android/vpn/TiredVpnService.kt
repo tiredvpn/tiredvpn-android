@@ -1571,6 +1571,9 @@ class TiredVpnService : VpnService() {
         if (config.strategy != "auto") {
             args.addAll(listOf("-strategy", config.strategy))
         }
+        if (config.strategy == "gost_tls13_gosuslugi") {
+            args.addAll(listOf("-gost-tls13-pin", config.gostTls13Pin, "-gost-tls13-port", config.gostTls13Port.toString()))
+        }
 
         // QUIC
         if (config.enableQuic) {
@@ -1971,6 +1974,9 @@ class TiredVpnService : VpnService() {
         // Strategy
         if (config.strategy != "auto") {
             args.addAll(listOf("-strategy", config.strategy))
+        }
+        if (config.strategy == "gost_tls13_gosuslugi") {
+            args.addAll(listOf("-gost-tls13-pin", config.gostTls13Pin, "-gost-tls13-port", config.gostTls13Port.toString()))
         }
 
         // QUIC

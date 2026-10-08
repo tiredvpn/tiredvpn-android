@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added the opt-in `gost_tls13_gosuslugi` strategy to the strategy picker. GOST
+  certificate pin and dedicated TCP port are carried in imported `tired://` or
+  JSON profiles and passed to the native core; the app ships no operator-specific
+  certificate pin. Requires a core build that supports GOST TLS 1.3.
+
 ## [1.11.1] - 2026-10-03
 
 ### Added

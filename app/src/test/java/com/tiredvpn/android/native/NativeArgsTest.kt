@@ -132,5 +132,9 @@ class NativeArgsTest {
         // The embedded-command-line branch looks for "-secret " inside an
         // element; the flag on its own must still take the positional branch.
         assertEquals("-secret *** -tun", NativeArgs.redact(listOf("-secret", "k", "-tun")))
+        assertEquals(
+            "-gost-tls13-pin *** -tun",
+            NativeArgs.redact(listOf("-gost-tls13-pin", "public-fingerprint", "-tun")),
+        )
     }
 }

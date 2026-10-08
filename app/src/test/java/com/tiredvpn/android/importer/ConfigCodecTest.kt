@@ -337,6 +337,8 @@ class ConfigCodecTest {
         serverPort = 995,
         secret = "s3cr3t",
         strategy = "reality",
+        gostTls13Pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        gostTls13Port = 12445,
         enableQuic = false,
         quicPort = 8444,
         coverHost = "www.example.com",
@@ -441,7 +443,9 @@ class ConfigCodecTest {
                 "fallback":false,"debug":true,"server_v6":"[2001:db8::1]:995",
                 "prefer_ipv6":true,"fallback_v4":false,"tun_ipv6":"dual",
                 "ech":true,"ech_config":"AEr+DQBG","shaper":"youtube_streaming",
-                "quic_sni_frag":true,"dns":"9.9.9.9"}"""
+                "quic_sni_frag":true,"dns":"9.9.9.9",
+                "gost_tls13_pin":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "gost_tls13_port":12445}"""
         ).servers.single().config
 
         val camel = ConfigCodec.parse(
@@ -451,6 +455,8 @@ class ConfigCodecTest {
                 "serverAddressV6":"[2001:db8::1]:995","preferIpv6":true,"fallbackV4":false,
                 "tunnelIpv6":"dual","echEnabled":true,"echConfig":"AEr+DQBG",
                 "shaperPreset":"youtube_streaming","quicSniFrag":true,
+                "gostTls13Pin":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "gostTls13Port":12445,
                 "customDns":"9.9.9.9"}"""
         ).servers.single().config
 

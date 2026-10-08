@@ -67,6 +67,8 @@ class VpnConfigTest {
         serverPort = 443,
         secret = "secretXYZ",
         strategy = "reality",
+        gostTls13Pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        gostTls13Port = 12445,
         enableQuic = false,
         quicPort = 8443,
         coverHost = "example.com",
@@ -158,6 +160,8 @@ class VpnConfigTest {
         val config = VpnConfig.fromJson(json)
 
         assertEquals("auto", config.strategy)
+        assertEquals("", config.gostTls13Pin)
+        assertEquals(VpnConfig.DEFAULT_GOST_TLS13_PORT, config.gostTls13Port)
         assertTrue(config.enableQuic)
         assertEquals(443, config.quicPort)
         assertEquals("api.googleapis.com", config.coverHost)
@@ -216,5 +220,20 @@ class VpnConfigTest {
         val off = validConfig()
         assertFalse(off.toUrl().contains("tunIpv6"))
         assertEquals("off", VpnConfig.fromUrl(off.toUrl())!!.tunnelIpv6)
+    }
+
+    @Test
+    fun `GOST TLS pin and port survive tired URL import`() {
+        val config = validConfig().copy(
+            strategy = "gost_tls13_gosuslugi",
+            gostTls13Pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            gostTls13Port = 12445,
+        )
+
+        val restored = VpnConfig.fromUrl(config.toUrl())!!
+
+        assertEquals(config.strategy, restored.strategy)
+        assertEquals(config.gostTls13Pin, restored.gostTls13Pin)
+        assertEquals(config.gostTls13Port, restored.gostTls13Port)
     }
 }

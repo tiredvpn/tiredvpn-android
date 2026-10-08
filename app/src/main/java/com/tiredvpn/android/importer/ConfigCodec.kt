@@ -331,6 +331,12 @@ object ConfigCodec {
             serverPort = json.firstInt(PORT_KEYS) ?: 993,
             secret = json.firstString(listOf("secret")).orEmpty(),
             strategy = json.firstString(listOf("strategy")) ?: "auto",
+            gostTls13Pin = json.firstString(
+                listOf("gostPin", "gost_pin", "gostTls13Pin", "gost_tls13_pin")
+            ) ?: VpnConfig.DEFAULT_GOST_TLS13_PIN,
+            gostTls13Port = json.firstInt(
+                listOf("gostPort", "gost_port", "gostTls13Port", "gost_tls13_port")
+            ) ?: VpnConfig.DEFAULT_GOST_TLS13_PORT,
             enableQuic = json.firstBool(listOf("quic", "enableQuic", "enable_quic")) ?: true,
             quicPort = json.firstInt(listOf("quic_port", "quicPort")) ?: 443,
             coverHost = json.firstString(listOf("cover_host", "coverHost", "cover"))

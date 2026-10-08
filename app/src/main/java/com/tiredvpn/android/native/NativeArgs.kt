@@ -28,8 +28,8 @@ object NativeArgs {
 
     private const val REDACTED = "***"
 
-    /** Flags whose following token is a credential. */
-    private val SECRET_FLAGS = setOf("-secret")
+    /** Flags whose following token is a credential or certificate pin. */
+    private val SECRET_FLAGS = setOf("-secret", "-gost-tls13-pin")
 
     /**
      * The shell Android 10+ makes us go through: a binary in app storage cannot

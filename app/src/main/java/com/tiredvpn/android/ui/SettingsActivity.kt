@@ -67,6 +67,7 @@ class SettingsActivity : BaseActivity() {
         private val STRATEGIES = listOf(
             "auto" to "Auto (Best Available)",
             "reality" to "REALITY",
+            "gost_tls13_gosuslugi" to "GOST TLS 1.3 (Gosuslugi SNI)",
             "seqovl" to "Seqovl (sequence overlap)",
             "quic" to "QUIC",
             "quic_salamander" to "QUIC (Salamander)",

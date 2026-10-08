@@ -12,6 +12,8 @@ data class VpnConfig(
     val serverPort: Int,
     val secret: String,
     val strategy: String = "auto",
+    val gostTls13Pin: String = DEFAULT_GOST_TLS13_PIN,
+    val gostTls13Port: Int = DEFAULT_GOST_TLS13_PORT,
     val enableQuic: Boolean = true,
     val quicPort: Int = 443,
     val coverHost: String = "api.googleapis.com",
@@ -60,6 +62,8 @@ data class VpnConfig(
             put("serverPort", serverPort)
             put("secret", secret)
             put("strategy", strategy)
+            put("gostTls13Pin", gostTls13Pin)
+            put("gostTls13Port", gostTls13Port)
             put("enableQuic", enableQuic)
             put("quicPort", quicPort)
             put("coverHost", coverHost)
@@ -102,6 +106,8 @@ data class VpnConfig(
         params.add("secret=" + Uri.encode(secret))
         if (name.isNotBlank() && name != "Server") params.add("name=" + Uri.encode(name))
         if (strategy != "auto") params.add("strategy=" + Uri.encode(strategy))
+        if (gostTls13Pin.isNotBlank()) params.add("gostPin=" + Uri.encode(gostTls13Pin))
+        if (gostTls13Port != DEFAULT_GOST_TLS13_PORT) params.add("gostPort=$gostTls13Port")
         if (!enableQuic) params.add("quic=false")
         if (quicPort != 443) params.add("quicPort=$quicPort")
         if (coverHost != "api.googleapis.com") params.add("cover=" + Uri.encode(coverHost))
@@ -135,6 +141,8 @@ data class VpnConfig(
     }
 
     companion object {
+        const val DEFAULT_GOST_TLS13_PIN: String = ""
+        const val DEFAULT_GOST_TLS13_PORT: Int = 443
         // Connection modes
         val CONNECTION_MODES = listOf(
             "tun" to "VPN (Full Tunnel)",
@@ -145,6 +153,7 @@ data class VpnConfig(
         val STRATEGIES = listOf(
             "auto" to "Auto (Best Available)",
             "reality" to "REALITY Protocol",
+            "gost_tls13_gosuslugi" to "GOST TLS 1.3 (Gosuslugi SNI)",
             "seqovl" to "Seqovl (sequence overlap)",
             "quic" to "QUIC Tunnel",
             "websocket_padded" to "WebSocket Salamander",
@@ -172,6 +181,8 @@ data class VpnConfig(
                 serverPort = json.optInt("serverPort", 993),
                 secret = json.optString("secret", ""),
                 strategy = json.optString("strategy", "auto"),
+                gostTls13Pin = json.optString("gostTls13Pin", DEFAULT_GOST_TLS13_PIN),
+                gostTls13Port = json.optInt("gostTls13Port", DEFAULT_GOST_TLS13_PORT),
                 enableQuic = json.optBoolean("enableQuic", true),
                 quicPort = json.optInt("quicPort", 443),
                 coverHost = json.optString("coverHost", "api.googleapis.com"),
@@ -271,6 +282,8 @@ data class VpnConfig(
                     serverPort = resolvedPort,
                     secret = secret,
                     strategy = uri.getQueryParameter("strategy") ?: "auto",
+                    gostTls13Pin = uri.getQueryParameter("gostPin") ?: DEFAULT_GOST_TLS13_PIN,
+                    gostTls13Port = uri.getQueryParameter("gostPort")?.toIntOrNull() ?: DEFAULT_GOST_TLS13_PORT,
                     enableQuic = uri.getQueryParameter("quic")?.toBooleanStrictOrNull() ?: true,
                     quicPort = uri.getQueryParameter("quicPort")?.toIntOrNull() ?: 443,
                     coverHost = uri.getQueryParameter("cover") ?: "api.googleapis.com",

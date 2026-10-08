@@ -118,8 +118,8 @@ class ArgLoggingCallSiteTest {
     @Test
     fun `every flag carrying a credential is declared in SECRET_FLAGS`() {
         // Audited by listing every "-flag" literal the app passes to the core.
-        // Of the thirty, one carries a credential. -ech-config is a public
-        // ECHConfigList published in DNS, -shaper-seed picks a shaping profile,
+        // Of the flags, -secret and the GOST certificate pin are redacted.
+        // -ech-config is a public ECHConfigList published in DNS, -shaper-seed picks a shaping profile,
         // and -config is a path - the file it names holds the keys, and it is
         // the path that gets logged, not the contents.
         val flags = mainSources()
@@ -136,7 +136,7 @@ class ArgLoggingCallSiteTest {
                 "-android", "-c", "-config", "-control-socket", "-cover", "-debug",
                 "-ech", "-ech-config", "-ech-public-name", "-fallback", "-fallback-v4", "-listen",
                 "-prefer-ipv6", "-protect-path", "-quic", "-quic-port", "-quic-sni-frag",
-                "-rtt-masking", "-rtt-profile", "-secret", "-server", "-server-v6", "-shaper",
+                "-gost-tls13-pin", "-gost-tls13-port", "-rtt-masking", "-rtt-profile", "-secret", "-server", "-server-v6", "-shaper",
                 "-shaper-seed", "-strategy", "-tun", "-tun-ip", "-tun-ipv6", "-tun-mtu"
             ),
             flags.toSet()
