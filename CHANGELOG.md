@@ -7,6 +7,31 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-10-13
+
+### Changed
+
+- Core updated to 1.11.6. The wire format is unchanged, so this build works
+  with servers on any 1.11.x core.
+- The core version is now pinned in `CORE_VERSION` and CI builds the native
+  library from that tag. Until now a release took whatever the core's main
+  branch held when the tag was pushed.
+
+### Fixed
+
+- **Faster recovery after a server restart on HTTP Polling.** The core now
+  rejects a frame longer than the protocol allows before allocating memory for
+  it, which is also the signal a restarted server sends for a session it no
+  longer has. The app reconnects in about a second and a half instead of
+  waiting out a 30 second read deadline. A corrupted frame length can no
+  longer make the core ask for gigabytes of memory and kill the app.
+- **QUIC (Salamander) chosen by hand no longer gives up on a cold start**, after
+  starting with no network, or after switching networks. Local errors such as
+  "network unreachable" are no longer mistaken for UDP being blocked.
+- The QUIC port setting never had an effect: QUIC always dials the server's
+  port. The core now says so in the log, at debug level for the default 443
+  and 8443 so it does not show up on every connect.
+
 ## [1.11.1] - 2026-10-03
 
 ### Added
