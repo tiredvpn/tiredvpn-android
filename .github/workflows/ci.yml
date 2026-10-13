@@ -25,11 +25,34 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The core is pinned to the tag in CORE_VERSION. Without a ref the
+      # checkout took whatever main held at build time, so the core inside a
+      # release depended on when the tag was pushed, not on this repository.
+      - name: Read pinned core version
+        id: core
+        run: |
+          REF="$(tr -d '[:space:]' < CORE_VERSION)"
+          if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "CORE_VERSION must hold a core tag like v1.2.3, got '$REF'"
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Checkout tiredvpn core
         uses: actions/checkout@v7
         with:
           repository: tiredvpn/tiredvpn
+          ref: ${{ steps.core.outputs.ref }}
           path: tiredvpn-core
+
+      - name: Check core version
+        run: |
+          WANT="${{ steps.core.outputs.ref }}"
+          GOT="v$(tr -d '[:space:]' < tiredvpn-core/VERSION)"
+          if [[ "$GOT" != "$WANT" ]]; then
+            echo "Core checkout says $GOT, CORE_VERSION pins $WANT"
+            exit 1
+          fi
 
       - name: Setup Go 1.26
         uses: actions/setup-go@v7

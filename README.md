@@ -95,7 +95,7 @@ app/src/main/java/com/tiredvpn/android/
 
 ### Step 1: Build the Go native library
 
-Use the provided script. Without arguments it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) into a fresh temporary directory, cross-compiles for all three architectures, and places the `.so` files in the right directories:
+Use the provided script. Without arguments it clones the [Go VPN core](https://github.com/tiredvpn/tiredvpn) at the tag pinned in `CORE_VERSION` into a fresh temporary directory, cross-compiles for all three architectures, and places the `.so` files in the right directories:
 
 ```bash
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.2.12479018
