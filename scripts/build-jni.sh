@@ -4,14 +4,16 @@ set -euo pipefail
 # Build TiredVPN Go core as shared libraries for Android architectures.
 #
 # Usage:
-#   ./scripts/build-jni.sh [--core-dir /path/to/tiredvpn-core] [--output-dir /path/to/jniLibs]
+#   ./scripts/build-jni.sh [--core-dir /path/to/tiredvpn-core] [--core-ref vX.Y.Z] [--output-dir /path/to/jniLibs]
 #
 # Environment:
 #   ANDROID_NDK_HOME — path to Android NDK (required)
 #
 # Defaults:
-#   --core-dir   a fresh clone of the core's default branch in a new temp
+#   --core-dir   a fresh clone of the core at --core-ref in a new temp
 #                directory, made for this run only
+#   --core-ref   the tag in CORE_VERSION at the repository root; used only
+#                when the script clones the core itself
 #   --output-dir app/src/main/jniLibs
 #
 # Writes <output-dir>/.core-revision: the core revision and a SHA-256 per
@@ -23,6 +25,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CORE_DIR=""
 OUTPUT_DIR="app/src/main/jniLibs"
 CORE_REPO="https://github.com/tiredvpn/tiredvpn.git"
+CORE_REF="$(tr -d '[:space:]' < "$REPO_ROOT/CORE_VERSION")"
 # Empty by default: the real version is read from the core checkout below so it
 # can never drift away from the code that actually gets compiled.
 VERSION=""
@@ -32,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --core-dir)  CORE_DIR="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --core-repo) CORE_REPO="$2"; shift 2 ;;
+    --core-ref)  CORE_REF="$2"; shift 2 ;;
     --version)   VERSION="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -58,11 +62,11 @@ fi
 # every later build quietly packaged whatever that first clone had been.
 if [[ -z "$CORE_DIR" ]]; then
   CORE_DIR="$(mktemp -d)/tiredvpn"
-  echo "==> No --core-dir given, cloning $CORE_REPO into $CORE_DIR"
-  git clone --depth 1 "$CORE_REPO" "$CORE_DIR"
+  echo "==> No --core-dir given, cloning $CORE_REPO at $CORE_REF into $CORE_DIR"
+  git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" "$CORE_DIR"
 elif [[ ! -d "$CORE_DIR" ]]; then
-  echo "==> Cloning tiredvpn core into $CORE_DIR"
-  git clone --depth 1 "$CORE_REPO" "$CORE_DIR"
+  echo "==> Cloning tiredvpn core at $CORE_REF into $CORE_DIR"
+  git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" "$CORE_DIR"
 fi
 
 if [[ -z "$VERSION" ]]; then
