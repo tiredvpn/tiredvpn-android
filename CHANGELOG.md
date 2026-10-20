@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-10-20
+
+### Changed
+
+- Core updated to 1.11.8. The wire format is unchanged, so this build works
+  with servers on any 1.11.x core.
+- Dependencies: media3 1.11.0, Gradle 9.7.0, `actions/setup-java` 6.0.1. The
+  Gradle wrapper now checks the distribution against its published SHA-256.
+
+### Fixed
+
+- **Protocol Confusion no longer loses the stream after a read timeout in the
+  middle of a record.** The next read used to fail authentication and the
+  tunnel had to reconnect.
+- **ICMP tunnel reads honour their deadline**, so a stalled ICMP path is
+  noticed when it should be rather than at the next packet.
+- **A handshake flags byte that arrives late ends the session cleanly** and
+  the app reconnects, instead of the byte corrupting the tunnel stream.
+
 ## [1.11.2] - 2026-10-13
 
 ### Changed
