@@ -10,18 +10,18 @@ import javax.xml.transform.stream.StreamResult
 
 plugins {
     id("com.android.application")
-    id("org.owasp.dependencycheck")
 }
 
-dependencyCheck {
-    failBuildOnCVSS = 9.0f
-    formats = listOf("JSON", "HTML")
-    analyzers.assemblyEnabled = false
-    // Without a key the NVD API is throttled hard: a cold download took
-    // 27 min to 1h45m in CI, and several runs at once hung for hours. CI
-    // passes both from the environment; locally the plugin defaults stay.
-    System.getenv("NVD_API_KEY")?.takeIf { it.isNotBlank() }?.let { nvd.apiKey.set(it) }
-    System.getenv("DEPENDENCY_CHECK_DATA")?.takeIf { it.isNotBlank() }?.let { data.directory.set(it) }
+// Lock state for the vulnerability scan only. CI runs
+// `:app:dependencies --configuration releaseRuntimeClasspath --write-locks
+// -PwriteDependencyLocks` and hands the resulting gradle.lockfile to
+// osv-scanner, so what is scanned is what ships in the APK and not the
+// build tooling. Without the property nothing is locked and nothing changes
+// for an ordinary build.
+if (providers.gradleProperty("writeDependencyLocks").isPresent) {
+    dependencyLocking {
+        lockAllConfigurations()
+    }
 }
 
 // --- JNI core: build libtiredvpn.so only from a core checkout someone named ---

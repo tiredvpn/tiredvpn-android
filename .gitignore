@@ -33,3 +33,6 @@ keystore.properties
 # Pre-built JNI libs (built by CI)
 app/src/main/jniLibs/
 CLAUDE.local.md
+
+# Written by CI for the osv-scanner step (-PwriteDependencyLocks); not tracked.
+app/gradle.lockfile
