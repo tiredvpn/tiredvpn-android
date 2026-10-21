@@ -88,18 +88,12 @@ jobs:
 
   security_scan:
     runs-on: ubuntu-latest
-    # Without this the job inherited the 6 h default: the NVD download has no
-    # timeout of its own and, unauthenticated and with several runs at once,
-    # sat in "in progress" for hours.
-    timeout-minutes: 90
-    # A newer push to the same branch makes the running scan pointless, and
-    # parallel scans compete for the same NVD rate limit.
+    timeout-minutes: 20
     concurrency:
       group: security-scan-${{ github.ref }}
       cancel-in-progress: true
     env:
-      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-      DEPENDENCY_CHECK_DATA: /home/runner/.cache/dependency-check-data
+      OSV_SCANNER_VERSION: v2.7.0
     steps:
       - uses: actions/checkout@v7
 
@@ -109,50 +103,28 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # The vulnerability database is downloaded once and then only updated:
-      # every run restores the newest copy, and main saves it back.
-      - name: Restore vulnerability database
-        uses: actions/cache/restore@v6
-        with:
-          path: /home/runner/.cache/dependency-check-data
-          key: dependency-check-data-${{ github.run_id }}
-          restore-keys: dependency-check-data-
+      # osv-scanner reads a lockfile and does not resolve Gradle itself. Lock
+      # only releaseRuntimeClasspath: that is what ships in the APK. The
+      # build classpath (kotlin-compiler, AGP and what they pull in) is
+      # tooling, and scanning it is what kept the old OWASP gate red on
+      # findings nobody could act on.
+      - name: Lock the release runtime classpath
+        run: ./gradlew -q :app:dependencies --configuration releaseRuntimeClasspath --write-locks -PwriteDependencyLocks > /dev/null
 
-      - name: Update vulnerability database
-        id: nvd_update
-        run: ./gradlew dependencyCheckUpdate
-        timeout-minutes: 50
-        continue-on-error: true
+      - name: Install osv-scanner
+        run: |
+          base="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}"
+          curl -fsSLO "$base/osv-scanner_linux_amd64"
+          curl -fsSLO "$base/osv-scanner_SHA256SUMS"
+          grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
+          install -m 755 osv-scanner_linux_amd64 /usr/local/bin/osv-scanner
+          rm osv-scanner_linux_amd64 osv-scanner_SHA256SUMS
 
-      # Only a database that finished updating is saved; a step cut off by
-      # its timeout may leave a half-written one behind.
-      - name: Save vulnerability database
-        if: github.ref == 'refs/heads/main' && steps.nvd_update.outcome == 'success'
-        uses: actions/cache/save@v6
-        with:
-          path: /home/runner/.cache/dependency-check-data
-          key: dependency-check-data-${{ github.run_id }}
-
-      # Report only, not a gate. failBuildOnCVSS = 9.0 trips on every run
-      # (kotlin-compiler, and grpc/netty pulled in by AGP, all build-time
-      # tooling), and continue-on-error swallows the failure, so this step
-      # has never blocked anything. Read the uploaded report; making it a
-      # real gate needs suppressions for the build classpath first.
-      - name: OWASP Dependency Check
-        run: ./gradlew dependencyCheckAnalyze
-        timeout-minutes: 20
-        continue-on-error: true
-
-      - name: Upload OWASP Report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: owasp-dependency-check
-          # The plugin writes dependency-check-report.{html,json} straight
-          # into reports/; the old dependency-check/ directory never existed,
-          # so no report was ever uploaded.
-          path: app/build/reports/dependency-check-report.*
-          retention-days: 30
+      # A gate, not a report: any known vulnerability in a shipped dependency
+      # fails the job. The scheduled run catches advisories published after
+      # the last push.
+      - name: Scan shipped dependencies
+        run: osv-scanner scan source --lockfile app/gradle.lockfile
 
       - name: Trivy Filesystem Scan
         uses: aquasecurity/trivy-action@v0.36.0
