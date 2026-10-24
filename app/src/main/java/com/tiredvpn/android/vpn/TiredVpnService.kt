@@ -370,6 +370,15 @@ class TiredVpnService : VpnService() {
      */
     @Volatile private var interfaceBuiltFor: Pair<VpnConfig, TunnelConfig>? = null
 
+    /**
+     * The core renegotiated an address the current interface does not carry.
+     * The network-change path keeps a valid interface (see
+     * [sendNetworkChangedCommand]), so without this a rebuild asked for by
+     * [scheduleInterfaceRebuild] handed the core the same stale interface
+     * again. Cleared once an interface is built for the addresses in force.
+     */
+    @Volatile private var interfaceAddressesStale = false
+
     // Written by the control-socket event listener and read by the
     // network-change coroutine, so neither may cache them.
     @Volatile private var currentVpnIp6: String = ""  // Negotiated dual-stack v6 ("" = v4-only session)
@@ -1406,6 +1415,7 @@ class TiredVpnService : VpnService() {
         )
         updateNotification("Connected • $finalIp")
         currentVpnIp = finalIp
+        interfaceAddressesStale = false
         // Remember the negotiated dual-stack addresses so the network-change
         // path can recreate the interface with the same v6 configuration.
         currentVpnIp6 = tunConfig.ip6 ?: ""
@@ -2456,6 +2466,38 @@ class TiredVpnService : VpnService() {
             serverIp6 = outcome.serverIp6.takeIf { it.isNotEmpty() },
         )
 
+        scheduleInterfaceRebuild("IPv6")
+    }
+
+    /**
+     * Follow a tunnel IPv4 address the core renegotiated on a reconnect.
+     *
+     * A reconnect may land on another exit of the pool, or on the same exit
+     * after it gave the old address away, and the answer then names a new
+     * address. The interface kept across the network change still carries
+     * the old one: the exit drops every packet from it, while keepalives keep
+     * the session looking alive, so nothing ever reconnects. Seen on a Pixel
+     * after a mobile-to-Wi-Fi switch: 10.8.100.6 on the interface, 10.8.100.9
+     * assigned, no traffic for minutes and no connection_dead.
+     *
+     * Same loop guard as IPv6: the rebuild's reconnect asks the exit for the
+     * address in force, and a rebuild follows only an answer that differs.
+     */
+    private fun applyRenegotiatedIpv4(reportedIp: String, source: String) {
+        if (!TunnelAddresses.ipv4Changed(currentVpnIp, reportedIp)) return
+        FileLogger.i(TAG, "IPv4 renegotiated via $source: $currentVpnIp -> $reportedIp; rebuilding the interface")
+        currentVpnIp = reportedIp
+        activeTunnelConfig = activeTunnelConfig?.copy(ip = reportedIp)
+        try { updateNotification("Connected • $reportedIp") } catch (_: Exception) {}
+        scheduleInterfaceRebuild("IPv4")
+    }
+
+    /**
+     * Build an interface for the addresses in force and hand it to the core,
+     * once the state is back to Connected.
+     */
+    private fun scheduleInterfaceRebuild(family: String) {
+        interfaceAddressesStale = true
         // forceReconnect, because this is not a debounceable network event: the
         // addresses are already wrong and waiting three seconds only extends
         // the black hole.
@@ -2472,14 +2514,16 @@ class TiredVpnService : VpnService() {
             repeat(IPV6_REBUILD_WAIT_TICKS) {
                 when (_state.value) {
                     is VpnState.Connected -> {
-                        sendNetworkChangedCommand(forceReconnect = true)
+                        // Both families can ask for a rebuild from one
+                        // answer; the first rebuild serves the second.
+                        if (interfaceAddressesStale) sendNetworkChangedCommand(forceReconnect = true)
                         return@launch
                     }
                     is VpnState.Disconnected -> return@launch
                     else -> delay(IPV6_REBUILD_WAIT_TICK_MS)
                 }
             }
-            FileLogger.w(TAG, "IPv6 rebuild skipped: never reached Connected within " +
+            FileLogger.w(TAG, "$family rebuild skipped: never reached Connected within " +
                 "${IPV6_REBUILD_WAIT_TICKS * IPV6_REBUILD_WAIT_TICK_MS}ms; addresses stored for the next build")
         }
     }
@@ -2670,6 +2714,7 @@ class TiredVpnService : VpnService() {
                                     // the ipv6_changed event rides
                                     // doAutoReconnect, which the control-socket
                                     // path disables.
+                                    applyRenegotiatedIpv4(json.optString("ip", ""), source = "network_changed response")
                                     applyRenegotiatedIpv6(
                                         reportedIp6 = if (json.has("ip6")) json.optString("ip6", "") else null,
                                         reportedServerIp6 = if (json.has("server_ip6")) json.optString("server_ip6", "") else null,
@@ -3720,13 +3765,18 @@ class TiredVpnService : VpnService() {
                 // command per recvmsg, and a bare JSON line can arrive glued
                 // to the network_available sent just before it. A new
                 // interface is built only when the current one is gone.
+                //
+                // Except when the core has renegotiated an address: then the
+                // interface carries the old one, and every packet the phone
+                // sends leaves from an address the exit no longer routes.
                 val currentVpnFd = vpnInterface
-                if (currentVpnFd != null && isVpnInterfaceValid(currentVpnFd)) {
+                if (currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid(currentVpnFd)) {
                     FileLogger.i(TAG, "VPN interface still valid (fd=${currentVpnFd.fd}), keeping it")
                     sendNetworkChangedWithFd(currentVpnFd.fd, reason)
                     return@withLock
                 }
-                FileLogger.w(TAG, "VPN interface is gone, recreating it")
+                FileLogger.w(TAG, if (interfaceAddressesStale) "VPN interface carries a stale address, recreating it"
+                    else "VPN interface is gone, recreating it")
 
                 val config = ServerRepository.getActiveServer(this@TiredVpnService) ?: return@withLock
 
@@ -3779,6 +3829,7 @@ class TiredVpnService : VpnService() {
                 val oldVpnFd = vpnInterface
                 vpnInterface = newVpnFd
                 interfaceBuiltFor = config to tunConfig
+                interfaceAddressesStale = false
                 FileLogger.i(TAG, "VPN interface swapped atomically")
 
                 // Send network_changed command with new fd

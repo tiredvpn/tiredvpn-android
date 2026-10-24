@@ -896,7 +896,9 @@ class VpnCoreCallSiteTest {
             "activeTunnelConfig must follow too, or forNetworkChange reads the old pair straight back",
             body.contains("activeTunnelConfig = activeTunnelConfig?.copy(")
         )
-        assertTrue("and the interface has to be rebuilt", body.contains("sendNetworkChangedCommand(forceReconnect = true)"))
+        // scheduleInterfaceRebuild sends the network_changed; pinned in
+        // `a rebuild does not keep the interface it is meant to replace`.
+        assertTrue("and the interface has to be rebuilt", body.contains("scheduleInterfaceRebuild(\"IPv6\")"))
     }
 
     @Test
@@ -1336,7 +1338,7 @@ class VpnCoreCallSiteTest {
     fun `a network switch hands the core the interface it already has`() {
         val service = callSites("TiredVpnService.kt")
         val body = bodyAfter(service, "private fun sendNetworkChangedCommand(")
-        val keep = Regex("""if \(currentVpnFd != null && isVpnInterfaceValid\(currentVpnFd\)\) \{[\s\S]*?sendNetworkChangedWithFd\(currentVpnFd\.fd, reason\)\s*return@withLock""").find(body)
+        val keep = Regex("""if \(currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid\(currentVpnFd\)\) \{[\s\S]*?sendNetworkChangedWithFd\(currentVpnFd\.fd, reason\)\s*return@withLock""").find(body)
         assertTrue("a valid interface must be sent again, not replaced", keep != null)
         assertTrue("and that check comes before any new interface is built", keep!!.range.first < body.indexOf("establishVpn("))
     }
@@ -1990,5 +1992,46 @@ class VpnCoreCallSiteTest {
         val connectBranch = service.substringAfter("ACTION_CONNECT, SERVICE_INTERFACE -> {").substringBefore("ACTION_DISCONNECT -> {")
         assertFalse(connectBranch.contains("sendDisconnectCommand()"))
         assertFalse(bodyAfter(service, "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {").contains("sendDisconnectCommand()"))
+    }
+
+    // --- a renegotiated address rebuilds the interface ----------------------
+
+    @Test
+    fun `a reconnect's new IPv4 address is followed`() {
+        val service = source("TiredVpnService.kt")
+        val connectedAt = service.indexOf("_state.value = VpnState.Connected(", service.indexOf("\"connected\" -> {\n                                    // Response to network_changed or reconnect"))
+        val v4 = service.indexOf("applyRenegotiatedIpv4(json.optString(\"ip\", \"\"), source = \"network_changed response\")")
+        assertTrue("the network_changed answer is checked for a new address", v4 >= 0)
+        assertTrue("after Connected is published: the rebuild runs only then", connectedAt in 0 until v4)
+
+        val apply = bodyAfter(service, "private fun applyRenegotiatedIpv4(reportedIp: String, source: String) {")
+        assertTrue(apply.contains("if (!TunnelAddresses.ipv4Changed(currentVpnIp, reportedIp)) return"))
+        assertTrue("the rebuild reads the new address", apply.contains("currentVpnIp = reportedIp"))
+        assertTrue(apply.contains("activeTunnelConfig = activeTunnelConfig?.copy(ip = reportedIp)"))
+        assertTrue(apply.contains("scheduleInterfaceRebuild(\"IPv4\")"))
+        assertTrue(bodyAfter(service, "private fun applyRenegotiatedIpv6(").contains("scheduleInterfaceRebuild(\"IPv6\")"))
+    }
+
+    /**
+     * The rebuild goes through the network-change path, which keeps a valid
+     * interface. Without the stale mark it kept the one with the old address,
+     * for IPv4 and for IPv6 alike.
+     */
+    @Test
+    fun `a rebuild does not keep the interface it is meant to replace`() {
+        val service = source("TiredVpnService.kt")
+        val schedule = bodyAfter(service, "private fun scheduleInterfaceRebuild(family: String) {")
+        assertTrue(schedule.contains("interfaceAddressesStale = true"))
+        assertTrue(schedule.contains("if (interfaceAddressesStale) sendNetworkChangedCommand(forceReconnect = true)"))
+
+        val change = bodyAfter(service, "private fun sendNetworkChangedCommand(")
+        assertTrue(
+            "a stale interface is not kept",
+            change.contains("if (currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid(currentVpnFd)) {")
+        )
+        val swapped = change.indexOf("vpnInterface = newVpnFd")
+        val cleared = change.indexOf("interfaceAddressesStale = false")
+        assertTrue("cleared once the new interface is in place", swapped in 0 until cleared)
+        assertTrue("and before the core is handed it", cleared < change.indexOf("sendNetworkChangedWithFd(newVpnFd.fd, reason)"))
     }
 }
