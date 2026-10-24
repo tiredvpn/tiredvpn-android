@@ -933,15 +933,12 @@ class VpnCoreCallSiteTest {
             service.contains("NetworkTransition.reason(lastNetworkType, currentNetworkType)")
         )
         assertTrue(service.contains("sendNetworkChangedCommand(forceReconnect = false, isCritical = true, reason = reason)"))
+        // ControlSocketProtocol.command leaves a null field out; the
+        // ControlSocketProtocolTest pins that half.
         assertTrue(
-            "the reason has to reach the wire",
+            "the reason has to reach the wire, and an unnamed transition must be omitted, not sent blank",
             bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(fd: Int, reason: String = \"\") {")
-                .contains("""put("reason", reason)""")
-        )
-        assertTrue(
-            "an unnamed transition must be omitted, not sent blank",
-            bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(fd: Int, reason: String = \"\") {")
-                .contains("if (reason.isNotEmpty())")
+                .contains(""""reason" to reason.ifEmpty { null }""")
         )
     }
 
@@ -1891,5 +1888,87 @@ class VpnCoreCallSiteTest {
         val published = Regex("""if \(stopLatch\.isLatched\) throw CancellationException\([^)]*\)\s*clearPhase\(\)\s*_state\.value = VpnState\.Connected\(""")
             .findAll(callSites("TiredVpnService.kt")).count()
         assertEquals("a dead tunnel is never painted live after a stop, in tun and proxy mode", 2, published)
+    }
+
+    // --- core 1.11.9 contract: network_id and the awaited stop --------------
+    //
+    // UnderlyingNetworkTest, ControlSocketProtocolTest and ControlChannelTest
+    // cover the functions; these pin the places that have to call them.
+
+    @Test
+    fun `connect and network_changed name the network they are made on`() {
+        val service = source("TiredVpnService.kt")
+
+        val connect = bodyAfter(service, "private suspend fun connectToControlSocket(")
+        val id = connect.indexOf("val networkId = underlyingNetworkId()")
+        val cmd = connect.indexOf("val connectCmd = ControlSocketProtocol.command(\"connect\", \"network_id\" to networkId)")
+        assertTrue("connect looks the network up", id >= 0)
+        assertTrue("and the command it sends carries it", cmd > id)
+        assertTrue("that command is the one sent", connect.indexOf("channel.send(connectCmd)") > cmd)
+
+        val changed = bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(")
+        val changedId = changed.indexOf("val networkId = underlyingNetworkId()")
+        val changedCmd = changed.indexOf("val cmd = ControlSocketProtocol.command(")
+        assertTrue("network_changed looks the network up", changedId >= 0)
+        assertTrue("and names it", changed.indexOf("\"network_id\" to networkId", changedCmd) > changedCmd)
+        assertTrue("on the command that carries the new fd", changed.indexOf("channel.send(cmd, fileDescriptor)") > changedCmd)
+    }
+
+    @Test
+    fun `the network named is the underlying one, never the VPN`() {
+        val service = source("TiredVpnService.kt")
+        val lookup = bodyAfter(service, "private fun underlyingNetworkId(): String? = try {")
+        assertTrue(lookup.contains("UnderlyingNetwork.choose(trackedUnderlyingNetwork, cm.activeNetwork, all)"))
+        assertTrue("a VPN is marked as one", lookup.contains("caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)"))
+        assertTrue(lookup.contains("!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)"))
+        assertTrue("none is left out, not sent as 0", lookup.contains("UnderlyingNetwork.wireId(chosen?.handle)"))
+    }
+
+    /** Every change to the callback's ranking reaches what network_changed names. */
+    @Test
+    fun `every move the network callback sees is published`() {
+        val service = source("TiredVpnService.kt")
+        val monitor = bodyAfter(service, "private fun startNetworkMonitoring() {")
+        val changes = occurrences(monitor, "networksUp.available(") + occurrences(monitor, "networksUp.lost(")
+        val published = occurrences(monitor, "trackedUnderlyingNetwork = ")
+        assertEquals(3, changes)
+        assertEquals("one publication per ranking change", changes, published)
+        assertTrue(
+            "a stopped callback publishes nothing",
+            bodyAfter(service, "private fun stopNetworkMonitoring() {").contains("trackedUnderlyingNetwork = null")
+        )
+    }
+
+    @Test
+    fun `a stop waits until the core has read disconnect`() {
+        val service = source("TiredVpnService.kt")
+        val tell = bodyAfter(service, "private fun sendDisconnectCommand() {")
+        assertTrue("over the open channel", tell.contains("awaitStopAnswer(channel, "))
+        assertTrue("or, with none, over a connection of its own", tell.contains("awaitStopAnswer(own, "))
+        assertFalse("never fire-and-forget", tell.contains(".send("))
+
+        val await = bodyAfter(service, "private fun awaitStopAnswer(")
+        assertTrue(await.contains("channel.request(cmd, DISCONNECT_ANSWER_TIMEOUT_MS, ControlSocketProtocol::isStopAnswer)"))
+
+        val disconnect = bodyAfter(service, "private fun disconnect(intent: StopIntent) {")
+        val told = disconnect.indexOf("sendDisconnectCommand()")
+        assertTrue("disconnect tells the core", told >= 0)
+        assertTrue("before the channel closes", told < disconnect.indexOf("closeControlChannel()"))
+        assertTrue("before the core stops", told < disconnect.indexOf("tiredvpnProcess?.stop()"))
+    }
+
+    @Test
+    fun `a force reset is a stop the core is told of, a connect's reset is not`() {
+        val service = source("TiredVpnService.kt")
+        assertTrue(
+            "ACTION_FORCE_RESET tells the core before resetting it",
+            Regex("""ACTION_FORCE_RESET -> \{[^}]*?sendDisconnectCommand\(\)[^}]*?forceResetCore\("user force reset"\)""")
+                .containsMatchIn(service)
+        )
+        // The reset a Connect tap does is no stop: it must not wipe what the
+        // previous core learned.
+        val connectBranch = service.substringAfter("ACTION_CONNECT, SERVICE_INTERFACE -> {").substringBefore("ACTION_DISCONNECT -> {")
+        assertFalse(connectBranch.contains("sendDisconnectCommand()"))
+        assertFalse(bodyAfter(service, "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {").contains("sendDisconnectCommand()"))
     }
 }

@@ -3,6 +3,11 @@ package com.tiredvpn.android.vpn
 import java.io.FileDescriptor
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * The bits of a control socket [ControlChannel] needs, named so the channel can
@@ -54,7 +59,15 @@ internal interface ControlTransport {
 internal class ControlChannel(private val transport: ControlTransport) {
 
     private val writeLock = Any()
-    private val readLock = Any()
+    private val readLock = ReentrantLock()
+
+    /** A [request] waiting for its answer; see [offer]. */
+    private class Waiter(val isAnswer: (String) -> Boolean) {
+        val done = CountDownLatch(1)
+        @Volatile var line: String? = null
+    }
+
+    private val waiters = CopyOnWriteArrayList<Waiter>()
 
     /** The single reader. Recreated only by recreating the channel. */
     private val reader = transport.input.bufferedReader()
@@ -97,7 +110,7 @@ internal class ControlChannel(private val transport: ControlTransport) {
     /**
      * Read one line, blocking for at most the socket's current read timeout.
      */
-    fun readLine(): String? = synchronized(readLock) { reader.readLine() }
+    fun readLine(): String? = readLock.withLock { reader.readLine().also(::offer) }
 
     /**
      * Read one line with [timeoutMs] as the real deadline.
@@ -109,14 +122,74 @@ internal class ControlChannel(private val transport: ControlTransport) {
      *
      * @return the line, or null on timeout.
      */
-    fun readLine(timeoutMs: Int): String? = synchronized(readLock) {
+    fun readLine(timeoutMs: Int): String? = readLock.withLock {
         transport.setReadTimeoutMs(timeoutMs)
         try {
-            reader.readLine()
+            reader.readLine().also(::offer)
         } catch (e: java.net.SocketTimeoutException) {
             null
         } finally {
             transport.setReadTimeoutMs(baseReadTimeoutMs)
+        }
+    }
+
+    /**
+     * Send [json] and wait at most [timeoutMs] for a line [isAnswer] accepts.
+     *
+     * The channel has one reader, and while a tunnel is up it is the service's
+     * event listener, parked in [readLine] for up to the socket's base timeout.
+     * Reading here as well would wait on that read's lock for as long. So a
+     * line read by anyone is offered to the requests waiting for one, and a
+     * request reads for itself only when nobody else is reading.
+     *
+     * Lines this call reads itself and does not accept are dropped. It is for
+     * the last exchange on a channel - the stop - where nothing is left to
+     * hand them to.
+     *
+     * @return the answer, or null on timeout or when the core closed the
+     *   connection.
+     */
+    fun request(json: String, timeoutMs: Long, isAnswer: (String) -> Boolean): String? {
+        val waiter = Waiter(isAnswer)
+        waiters.add(waiter)
+        try {
+            send(json)
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            while (true) {
+                if (waiter.done.count == 0L) return waiter.line
+                val leftMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+                if (leftMs <= 0) return null
+                if (readLock.tryLock()) {
+                    try {
+                        transport.setReadTimeoutMs(leftMs.toInt().coerceAtLeast(1))
+                        val line = try {
+                            reader.readLine() ?: return waiter.line
+                        } catch (e: java.net.SocketTimeoutException) {
+                            null
+                        } finally {
+                            transport.setReadTimeoutMs(baseReadTimeoutMs)
+                        }
+                        offer(line)
+                    } finally {
+                        readLock.unlock()
+                    }
+                } else {
+                    waiter.done.await(minOf(leftMs, REQUEST_POLL_MS), TimeUnit.MILLISECONDS)
+                }
+            }
+        } finally {
+            waiters.remove(waiter)
+        }
+    }
+
+    /** Hand [line] to every waiting [request] that accepts it. */
+    private fun offer(line: String?) {
+        if (line == null) return
+        for (w in waiters) {
+            if (w.done.count != 0L && w.isAnswer(line)) {
+                w.line = line
+                w.done.countDown()
+            }
         }
     }
 
@@ -126,4 +199,12 @@ internal class ControlChannel(private val transport: ControlTransport) {
     }
 
     val isClosed: Boolean get() = closed
+
+    private companion object {
+        /**
+         * How often a waiting [request] looks again at whether the reader
+         * went away. Its answer itself arrives through [offer] at once.
+         */
+        const val REQUEST_POLL_MS = 20L
+    }
 }

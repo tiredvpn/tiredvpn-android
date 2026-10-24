@@ -1,5 +1,6 @@
 package com.tiredvpn.android.vpn
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -116,5 +117,54 @@ class ControlSocketProtocolTest {
             """"routes":"0.0.0.0/1,128.0.0.0/1"}"""
         assertTrue(ControlSocketProtocol.isResponse(full))
         assertFalse(ControlSocketProtocol.isEvent(full))
+    }
+
+    // --- core 1.11.9: network_id and the stop's answer ----------------------
+
+    @Test
+    fun `network_id is a JSON string, as the contract pins it`() {
+        assertEquals(
+            """{"command":"connect","network_id":"432902426637"}""",
+            ControlSocketProtocol.command("connect", "network_id" to "432902426637"),
+        )
+    }
+
+    @Test
+    fun `a field without a value is left out, not sent empty`() {
+        assertEquals("""{"command":"connect"}""", ControlSocketProtocol.command("connect", "network_id" to null))
+        assertEquals("""{"command":"disconnect"}""", ControlSocketProtocol.command("disconnect"))
+        assertEquals(
+            """{"command":"network_changed","network_id":"7"}""",
+            ControlSocketProtocol.command("network_changed", "reason" to null, "network_id" to "7"),
+        )
+    }
+
+    @Test
+    fun `values are escaped`() {
+        assertEquals(
+            """{"command":"x","reason":"a\"b\\c\u000a"}""",
+            ControlSocketProtocol.command("x", "reason" to "a\"b\\c\n"),
+        )
+    }
+
+    /** handleDisconnect answers {"status":"ok"}: connected is omitempty. */
+    @Test
+    fun `the core's answer to disconnect is recognised`() {
+        assertTrue(ControlSocketProtocol.isStopAnswer("""{"status":"ok"}"""))
+        assertTrue(ControlSocketProtocol.isStopAnswer(errorResponse))
+    }
+
+    /**
+     * Commands on one connection are answered in turn, so the answer to a
+     * status poll or a network_changed sent before the stop can come first.
+     */
+    @Test
+    fun `answers to earlier commands are not taken for the stop's`() {
+        assertFalse(ControlSocketProtocol.isStopAnswer("""{"status":"ok","connected":true,"ip":"10.8.0.32"}"""))
+        assertFalse(ControlSocketProtocol.isStopAnswer("""{"status":"connected","ip":"10.8.0.32","strategy":"REALITY"}"""))
+        assertFalse(ControlSocketProtocol.isStopAnswer(waitingFd))
+        assertFalse(ControlSocketProtocol.isStopAnswer(keepalive))
+        assertFalse(ControlSocketProtocol.isStopAnswer("""{"event":"keepalive","data":"{\"status\":\"ok\"}"}"""))
+        assertFalse(ControlSocketProtocol.isStopAnswer("not json"))
     }
 }

@@ -67,6 +67,18 @@ class TiredVpnService : VpnService() {
         private const val SET_FD_READ_TIMEOUT = CONTROL_SOCKET_READ_TIMEOUT
 
         /**
+         * How long a stop waits for the core's answer to `disconnect`.
+         *
+         * The core books the user's stop when it READS the command, and
+         * answers once the commands before it on the connection are done, so
+         * the answer is the proof of the read, not the event itself. A core
+         * that is idle answers in a few milliseconds; one still inside a
+         * `connect` or a `network_changed` answers after it, and has read the
+         * stop long before. 500 ms is the core's own figure (PR #126).
+         */
+        private const val DISCONNECT_ANSWER_TIMEOUT_MS = 500L
+
+        /**
          * Names for the three waits a connect is made of, carried by
          * [ConnectDeadlineExceeded] and shown to the user.
          *
@@ -318,6 +330,13 @@ class TiredVpnService : VpnService() {
     private var connectAttemptsSinceBodyEntered = 0  // Track if coroutine body ever starts
     @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /**
+     * The non-VPN network the callback has traffic on, published for
+     * [underlyingNetworkId]: the callback's [NetworkInUse] lives on the
+     * connectivity thread and is not shared. Null while no callback runs.
+     */
+    @Volatile private var trackedUnderlyingNetwork: Network? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Connection info from Go binary response
@@ -532,6 +551,9 @@ class TiredVpnService : VpnService() {
             ACTION_FORCE_RESET -> {
                 FileLogger.w(TAG, "onStartCommand: ACTION_FORCE_RESET")
                 stopLatch.latch()
+                // The user's stop, so the core is told before it is reset:
+                // otherwise its server verdicts outlive the stop.
+                sendDisconnectCommand()
                 forceResetCore("user force reset")
                 _state.value = VpnState.Disconnected
                 applyStopIntent(StopIntent.USER)
@@ -2139,12 +2161,13 @@ class TiredVpnService : VpnService() {
             controlChannel = channel
             FileLogger.d(TAG, "connectToControlSocket: LocalSocket connected!")
 
-            // Send connect command
-            val connectCmd = JSONObject().apply {
-                put("command", "connect")
-            }.toString()
+            // Send connect command, naming the network it is made on: the
+            // core takes the previous core's server verdicts over only on the
+            // same one (see UnderlyingNetwork).
+            val networkId = underlyingNetworkId()
+            val connectCmd = ControlSocketProtocol.command("connect", "network_id" to networkId)
 
-            FileLogger.d(TAG, "connectToControlSocket: sending 'connect' command...")
+            FileLogger.i(TAG, "connectToControlSocket: sending 'connect' command, network_id=${networkId ?: "(none)"}")
             channel.send(connectCmd)
             FileLogger.d(TAG, "connectToControlSocket: 'connect' sent, waiting for response...")
 
@@ -2760,20 +2783,102 @@ class TiredVpnService : VpnService() {
         processWatchdogJob = null
     }
 
+    /**
+     * Tell the core the tunnel is being stopped on purpose, and wait (at most
+     * [DISCONNECT_ANSWER_TIMEOUT_MS]) until it has read that.
+     *
+     * The core hands what it learned about the servers to the next core for
+     * two minutes - unless it read a `disconnect` first. A stop the core never
+     * read leaves that carry alive, and the next start within two minutes
+     * takes over verdicts the user's stop was meant to end. So the stop is
+     * not fire-and-forget: it waits for the answer before the core is stopped.
+     *
+     * With no control channel - the reconnect window, between a core restart
+     * and connectToControlSocket - the command goes over a connection of its
+     * own to whatever core is listening. With no socket to connect to, the
+     * core has not got far enough to have dialled, and a core stopped before
+     * its first dial leaves the carry it found as it was; that is logged.
+     */
     private fun sendDisconnectCommand() {
-        try {
-            val channel = controlChannel ?: return
+        val cmd = ControlSocketProtocol.command("disconnect")
 
-            val disconnectCmd = JSONObject().apply {
-                put("command", "disconnect")
-            }.toString()
-
-            channel.send(disconnectCmd)
-
-            FileLogger.d(TAG, "Sent disconnect command to tiredvpn")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "Failed to send disconnect command", e)
+        val channel = controlChannel
+        if (channel != null) {
+            awaitStopAnswer(channel, "the control channel", cmd)
+            return
         }
+
+        if (!coreStarted) {
+            FileLogger.d(TAG, "disconnect: no core running, nothing to tell")
+            return
+        }
+        val socketPath = "${filesDir.absolutePath}/control.sock"
+        if (!File(socketPath).exists()) {
+            FileLogger.w(TAG, "disconnect: no control channel and no control socket yet; the core cannot be told")
+            return
+        }
+        val own = try {
+            ControlChannel(LocalSocketTransport(LocalSocket().apply {
+                connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
+            }))
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "disconnect: no control channel, and connecting to the core failed: ${e.message}")
+            return
+        }
+        try {
+            awaitStopAnswer(own, "a control connection of its own", cmd)
+        } finally {
+            own.close()
+        }
+    }
+
+    private fun awaitStopAnswer(channel: ControlChannel, via: String, cmd: String) {
+        val started = SystemClock.uptimeMillis()
+        try {
+            val answer = channel.request(cmd, DISCONNECT_ANSWER_TIMEOUT_MS, ControlSocketProtocol::isStopAnswer)
+            val tookMs = SystemClock.uptimeMillis() - started
+            if (answer != null) {
+                FileLogger.i(TAG, "disconnect: core answered over $via in ${tookMs}ms: $answer")
+            } else {
+                FileLogger.w(TAG, "disconnect: no answer over $via within ${tookMs}ms, stopping the core anyway")
+            }
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "disconnect: sending over $via failed: ${e.message}")
+        }
+    }
+
+    /**
+     * The control-socket `network_id` of the network the core's traffic
+     * leaves on now - Network.getNetworkHandle() in decimal - or null when
+     * there is none, and the field is left out. See [UnderlyingNetwork].
+     */
+    private fun underlyingNetworkId(): String? = try {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        // allNetworks is deprecated for callback-based tracking, which the
+        // service does too ([trackedUnderlyingNetwork]); this is the one call
+        // that answers before the callback has seen anything.
+        @Suppress("DEPRECATION")
+        val all = cm.allNetworks.mapNotNull { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@mapNotNull null
+            UnderlyingNetwork.Candidate(
+                network = network,
+                handle = network.networkHandle,
+                isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+                hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+                kind = NetworkInUse.kindOf(
+                    ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                    wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                    cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                ),
+            )
+        }
+        val chosen = UnderlyingNetwork.choose(trackedUnderlyingNetwork, cm.activeNetwork, all)
+        UnderlyingNetwork.wireId(chosen?.handle)
+    } catch (e: Exception) {
+        FileLogger.w(TAG, "network_id: could not read the networks: ${e.message}")
+        null
     }
 
     private fun startNetworkMonitoring() {
@@ -2815,6 +2920,7 @@ class TiredVpnService : VpnService() {
                 val previousKind = networksUp.inUseKind
                 val change = networksUp.available(network, kindOf(network), isValidated(network))
                 val inUse = networksUp.inUse
+                trackedUnderlyingNetwork = inUse
 
                 FileLogger.i(TAG, "=== NETWORK AVAILABLE: $network (in use: $inUse, was: $previousInUse, up: ${networksUp.size}, hadLoss: $hadNetworkLoss) ===")
                 lastNetworkAvailableTime = System.currentTimeMillis()
@@ -2934,6 +3040,7 @@ class TiredVpnService : VpnService() {
                 val inUseBefore = networksUp.inUse
                 val kindBefore = networksUp.inUseKind
                 val change = networksUp.lost(network)
+                trackedUnderlyingNetwork = networksUp.inUse
 
                 if (!NetworkLossPolicy.isRelevant(network, inUseBefore, checkNetworkAvailability())) {
                     FileLogger.d(TAG, "Network lost: $network, but it is not the one in use ($inUseBefore) and connectivity remains - ignoring")
@@ -2990,16 +3097,17 @@ class TiredVpnService : VpnService() {
                 // move is left to onAvailable and to the poll - the gate would
                 // discard the second report anyway, and a capabilities update
                 // is the weakest of the three signals.
-                if (networksUp.available(
-                        network,
-                        NetworkInUse.kindOf(
-                            ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
-                            wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
-                            cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
-                        ),
-                        validated = hasValidated,
-                    ) == NetworkInUse.Change.SWITCHED
-                ) {
+                val capsChange = networksUp.available(
+                    network,
+                    NetworkInUse.kindOf(
+                        ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                        wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                        cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                    ),
+                    validated = hasValidated,
+                )
+                trackedUnderlyingNetwork = networksUp.inUse
+                if (capsChange == NetworkInUse.Change.SWITCHED) {
                     FileLogger.i(TAG, "Capabilities moved traffic onto ${networksUp.inUse} (${networksUp.inUseKind?.wireName})")
                 }
 
@@ -3067,6 +3175,7 @@ class TiredVpnService : VpnService() {
                 val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
                 connectivityManager.unregisterNetworkCallback(callback)
                 FileLogger.d(TAG, "Network monitoring stopped")
+                trackedUnderlyingNetwork = null
             } catch (e: Exception) {
                 FileLogger.w(TAG, "Failed to unregister network callback", e)
             }
@@ -3672,16 +3781,22 @@ class TiredVpnService : VpnService() {
             // Attach + write + detach in one critical section. Split apart,
             // the 30-second `status` poll or a `network_available` could take
             // the descriptor with them and leave this command without one.
-            // Built with JSONObject rather than a literal now that it has an
-            // optional field; the core's decoder ignores what it does not know,
-            // so an omitted reason is exactly the old wire form.
-            val cmd = JSONObject().apply {
-                put("command", "network_changed")
-                if (reason.isNotEmpty()) put("reason", reason)
-            }.toString()
+            // Optional fields are left out rather than sent empty; the core's
+            // decoder ignores what it does not know, so an omitted reason is
+            // exactly the old wire form.
+            //
+            // network_id is the network traffic is moving to: the core hands
+            // the carry on with the last network it was told.
+            val networkId = underlyingNetworkId()
+            val cmd = ControlSocketProtocol.command(
+                "network_changed",
+                "reason" to reason.ifEmpty { null },
+                "network_id" to networkId,
+            )
             channel.send(cmd, fileDescriptor)
 
-            FileLogger.i(TAG, "Sent network_changed command with new TUN fd=$fd, reason=${reason.ifEmpty { "(none)" }}")
+            FileLogger.i(TAG, "Sent network_changed command with new TUN fd=$fd, reason=${reason.ifEmpty { "(none)" }}, " +
+                "network_id=${networkId ?: "(none)"}")
             // Response will be handled by eventListener in startStatusMonitoring
 
         } catch (e: Exception) {

@@ -223,4 +223,143 @@ class ControlChannelTest {
         }
         assertEquals(30, transport.sent.size)
     }
+
+    // --- request: the stop's send-and-wait ----------------------------------
+
+    /**
+     * A socket's input as the core's side writes it: bytes arrive when the
+     * test feeds them, and a read honours the timeout the channel set, the
+     * way LocalSocket's soTimeout does (0 waits for ever).
+     */
+    private class CoreSide : InputStream() {
+        private val bytes = java.util.concurrent.LinkedBlockingQueue<Int>()
+        @Volatile var timeoutMs = 0
+        val readersWaiting = AtomicInteger()
+
+        fun feed(line: String) = (line + "\n").toByteArray().forEach { bytes.put(it.toInt() and 0xff) }
+        fun eof() = bytes.put(-1)
+
+        override fun read(): Int {
+            readersWaiting.incrementAndGet()
+            try {
+                val b = if (timeoutMs == 0) bytes.take()
+                else bytes.poll(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                    ?: throw java.net.SocketTimeoutException("read timed out")
+                if (b == -1) bytes.put(-1)
+                return b
+            } finally {
+                readersWaiting.decrementAndGet()
+            }
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            val first = read()
+            if (first == -1) return -1
+            b[off] = first.toByte()
+            var n = 1
+            while (n < len) {
+                val next = bytes.peek() ?: break
+                if (next == -1) break
+                b[off + n] = bytes.take().toByte()
+                n++
+            }
+            return n
+        }
+    }
+
+    private class TimedTransport(val core: CoreSide) : ControlTransport {
+        val sent = java.util.Collections.synchronizedList(mutableListOf<String>())
+        override val input: InputStream = core
+        override val output: OutputStream = object : OutputStream() {
+            override fun write(b: Int) = throw UnsupportedOperationException()
+            override fun write(b: ByteArray) { sent.add(String(b)) }
+        }
+        override fun attachFds(fds: Array<FileDescriptor>?) {}
+        override fun setReadTimeoutMs(ms: Int) { core.timeoutMs = ms }
+        override fun close() {}
+    }
+
+    private val stop = """{"command":"disconnect"}"""
+
+    @Test
+    fun `with nobody reading, a request reads its own answer`() {
+        val core = CoreSide()
+        val channel = ControlChannel(TimedTransport(core))
+        // The answer to a status poll sent before the stop arrives first.
+        core.feed("""{"status":"ok","connected":true}""")
+        core.feed("""{"status":"ok"}""")
+
+        assertEquals("""{"status":"ok"}""", channel.request(stop, 2_000, ControlSocketProtocol::isStopAnswer))
+    }
+
+    /**
+     * The defect this guards: the service's event listener sits in readLine
+     * on the same channel for up to the socket's base timeout. A request that
+     * waited for the read lock waited that long; one that read past the lock
+     * would race the listener for bytes. The answer has to come through the
+     * listener's read, at once.
+     */
+    @Test
+    fun `a request is answered through the read already in progress`() {
+        val core = CoreSide()
+        val transport = TimedTransport(core)
+        val channel = ControlChannel(transport)
+
+        val listenerGot = java.util.concurrent.atomic.AtomicReference<String?>()
+        val listener = Thread { listenerGot.set(channel.readLine()) }.apply { isDaemon = true; start() }
+        while (core.readersWaiting.get() == 0) Thread.sleep(1)
+
+        val answerer = Thread {
+            while (transport.sent.isEmpty()) Thread.sleep(1)
+            core.feed("""{"status":"ok"}""")
+        }.apply { isDaemon = true; start() }
+
+        val started = System.nanoTime()
+        // The listener reads with no timeout at all here, so only a hand-over
+        // can answer this request before its own deadline.
+        val answer = channel.request(stop, 5_000, ControlSocketProtocol::isStopAnswer)
+        val tookMs = (System.nanoTime() - started) / 1_000_000
+
+        assertEquals("""{"status":"ok"}""", answer)
+        assertTrue("answered in ${tookMs}ms, not at its deadline", tookMs < 2_000)
+        assertEquals(listOf(stop + "\n"), transport.sent.toList())
+        listener.join(2_000)
+        answerer.join(2_000)
+        assertEquals("the listener still sees the line", """{"status":"ok"}""", listenerGot.get())
+    }
+
+    @Test
+    fun `a request without an answer gives up at its deadline`() {
+        val core = CoreSide()
+        val channel = ControlChannel(TimedTransport(core))
+        core.feed("""{"event":"keepalive","data":""}""")
+
+        val started = System.nanoTime()
+        assertNull(channel.request(stop, 200, ControlSocketProtocol::isStopAnswer))
+        val tookMs = (System.nanoTime() - started) / 1_000_000
+        assertTrue("gave up after ${tookMs}ms", tookMs in 150..1_500)
+    }
+
+    @Test
+    fun `a request on a connection the core closed returns at once`() {
+        val core = CoreSide()
+        val channel = ControlChannel(TimedTransport(core))
+        core.eof()
+
+        val started = System.nanoTime()
+        assertNull(channel.request(stop, 5_000, ControlSocketProtocol::isStopAnswer))
+        assertTrue((System.nanoTime() - started) / 1_000_000 < 2_000)
+    }
+
+    @Test
+    fun `a request leaves the base read timeout in place`() {
+        val core = CoreSide()
+        val channel = ControlChannel(TimedTransport(core))
+        channel.setBaseReadTimeoutMs(15_000)
+        core.feed("""{"status":"ok"}""")
+
+        channel.request(stop, 500, ControlSocketProtocol::isStopAnswer)
+        assertEquals(15_000, core.timeoutMs)
+    }
 }
