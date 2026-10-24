@@ -377,6 +377,17 @@ android {
     }
 
     buildTypes {
+        debug {
+            // A debug build that installs next to the release app instead of
+            // over it: -PdebugApplicationIdSuffix=.coretest gives it its own
+            // package, data and VPN profile, so a phone's real app and its
+            // configs stay untouched while a test build runs beside them.
+            // Unset, the debug build is com.tiredvpn.android as before.
+            providers.gradleProperty("debugApplicationIdSuffix").orNull?.let {
+                applicationIdSuffix = it
+                versionNameSuffix = "-${it.removePrefix(".")}"
+            }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true

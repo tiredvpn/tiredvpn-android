@@ -2,9 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Custom permission for ADB/automation control — only apps signed with the same key can use it -->
+    <!-- Custom permission for ADB/automation control — only apps signed with the same key can use it.
+         Named after the applicationId: a debug build with an applicationIdSuffix declares its own,
+         and does not collide with the release app's (INSTALL_FAILED_DUPLICATE_PERMISSION). -->
     <permission
-        android:name="com.tiredvpn.android.permission.VPN_CONTROL"
+        android:name="${applicationId}.permission.VPN_CONTROL"
         android:protectionLevel="signature" />
 
     <!-- Network permissions -->
@@ -253,7 +255,7 @@
         <receiver
             android:name=".receiver.ConfigImportReceiver"
             android:exported="true"
-            android:permission="com.tiredvpn.android.permission.VPN_CONTROL">
+            android:permission="${applicationId}.permission.VPN_CONTROL">
             <intent-filter>
                 <action android:name="com.tiredvpn.IMPORT_CONFIG" />
             </intent-filter>
@@ -265,7 +267,7 @@
             android:name=".receiver.VpnControlReceiver"
             android:exported="true"
             android:enabled="true"
-            android:permission="com.tiredvpn.android.permission.VPN_CONTROL">
+            android:permission="${applicationId}.permission.VPN_CONTROL">
             <intent-filter>
                 <action android:name="com.tiredvpn.ACTION_CONNECT" />
                 <action android:name="com.tiredvpn.ACTION_DISCONNECT" />
