@@ -79,6 +79,15 @@ class TiredVpnService : VpnService() {
         private const val DISCONNECT_ANSWER_TIMEOUT_MS = 500L
 
         /**
+         * How long `connect` waits for an underlying network to name. Short
+         * against the attempt's budget, because the core's own connect needs
+         * the rest; long enough for the case it is for, the core restarted
+         * while mobile data or Wi-Fi is coming back (3-4 s on a Pixel 9 Pro).
+         */
+        private const val CONNECT_NETWORK_WAIT_MS = 10_000L
+        private const val NETWORK_WAIT_POLL_MS = 250L
+
+        /**
          * Names for the three waits a connect is made of, carried by
          * [ConnectDeadlineExceeded] and shown to the user.
          *
@@ -2163,8 +2172,11 @@ class TiredVpnService : VpnService() {
 
             // Send connect command, naming the network it is made on: the
             // core takes the previous core's server verdicts over only on the
-            // same one (see UnderlyingNetwork).
-            val networkId = underlyingNetworkId()
+            // same one (see UnderlyingNetwork). Waits a little for a network
+            // to exist rather than send none; see awaitUnderlyingNetworkId.
+            val networkId = awaitUnderlyingNetworkId(
+                budget.budgetMs(System.currentTimeMillis(), CONNECT_NETWORK_WAIT_MS)
+            )
             val connectCmd = ControlSocketProtocol.command("connect", "network_id" to networkId)
 
             FileLogger.i(TAG, "connectToControlSocket: sending 'connect' command, network_id=${networkId ?: "(none)"}")
@@ -2845,6 +2857,31 @@ class TiredVpnService : VpnService() {
         } catch (e: Exception) {
             FileLogger.w(TAG, "disconnect: sending over $via failed: ${e.message}")
         }
+    }
+
+    /**
+     * [underlyingNetworkId], waiting up to [maxWaitMs] for a network to exist.
+     *
+     * A dead connection restarts the core at once, often while the network
+     * that killed it is still gone. A `connect` sent then names no network,
+     * and the core takes the previous core's carry whatever network it was
+     * made on: with one side unnamed it cannot tell a move from a stay. So the
+     * old network's verdicts rode onto the next one on every mobile-data
+     * drop. The core cannot dial before a network is back anyway, so waiting
+     * for one costs no time; past [maxWaitMs] the command goes without.
+     */
+    private suspend fun awaitUnderlyingNetworkId(maxWaitMs: Long): String? {
+        underlyingNetworkId()?.let { return it }
+        FileLogger.i(TAG, "connect: no underlying network yet, waiting up to ${maxWaitMs}ms for one to name")
+        val started = SystemClock.uptimeMillis()
+        while (SystemClock.uptimeMillis() - started < maxWaitMs) {
+            delay(NETWORK_WAIT_POLL_MS)
+            underlyingNetworkId()?.let {
+                FileLogger.i(TAG, "connect: network $it came up after ${SystemClock.uptimeMillis() - started}ms")
+                return it
+            }
+        }
+        return null
     }
 
     /**

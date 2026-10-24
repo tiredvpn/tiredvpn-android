@@ -1900,7 +1900,7 @@ class VpnCoreCallSiteTest {
         val service = source("TiredVpnService.kt")
 
         val connect = bodyAfter(service, "private suspend fun connectToControlSocket(")
-        val id = connect.indexOf("val networkId = underlyingNetworkId()")
+        val id = connect.indexOf("val networkId = awaitUnderlyingNetworkId(")
         val cmd = connect.indexOf("val connectCmd = ControlSocketProtocol.command(\"connect\", \"network_id\" to networkId)")
         assertTrue("connect looks the network up", id >= 0)
         assertTrue("and the command it sends carries it", cmd > id)
@@ -1912,6 +1912,26 @@ class VpnCoreCallSiteTest {
         assertTrue("network_changed looks the network up", changedId >= 0)
         assertTrue("and names it", changed.indexOf("\"network_id\" to networkId", changedCmd) > changedCmd)
         assertTrue("on the command that carries the new fd", changed.indexOf("channel.send(cmd, fileDescriptor)") > changedCmd)
+    }
+
+    /**
+     * A core restarted while the network is still gone must not send a
+     * connect that names none: the core then takes any carry, made on any
+     * network. Seen on the Pixel: every mobile-data drop sent network_id
+     * (none).
+     */
+    @Test
+    fun `connect waits for a network to name, within a bound`() {
+        val service = source("TiredVpnService.kt")
+        val wait = bodyAfter(service, "private suspend fun awaitUnderlyingNetworkId(maxWaitMs: Long): String? {")
+        assertTrue("answers at once when there is a network", wait.indexOf("underlyingNetworkId()?.let { return it }") >= 0)
+        assertTrue("polls while there is none", wait.contains("while (SystemClock.uptimeMillis() - started < maxWaitMs)"))
+        assertTrue("and gives up to send none", wait.contains("return null"))
+        val connect = bodyAfter(service, "private suspend fun connectToControlSocket(")
+        assertTrue(
+            "bounded by the attempt's budget",
+            connect.contains("budget.budgetMs(System.currentTimeMillis(), CONNECT_NETWORK_WAIT_MS)")
+        )
     }
 
     @Test
