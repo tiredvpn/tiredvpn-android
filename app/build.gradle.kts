@@ -480,7 +480,7 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation("org.robolectric:robolectric:4.17")
     // Lets the update checker and downloader be driven against a real HTTP
     // server instead of being mocked away. okhttp-tls gives that server a
     // certificate, so the downloader's https-only rule can stay unconditional
