@@ -465,7 +465,7 @@ dependencies {
     // implementation("androidx.camera:camera-view:1.3.1")
 
     // WorkManager for VPN watchdog
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
+    implementation("androidx.work:work-runtime-ktx:2.12.0")
 
     // Looping muted mascot video on the connecting screen
     implementation("androidx.media3:media3-exoplayer:1.11.0")
