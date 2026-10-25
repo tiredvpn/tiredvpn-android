@@ -2034,4 +2034,22 @@ class VpnCoreCallSiteTest {
         assertTrue("cleared once the new interface is in place", swapped in 0 until cleared)
         assertTrue("and before the core is handed it", cleared < change.indexOf("sendNetworkChangedWithFd(newVpnFd.fd, reason)"))
     }
+
+    // --- the reconnect pre-check asks the pool, not only the active server --
+
+    @Test
+    fun `the reconnect pre-check is not held by a dead first server`() {
+        val service = source("TiredVpnService.kt")
+        val start = service.indexOf("val skipConnectivityCheck = isNetworkLost")
+        assertTrue("landmark not found: the pre-check", start >= 0)
+        val reconnect = service.substring(start).substringBefore("Reconnect: Step 7")
+        assertTrue("the pool is what is checked", reconnect.contains("ServerPoolConfig.selectPool(ServerRepository.getServers(this@TiredVpnService), config)"))
+        assertTrue("through the memory of dead servers", reconnect.contains("while (!precheckPool(precheckTargets) && connectivityAttempts < maxConnectivityAttempts) {"))
+        assertFalse("not the active server alone", reconnect.contains("checkTcpConnectivity(config.serverAddress, config.serverPort)"))
+
+        val probe = bodyAfter(service, "private suspend fun precheckPool(targets: List<Pair<String, Pair<String, Int>>>): Boolean {")
+        assertTrue(probe.contains("precheckMemory.pick("))
+        assertTrue("a failure is remembered", probe.contains("precheckMemory.failed(key, SystemClock.elapsedRealtime())"))
+        assertTrue("and an answer forgets it", probe.contains("precheckMemory.answered(key)"))
+    }
 }

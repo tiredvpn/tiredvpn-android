@@ -379,6 +379,9 @@ class TiredVpnService : VpnService() {
      */
     @Volatile private var interfaceAddressesStale = false
 
+    /** Pool servers the reconnect pre-check found dead lately; see [PrecheckMemory]. */
+    private val precheckMemory = PrecheckMemory()
+
     // Written by the control-socket event listener and read by the
     // network-change coroutine, so neither may cache them.
     @Volatile private var currentVpnIp6: String = ""  // Negotiated dual-stack v6 ("" = v4-only session)
@@ -4163,12 +4166,19 @@ class TiredVpnService : VpnService() {
             isNetworkLost = false  // Reset flag
 
             if (!skipConnectivityCheck) {
-                FileLogger.d(TAG, "Reconnect: Step 6 - Checking TCP connectivity to ${config.serverAddress}:${config.serverPort}...")
+                // Any server of the pool answering proves the network; a dead
+                // first server must not hold the reconnect (PrecheckMemory).
+                val precheckTargets = (if (config.fallbackEnabled) {
+                    ServerPoolConfig.selectPool(ServerRepository.getServers(this@TiredVpnService), config)
+                } else {
+                    listOf(config)
+                }).map { "${it.serverAddress}:${it.serverPort}" to (it.serverAddress to it.serverPort) }.distinctBy { it.first }
+                FileLogger.d(TAG, "Reconnect: Step 6 - Checking TCP connectivity to the pool (${precheckTargets.size} server(s))...")
                 enterReconnectingState("Checking network...")
 
                 var connectivityAttempts = 0
                 val maxConnectivityAttempts = 3  // Limit attempts
-                while (!checkTcpConnectivity(config.serverAddress, config.serverPort) && connectivityAttempts < maxConnectivityAttempts) {
+                while (!precheckPool(precheckTargets) && connectivityAttempts < maxConnectivityAttempts) {
                     connectivityAttempts++
                     // Shorter backoff: 1s, 2s, 3s (max 3s instead of 30s)
                     val waitMs = ReconnectBackoff.connectivityWaitMs(connectivityAttempts)
@@ -4826,6 +4836,18 @@ class TiredVpnService : VpnService() {
             FileLogger.i(TAG, "Parsed connection info: strategy=$connectedStrategy, latency=${connectedLatencyMs}ms, attempts=$connectedAttempts")
         }
         // Note: Keepalive tracking moved to Go side - events sent via control socket
+    }
+
+    /**
+     * One pre-check probe, at the server [PrecheckMemory] picks from [targets]
+     * ("host:port" to host and port, in pool order), and the outcome booked.
+     */
+    private suspend fun precheckPool(targets: List<Pair<String, Pair<String, Int>>>): Boolean {
+        val key = precheckMemory.pick(targets.map { it.first }, SystemClock.elapsedRealtime()) ?: return false
+        val (host, port) = targets.first { it.first == key }.second
+        val ok = checkTcpConnectivity(host, port)
+        if (ok) precheckMemory.answered(key) else precheckMemory.failed(key, SystemClock.elapsedRealtime())
+        return ok
     }
 
     /**
