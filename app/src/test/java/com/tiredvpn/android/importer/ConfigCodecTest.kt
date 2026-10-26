@@ -1,6 +1,7 @@
 package com.tiredvpn.android.importer
 
 import android.util.Base64
+import com.tiredvpn.android.vpn.SplitTunnelSettings
 import com.tiredvpn.android.vpn.VpnConfig
 import org.json.JSONArray
 import org.junit.Assert.assertEquals
@@ -194,6 +195,58 @@ class ConfigCodecTest {
         assertNotNull(split)
         assertEquals("include", split!!.mode)
         assertEquals(setOf("com.foo", "com.bar"), split.apps)
+    }
+
+    // --- export: the split-tunnel list must survive a round-trip ---
+
+    @Test
+    fun `encode then parse restores the split-tunnel app list`() {
+        val config = VpnConfig(serverAddress = "a.example", serverPort = 995, secret = "k")
+        val spec = ConfigCodec.SplitTunnelSpec("include", setOf("com.foo", "com.bar"))
+
+        val json = ConfigCodec.encode(config, spec)
+        val parsed = ConfigCodec.parse(JSONArray().put(json).toString())
+
+        val split = parsed.servers.single().splitTunnel
+        assertNotNull(split)
+        assertEquals("include", split!!.mode)
+        assertEquals(setOf("com.foo", "com.bar"), split.apps)
+    }
+
+    @Test
+    fun `encode keeps a non-default mode even with no apps`() {
+        val config = VpnConfig(serverAddress = "a.example", serverPort = 995, secret = "k")
+        val spec = ConfigCodec.SplitTunnelSpec("off", emptySet())
+
+        val json = ConfigCodec.encode(config, spec)
+
+        assertTrue(json.has("split_tunneling"))
+        val parsed = ConfigCodec.parse(JSONArray().put(json).toString())
+        assertEquals("off", parsed.servers.single().splitTunnel!!.mode)
+    }
+
+    @Test
+    fun `encode writes no block for a server with the default and no apps`() {
+        val config = VpnConfig(serverAddress = "a.example", serverPort = 995, secret = "k")
+        val spec = ConfigCodec.SplitTunnelSpec(SplitTunnelSettings.DEFAULT_MODE, emptySet())
+
+        val json = ConfigCodec.encode(config, spec)
+
+        // Nothing the user configured, so the export stays as it was before -
+        // and the reader returns null, leaving any existing rules untouched.
+        assertFalse(json.has("split_tunneling"))
+        assertNull(ConfigCodec.parse(JSONArray().put(json).toString()).servers.single().splitTunnel)
+    }
+
+    @Test
+    fun `an old backup without a split-tunnel block still imports`() {
+        val config = VpnConfig(serverAddress = "a.example", serverPort = 995, secret = "k")
+
+        val json = ConfigCodec.encode(config, null)
+        val parsed = ConfigCodec.parse(JSONArray().put(json).toString())
+
+        assertEquals("a.example", parsed.servers.single().config.serverAddress)
+        assertNull(parsed.servers.single().splitTunnel)
     }
 
     // --- base64 ---

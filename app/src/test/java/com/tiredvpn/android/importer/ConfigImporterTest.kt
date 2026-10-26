@@ -304,6 +304,42 @@ class ConfigImporterTest {
     }
 
     @Test
+    fun `a backup round-trip restores split tunneling after a data clear`() {
+        // The bug Denis hit: the app list lived only in SharedPreferences, so a
+        // reinstall or "clear data" wiped it and the export never carried it.
+        // Here the whole chain runs: configure, export, wipe, import.
+        val config = VpnConfig(serverAddress = "n1.example", serverPort = 995, secret = "k")
+        SplitTunnelSettings.save(context, config.id, "include", setOf("com.foo", "com.bar"))
+
+        val backup = org.json.JSONArray()
+            .put(
+                ConfigCodec.encode(
+                    config,
+                    ConfigCodec.SplitTunnelSpec(
+                        SplitTunnelSettings.getMode(context, config.id),
+                        SplitTunnelSettings.getApps(context, config.id),
+                    ),
+                ),
+            )
+            .toString()
+
+        // Everything the user had is gone, as after a reinstall.
+        context.getSharedPreferences(SplitTunnelSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().clear().apply()
+        stored().forEach { ServerRepository.deleteServer(context, it.id) }
+        assertTrue(stored().isEmpty())
+
+        import(backup)
+
+        // The server comes back under the id the backup carried, and so does the
+        // list keyed to it.
+        val saved = stored().single()
+        assertEquals(config.id, saved.id)
+        assertEquals("include", SplitTunnelSettings.getMode(context, saved.id))
+        assertEquals(setOf("com.foo", "com.bar"), SplitTunnelSettings.getApps(context, saved.id))
+    }
+
+    @Test
     fun `a single imported server becomes the active one`() {
         import(link("n1.example"))
 

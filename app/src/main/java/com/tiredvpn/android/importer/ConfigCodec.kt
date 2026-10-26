@@ -3,6 +3,7 @@ package com.tiredvpn.android.importer
 import android.net.Uri
 import android.util.Base64
 import com.tiredvpn.android.vpn.ServerPoolConfig
+import com.tiredvpn.android.vpn.SplitTunnelSettings
 import com.tiredvpn.android.vpn.VpnConfig
 import org.json.JSONArray
 import org.json.JSONObject
@@ -379,6 +380,38 @@ object ConfigCodec {
                 v6BySender = V6_KEYS.any { json.present(it) },
             )
         )
+    }
+
+    /**
+     * Serialize a server together with its split-tunnel rules into one JSON
+     * object - the inverse of the object [objectFromJson] reads back.
+     *
+     * [VpnConfig.toJson] owns the server fields; the per-app list lives apart
+     * from the config, in SharedPreferences keyed by the server id, so a plain
+     * `toJson()` export dropped it and the user had to pick the apps again after
+     * every reinstall, data clear or restore. This adds the "split_tunneling"
+     * block the parser already understands (see [splitTunnelFromJson]) so a
+     * backup carries the list.
+     *
+     * The block is written only when it says something a fresh install would
+     * not - a non-default mode or a non-empty app list. A server with nothing
+     * configured exports exactly as before, and an older backup without the
+     * block still imports (the reader returns null and import leaves any
+     * existing rules untouched).
+     */
+    fun encode(config: VpnConfig, split: SplitTunnelSpec?): JSONObject {
+        val json = config.toJson()
+        if (split != null &&
+            (split.apps.isNotEmpty() || split.mode != SplitTunnelSettings.DEFAULT_MODE)
+        ) {
+            json.put(
+                "split_tunneling",
+                JSONObject()
+                    .put("mode", split.mode)
+                    .put("apps", JSONArray(split.apps.toList())),
+            )
+        }
+        return json
     }
 
     private fun splitTunnelFromJson(json: JSONObject): SplitTunnelSpec? {
