@@ -340,6 +340,31 @@ class ConfigImporterTest {
     }
 
     @Test
+    fun `export reads split tunneling back from live prefs by server id`() {
+        // Models the backup screen's own read: save through the real
+        // SplitTunnelSettings, then run the exact lookup exportAndShare uses -
+        // getMode/getApps by server.id against the same PREFS_NAME. Closes the
+        // read-after-write / wrong-id / wrong-prefs-file questions that the
+        // lookup-injecting encodeAll test steps over.
+        val config = VpnConfig(serverAddress = "n1.example", serverPort = 995, secret = "k")
+        SplitTunnelSettings.save(
+            context, config.id, "include", setOf("com.cloudflare.onedotonedotonedotone"),
+        )
+
+        val array = ConfigCodec.encodeAll(listOf(config)) { server ->
+            ConfigCodec.SplitTunnelSpec(
+                SplitTunnelSettings.getMode(context, server.id),
+                SplitTunnelSettings.getApps(context, server.id),
+            )
+        }
+
+        val split = ConfigCodec.parse(array.toString()).servers.single().splitTunnel
+        assertNotNull(split)
+        assertEquals("include", split!!.mode)
+        assertEquals(setOf("com.cloudflare.onedotonedotonedotone"), split.apps)
+    }
+
+    @Test
     fun `a single imported server becomes the active one`() {
         import(link("n1.example"))
 
