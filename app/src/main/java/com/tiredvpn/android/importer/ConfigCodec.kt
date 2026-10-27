@@ -414,6 +414,23 @@ object ConfigCodec {
         return json
     }
 
+    /**
+     * Encode a whole backup: every server with its split-tunnel rules attached.
+     *
+     * [splitFor] supplies each server's rules; the caller reads them from wherever
+     * they live (SharedPreferences, keyed by server id). Pulling the loop in here,
+     * off the backup screen, is deliberate: the one line that mattered - "attach
+     * this server's app list to this server" - used to sit inside an Activity where
+     * no unit test could reach it, and a build that dropped it still compiled and
+     * still produced a plausible backup, just without the list. This function is
+     * the whole export, so a test over it covers the step that actually fails.
+     */
+    fun encodeAll(servers: List<VpnConfig>, splitFor: (VpnConfig) -> SplitTunnelSpec?): JSONArray {
+        val array = JSONArray()
+        servers.forEach { array.put(encode(it, splitFor(it))) }
+        return array
+    }
+
     private fun splitTunnelFromJson(json: JSONObject): SplitTunnelSpec? {
         val split = json.optJSONObject("split_tunneling")
             ?: json.optJSONObject("splitTunneling")

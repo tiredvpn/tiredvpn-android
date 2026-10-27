@@ -249,6 +249,29 @@ class ConfigCodecTest {
         assertNull(parsed.servers.single().splitTunnel)
     }
 
+    @Test
+    fun `encodeAll attaches each server's own rules from the lookup`() {
+        // The exact case that fell out on device: a server with mode=include and a
+        // non-empty app list. The loop that pairs a server with its rules now lives
+        // in encodeAll, not in the backup screen, so this test reaches it.
+        val a = VpnConfig(serverAddress = "a.example", serverPort = 995, secret = "k1")
+        val b = VpnConfig(serverAddress = "b.example", serverPort = 995, secret = "k2")
+        val rules = mapOf(
+            a.id to ConfigCodec.SplitTunnelSpec("include", setOf("com.cloudflare.onedotonedotonedotone")),
+        )
+
+        val array = ConfigCodec.encodeAll(listOf(a, b)) { rules[it.id] }
+        val parsed = ConfigCodec.parse(array.toString())
+
+        val byAddress = parsed.servers.associateBy { it.config.serverAddress }
+        val splitA = byAddress.getValue("a.example").splitTunnel
+        assertNotNull(splitA)
+        assertEquals("include", splitA!!.mode)
+        assertEquals(setOf("com.cloudflare.onedotonedotonedotone"), splitA.apps)
+        // A server the lookup had nothing for carries no block.
+        assertNull(byAddress.getValue("b.example").splitTunnel)
+    }
+
     // --- base64 ---
 
     @Test

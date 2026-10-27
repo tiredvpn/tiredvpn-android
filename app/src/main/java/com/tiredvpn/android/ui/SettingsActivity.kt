@@ -22,7 +22,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import java.io.File
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -512,14 +511,12 @@ class SettingsActivity : BaseActivity() {
             // Carry each server's split-tunnel rules alongside it. They live in
             // SharedPreferences, apart from the config, so a bare toJson() export
             // dropped them and the app list had to be re-picked after a restore.
-            val json = JSONArray().apply {
-                servers.forEach { server ->
-                    val split = ConfigCodec.SplitTunnelSpec(
-                        mode = SplitTunnelSettings.getMode(this@SettingsActivity, server.id),
-                        apps = SplitTunnelSettings.getApps(this@SettingsActivity, server.id),
-                    )
-                    put(ConfigCodec.encode(server, split))
-                }
+            // The assembly lives in ConfigCodec.encodeAll so a unit test covers it.
+            val json = ConfigCodec.encodeAll(servers) { server ->
+                ConfigCodec.SplitTunnelSpec(
+                    mode = SplitTunnelSettings.getMode(this, server.id),
+                    apps = SplitTunnelSettings.getApps(this, server.id),
+                )
             }
             // SharedFiles and not cacheDir: FileProvider only grants the two
             // subdirectories declared in file_paths.xml.
