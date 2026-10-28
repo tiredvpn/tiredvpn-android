@@ -459,6 +459,15 @@ androidComponents {
 }
 
 dependencies {
+    constraints {
+        // CVE-2026-102554 / GHSA-xxph-c9ww-hj94: Guava <= 33.7.1 can be driven
+        // into uncontrolled memory allocation while deserializing its map/set
+        // types. It reaches the release runtime only transitively, through
+        // androidx.media3:media3-common. Force the patched line so the
+        // osv-scanner gate passes; drop this once media3 ships >= 33.7.2.
+        implementation("com.google.guava:guava:33.7.2-android")
+    }
+
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("com.google.android.material:material:1.14.0")

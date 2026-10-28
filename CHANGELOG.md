@@ -16,6 +16,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - The connect pre-check now reports the network it will connect over
   (`network_id`), and a stop request is awaited rather than returning before
   the tunnel is actually down.
+- Guava is forced to 33.7.2-android to clear CVE-2026-102554
+  (GHSA-xxph-c9ww-hj94), a deserialization memory-allocation issue. It reaches
+  the app only transitively through media3; nothing in the app deserialized
+  untrusted data into the affected types.
 
 ### Fixed
 
