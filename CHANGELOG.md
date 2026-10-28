@@ -7,6 +7,28 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-10-29
+
+### Changed
+
+- Core updated to 1.11.9. The wire format is unchanged, so this build works
+  with servers on any 1.11.x core.
+- The connect pre-check now reports the network it will connect over
+  (`network_id`), and a stop request is awaited rather than returning before
+  the tunnel is actually down.
+
+### Fixed
+
+- **A reconnect that lands on a different tunnel address rebuilds the VPN
+  interface** instead of leaving the old address in place, which used to wedge
+  the tunnel after the server handed out a new IP.
+- **Connect waits for a usable network before it starts** rather than naming
+  none and failing the first attempt.
+- **The reconnect pre-check asks the pool and skips servers it already found
+  dead**, so a reconnect no longer stalls retrying a known-down endpoint.
+- **The split-tunnel app list is carried through backup export and import**, so
+  per-app routing survives a config backup and restore.
+
 ## [1.11.3] - 2026-10-20
 
 ### Changed
