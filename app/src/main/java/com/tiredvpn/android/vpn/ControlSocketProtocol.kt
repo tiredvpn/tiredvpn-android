@@ -31,15 +31,69 @@ internal object ControlSocketProtocol {
     fun isResponse(line: String): Boolean = topLevelKeys(line)?.contains("status") == true
 
     /**
-     * Keys of a JSON object at nesting depth one, or null if [line] is not a
-     * JSON object. Values are skipped wholesale, so nested objects and strings
-     * containing braces or quotes cannot contribute keys.
+     * True when the line can be the answer to `disconnect`.
+     *
+     * The core answers commands on a connection in the order it read them, so
+     * the answer to a `status` poll or a `network_changed` sent just before the
+     * stop can arrive first. Those are told apart by what the stop's answer
+     * lacks: `{"status":"ok"}` carries no "connected" (omitempty false), and a
+     * reconnect's answer has status "connected". An error answer counts: the
+     * core has read the command, which is what the stop needs - it books the
+     * user's stop when it reads `disconnect`, not when it answers.
      */
-    private fun topLevelKeys(line: String): Set<String>? {
+    fun isStopAnswer(line: String): Boolean {
+        val fields = topLevelFields(line) ?: return false
+        if ("event" in fields || "connected" in fields) return false
+        return when (fields["status"]) {
+            "ok", "error" -> true
+            else -> false
+        }
+    }
+
+    /**
+     * A command line for the core: `{"command":"<name>", ...}` with the
+     * [fields] that are not null, in order, every value a JSON string.
+     *
+     * Built here rather than with org.json so the wire form of the fields the
+     * contract pins - `network_id` a string, absent rather than "" when there
+     * is none - can be tested on the JVM, where org.json is a stub.
+     */
+    fun command(name: String, vararg fields: Pair<String, String?>): String {
+        val sb = StringBuilder("{\"command\":").append(quote(name))
+        for ((key, value) in fields) {
+            if (value == null) continue
+            sb.append(',').append(quote(key)).append(':').append(quote(value))
+        }
+        return sb.append('}').toString()
+    }
+
+    private fun quote(value: String): String {
+        val sb = StringBuilder(value.length + 2).append('"')
+        for (c in value) {
+            when {
+                c == '"' -> sb.append("\\\"")
+                c == '\\' -> sb.append("\\\\")
+                c < ' ' -> sb.append("\\u%04x".format(c.code))
+                else -> sb.append(c)
+            }
+        }
+        return sb.append('"').toString()
+    }
+
+    private fun topLevelKeys(line: String): Set<String>? = topLevelFields(line)?.keys
+
+    /**
+     * Keys of a JSON object at nesting depth one, each with its value when
+     * that value is a string (null otherwise), or null if [line] is not a
+     * JSON object. Other values are skipped wholesale, so nested objects and
+     * strings containing braces or quotes cannot contribute keys.
+     */
+    private fun topLevelFields(line: String): Map<String, String?>? {
         val text = line.trim()
         if (!text.startsWith("{") || !text.endsWith("}")) return null
 
-        val keys = mutableSetOf<String>()
+        val fields = LinkedHashMap<String, String?>()
+        var key: String? = null
         var i = 1
         var depth = 0
         var expectingKey = true
@@ -55,10 +109,12 @@ internal object ControlSocketProtocol {
                         // Only a name immediately followed by ':' is a key.
                         val after = skipWhitespace(text, literal.second)
                         if (after >= text.length || text[after] != ':') return null
-                        keys.add(literal.first)
+                        key = literal.first
+                        fields[literal.first] = null
                         expectingKey = false
                         i = after + 1
                     } else {
+                        if (depth == 0 && key != null) fields[key] = literal.first
                         i = literal.second
                     }
                 }
@@ -74,7 +130,7 @@ internal object ControlSocketProtocol {
                 else -> i++
             }
         }
-        return keys
+        return fields
     }
 
     /** Reads the string literal starting at [start]; returns its content and the index past it. */

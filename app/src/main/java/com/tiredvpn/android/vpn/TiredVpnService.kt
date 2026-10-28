@@ -67,6 +67,27 @@ class TiredVpnService : VpnService() {
         private const val SET_FD_READ_TIMEOUT = CONTROL_SOCKET_READ_TIMEOUT
 
         /**
+         * How long a stop waits for the core's answer to `disconnect`.
+         *
+         * The core books the user's stop when it READS the command, and
+         * answers once the commands before it on the connection are done, so
+         * the answer is the proof of the read, not the event itself. A core
+         * that is idle answers in a few milliseconds; one still inside a
+         * `connect` or a `network_changed` answers after it, and has read the
+         * stop long before. 500 ms is the core's own figure (PR #126).
+         */
+        private const val DISCONNECT_ANSWER_TIMEOUT_MS = 500L
+
+        /**
+         * How long `connect` waits for an underlying network to name. Short
+         * against the attempt's budget, because the core's own connect needs
+         * the rest; long enough for the case it is for, the core restarted
+         * while mobile data or Wi-Fi is coming back (3-4 s on a Pixel 9 Pro).
+         */
+        private const val CONNECT_NETWORK_WAIT_MS = 10_000L
+        private const val NETWORK_WAIT_POLL_MS = 250L
+
+        /**
          * Names for the three waits a connect is made of, carried by
          * [ConnectDeadlineExceeded] and shown to the user.
          *
@@ -318,6 +339,13 @@ class TiredVpnService : VpnService() {
     private var connectAttemptsSinceBodyEntered = 0  // Track if coroutine body ever starts
     @Volatile private var connectWatchdogFuture: java.util.concurrent.ScheduledFuture<*>? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /**
+     * The non-VPN network the callback has traffic on, published for
+     * [underlyingNetworkId]: the callback's [NetworkInUse] lives on the
+     * connectivity thread and is not shared. Null while no callback runs.
+     */
+    @Volatile private var trackedUnderlyingNetwork: Network? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Connection info from Go binary response
@@ -341,6 +369,18 @@ class TiredVpnService : VpnService() {
      * instead of building a new one; see [reusableInterface].
      */
     @Volatile private var interfaceBuiltFor: Pair<VpnConfig, TunnelConfig>? = null
+
+    /**
+     * The core renegotiated an address the current interface does not carry.
+     * The network-change path keeps a valid interface (see
+     * [sendNetworkChangedCommand]), so without this a rebuild asked for by
+     * [scheduleInterfaceRebuild] handed the core the same stale interface
+     * again. Cleared once an interface is built for the addresses in force.
+     */
+    @Volatile private var interfaceAddressesStale = false
+
+    /** Pool servers the reconnect pre-check found dead lately; see [PrecheckMemory]. */
+    private val precheckMemory = PrecheckMemory()
 
     // Written by the control-socket event listener and read by the
     // network-change coroutine, so neither may cache them.
@@ -532,6 +572,9 @@ class TiredVpnService : VpnService() {
             ACTION_FORCE_RESET -> {
                 FileLogger.w(TAG, "onStartCommand: ACTION_FORCE_RESET")
                 stopLatch.latch()
+                // The user's stop, so the core is told before it is reset:
+                // otherwise its server verdicts outlive the stop.
+                sendDisconnectCommand()
                 forceResetCore("user force reset")
                 _state.value = VpnState.Disconnected
                 applyStopIntent(StopIntent.USER)
@@ -1375,6 +1418,7 @@ class TiredVpnService : VpnService() {
         )
         updateNotification("Connected • $finalIp")
         currentVpnIp = finalIp
+        interfaceAddressesStale = false
         // Remember the negotiated dual-stack addresses so the network-change
         // path can recreate the interface with the same v6 configuration.
         currentVpnIp6 = tunConfig.ip6 ?: ""
@@ -2139,12 +2183,16 @@ class TiredVpnService : VpnService() {
             controlChannel = channel
             FileLogger.d(TAG, "connectToControlSocket: LocalSocket connected!")
 
-            // Send connect command
-            val connectCmd = JSONObject().apply {
-                put("command", "connect")
-            }.toString()
+            // Send connect command, naming the network it is made on: the
+            // core takes the previous core's server verdicts over only on the
+            // same one (see UnderlyingNetwork). Waits a little for a network
+            // to exist rather than send none; see awaitUnderlyingNetworkId.
+            val networkId = awaitUnderlyingNetworkId(
+                budget.budgetMs(System.currentTimeMillis(), CONNECT_NETWORK_WAIT_MS)
+            )
+            val connectCmd = ControlSocketProtocol.command("connect", "network_id" to networkId)
 
-            FileLogger.d(TAG, "connectToControlSocket: sending 'connect' command...")
+            FileLogger.i(TAG, "connectToControlSocket: sending 'connect' command, network_id=${networkId ?: "(none)"}")
             channel.send(connectCmd)
             FileLogger.d(TAG, "connectToControlSocket: 'connect' sent, waiting for response...")
 
@@ -2421,6 +2469,38 @@ class TiredVpnService : VpnService() {
             serverIp6 = outcome.serverIp6.takeIf { it.isNotEmpty() },
         )
 
+        scheduleInterfaceRebuild("IPv6")
+    }
+
+    /**
+     * Follow a tunnel IPv4 address the core renegotiated on a reconnect.
+     *
+     * A reconnect may land on another exit of the pool, or on the same exit
+     * after it gave the old address away, and the answer then names a new
+     * address. The interface kept across the network change still carries
+     * the old one: the exit drops every packet from it, while keepalives keep
+     * the session looking alive, so nothing ever reconnects. Seen on a Pixel
+     * after a mobile-to-Wi-Fi switch: 10.8.100.6 on the interface, 10.8.100.9
+     * assigned, no traffic for minutes and no connection_dead.
+     *
+     * Same loop guard as IPv6: the rebuild's reconnect asks the exit for the
+     * address in force, and a rebuild follows only an answer that differs.
+     */
+    private fun applyRenegotiatedIpv4(reportedIp: String, source: String) {
+        if (!TunnelAddresses.ipv4Changed(currentVpnIp, reportedIp)) return
+        FileLogger.i(TAG, "IPv4 renegotiated via $source: $currentVpnIp -> $reportedIp; rebuilding the interface")
+        currentVpnIp = reportedIp
+        activeTunnelConfig = activeTunnelConfig?.copy(ip = reportedIp)
+        try { updateNotification("Connected • $reportedIp") } catch (_: Exception) {}
+        scheduleInterfaceRebuild("IPv4")
+    }
+
+    /**
+     * Build an interface for the addresses in force and hand it to the core,
+     * once the state is back to Connected.
+     */
+    private fun scheduleInterfaceRebuild(family: String) {
+        interfaceAddressesStale = true
         // forceReconnect, because this is not a debounceable network event: the
         // addresses are already wrong and waiting three seconds only extends
         // the black hole.
@@ -2437,14 +2517,16 @@ class TiredVpnService : VpnService() {
             repeat(IPV6_REBUILD_WAIT_TICKS) {
                 when (_state.value) {
                     is VpnState.Connected -> {
-                        sendNetworkChangedCommand(forceReconnect = true)
+                        // Both families can ask for a rebuild from one
+                        // answer; the first rebuild serves the second.
+                        if (interfaceAddressesStale) sendNetworkChangedCommand(forceReconnect = true)
                         return@launch
                     }
                     is VpnState.Disconnected -> return@launch
                     else -> delay(IPV6_REBUILD_WAIT_TICK_MS)
                 }
             }
-            FileLogger.w(TAG, "IPv6 rebuild skipped: never reached Connected within " +
+            FileLogger.w(TAG, "$family rebuild skipped: never reached Connected within " +
                 "${IPV6_REBUILD_WAIT_TICKS * IPV6_REBUILD_WAIT_TICK_MS}ms; addresses stored for the next build")
         }
     }
@@ -2635,6 +2717,7 @@ class TiredVpnService : VpnService() {
                                     // the ipv6_changed event rides
                                     // doAutoReconnect, which the control-socket
                                     // path disables.
+                                    applyRenegotiatedIpv4(json.optString("ip", ""), source = "network_changed response")
                                     applyRenegotiatedIpv6(
                                         reportedIp6 = if (json.has("ip6")) json.optString("ip6", "") else null,
                                         reportedServerIp6 = if (json.has("server_ip6")) json.optString("server_ip6", "") else null,
@@ -2760,20 +2843,127 @@ class TiredVpnService : VpnService() {
         processWatchdogJob = null
     }
 
+    /**
+     * Tell the core the tunnel is being stopped on purpose, and wait (at most
+     * [DISCONNECT_ANSWER_TIMEOUT_MS]) until it has read that.
+     *
+     * The core hands what it learned about the servers to the next core for
+     * two minutes - unless it read a `disconnect` first. A stop the core never
+     * read leaves that carry alive, and the next start within two minutes
+     * takes over verdicts the user's stop was meant to end. So the stop is
+     * not fire-and-forget: it waits for the answer before the core is stopped.
+     *
+     * With no control channel - the reconnect window, between a core restart
+     * and connectToControlSocket - the command goes over a connection of its
+     * own to whatever core is listening. With no socket to connect to, the
+     * core has not got far enough to have dialled, and a core stopped before
+     * its first dial leaves the carry it found as it was; that is logged.
+     */
     private fun sendDisconnectCommand() {
-        try {
-            val channel = controlChannel ?: return
+        val cmd = ControlSocketProtocol.command("disconnect")
 
-            val disconnectCmd = JSONObject().apply {
-                put("command", "disconnect")
-            }.toString()
-
-            channel.send(disconnectCmd)
-
-            FileLogger.d(TAG, "Sent disconnect command to tiredvpn")
-        } catch (e: Exception) {
-            FileLogger.w(TAG, "Failed to send disconnect command", e)
+        val channel = controlChannel
+        if (channel != null) {
+            awaitStopAnswer(channel, "the control channel", cmd)
+            return
         }
+
+        if (!coreStarted) {
+            FileLogger.d(TAG, "disconnect: no core running, nothing to tell")
+            return
+        }
+        val socketPath = "${filesDir.absolutePath}/control.sock"
+        if (!File(socketPath).exists()) {
+            FileLogger.w(TAG, "disconnect: no control channel and no control socket yet; the core cannot be told")
+            return
+        }
+        val own = try {
+            ControlChannel(LocalSocketTransport(LocalSocket().apply {
+                connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
+            }))
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "disconnect: no control channel, and connecting to the core failed: ${e.message}")
+            return
+        }
+        try {
+            awaitStopAnswer(own, "a control connection of its own", cmd)
+        } finally {
+            own.close()
+        }
+    }
+
+    private fun awaitStopAnswer(channel: ControlChannel, via: String, cmd: String) {
+        val started = SystemClock.uptimeMillis()
+        try {
+            val answer = channel.request(cmd, DISCONNECT_ANSWER_TIMEOUT_MS, ControlSocketProtocol::isStopAnswer)
+            val tookMs = SystemClock.uptimeMillis() - started
+            if (answer != null) {
+                FileLogger.i(TAG, "disconnect: core answered over $via in ${tookMs}ms: $answer")
+            } else {
+                FileLogger.w(TAG, "disconnect: no answer over $via within ${tookMs}ms, stopping the core anyway")
+            }
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "disconnect: sending over $via failed: ${e.message}")
+        }
+    }
+
+    /**
+     * [underlyingNetworkId], waiting up to [maxWaitMs] for a network to exist.
+     *
+     * A dead connection restarts the core at once, often while the network
+     * that killed it is still gone. A `connect` sent then names no network,
+     * and the core takes the previous core's carry whatever network it was
+     * made on: with one side unnamed it cannot tell a move from a stay. So the
+     * old network's verdicts rode onto the next one on every mobile-data
+     * drop. The core cannot dial before a network is back anyway, so waiting
+     * for one costs no time; past [maxWaitMs] the command goes without.
+     */
+    private suspend fun awaitUnderlyingNetworkId(maxWaitMs: Long): String? {
+        underlyingNetworkId()?.let { return it }
+        FileLogger.i(TAG, "connect: no underlying network yet, waiting up to ${maxWaitMs}ms for one to name")
+        val started = SystemClock.uptimeMillis()
+        while (SystemClock.uptimeMillis() - started < maxWaitMs) {
+            delay(NETWORK_WAIT_POLL_MS)
+            underlyingNetworkId()?.let {
+                FileLogger.i(TAG, "connect: network $it came up after ${SystemClock.uptimeMillis() - started}ms")
+                return it
+            }
+        }
+        return null
+    }
+
+    /**
+     * The control-socket `network_id` of the network the core's traffic
+     * leaves on now - Network.getNetworkHandle() in decimal - or null when
+     * there is none, and the field is left out. See [UnderlyingNetwork].
+     */
+    private fun underlyingNetworkId(): String? = try {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        // allNetworks is deprecated for callback-based tracking, which the
+        // service does too ([trackedUnderlyingNetwork]); this is the one call
+        // that answers before the callback has seen anything.
+        @Suppress("DEPRECATION")
+        val all = cm.allNetworks.mapNotNull { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@mapNotNull null
+            UnderlyingNetwork.Candidate(
+                network = network,
+                handle = network.networkHandle,
+                isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+                hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+                kind = NetworkInUse.kindOf(
+                    ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                    wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                    cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                ),
+            )
+        }
+        val chosen = UnderlyingNetwork.choose(trackedUnderlyingNetwork, cm.activeNetwork, all)
+        UnderlyingNetwork.wireId(chosen?.handle)
+    } catch (e: Exception) {
+        FileLogger.w(TAG, "network_id: could not read the networks: ${e.message}")
+        null
     }
 
     private fun startNetworkMonitoring() {
@@ -2815,6 +3005,7 @@ class TiredVpnService : VpnService() {
                 val previousKind = networksUp.inUseKind
                 val change = networksUp.available(network, kindOf(network), isValidated(network))
                 val inUse = networksUp.inUse
+                trackedUnderlyingNetwork = inUse
 
                 FileLogger.i(TAG, "=== NETWORK AVAILABLE: $network (in use: $inUse, was: $previousInUse, up: ${networksUp.size}, hadLoss: $hadNetworkLoss) ===")
                 lastNetworkAvailableTime = System.currentTimeMillis()
@@ -2934,6 +3125,7 @@ class TiredVpnService : VpnService() {
                 val inUseBefore = networksUp.inUse
                 val kindBefore = networksUp.inUseKind
                 val change = networksUp.lost(network)
+                trackedUnderlyingNetwork = networksUp.inUse
 
                 if (!NetworkLossPolicy.isRelevant(network, inUseBefore, checkNetworkAvailability())) {
                     FileLogger.d(TAG, "Network lost: $network, but it is not the one in use ($inUseBefore) and connectivity remains - ignoring")
@@ -2990,16 +3182,17 @@ class TiredVpnService : VpnService() {
                 // move is left to onAvailable and to the poll - the gate would
                 // discard the second report anyway, and a capabilities update
                 // is the weakest of the three signals.
-                if (networksUp.available(
-                        network,
-                        NetworkInUse.kindOf(
-                            ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
-                            wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
-                            cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
-                        ),
-                        validated = hasValidated,
-                    ) == NetworkInUse.Change.SWITCHED
-                ) {
+                val capsChange = networksUp.available(
+                    network,
+                    NetworkInUse.kindOf(
+                        ethernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                        wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                        cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                    ),
+                    validated = hasValidated,
+                )
+                trackedUnderlyingNetwork = networksUp.inUse
+                if (capsChange == NetworkInUse.Change.SWITCHED) {
                     FileLogger.i(TAG, "Capabilities moved traffic onto ${networksUp.inUse} (${networksUp.inUseKind?.wireName})")
                 }
 
@@ -3067,6 +3260,7 @@ class TiredVpnService : VpnService() {
                 val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
                 connectivityManager.unregisterNetworkCallback(callback)
                 FileLogger.d(TAG, "Network monitoring stopped")
+                trackedUnderlyingNetwork = null
             } catch (e: Exception) {
                 FileLogger.w(TAG, "Failed to unregister network callback", e)
             }
@@ -3574,13 +3768,18 @@ class TiredVpnService : VpnService() {
                 // command per recvmsg, and a bare JSON line can arrive glued
                 // to the network_available sent just before it. A new
                 // interface is built only when the current one is gone.
+                //
+                // Except when the core has renegotiated an address: then the
+                // interface carries the old one, and every packet the phone
+                // sends leaves from an address the exit no longer routes.
                 val currentVpnFd = vpnInterface
-                if (currentVpnFd != null && isVpnInterfaceValid(currentVpnFd)) {
+                if (currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid(currentVpnFd)) {
                     FileLogger.i(TAG, "VPN interface still valid (fd=${currentVpnFd.fd}), keeping it")
                     sendNetworkChangedWithFd(currentVpnFd.fd, reason)
                     return@withLock
                 }
-                FileLogger.w(TAG, "VPN interface is gone, recreating it")
+                FileLogger.w(TAG, if (interfaceAddressesStale) "VPN interface carries a stale address, recreating it"
+                    else "VPN interface is gone, recreating it")
 
                 val config = ServerRepository.getActiveServer(this@TiredVpnService) ?: return@withLock
 
@@ -3633,6 +3832,7 @@ class TiredVpnService : VpnService() {
                 val oldVpnFd = vpnInterface
                 vpnInterface = newVpnFd
                 interfaceBuiltFor = config to tunConfig
+                interfaceAddressesStale = false
                 FileLogger.i(TAG, "VPN interface swapped atomically")
 
                 // Send network_changed command with new fd
@@ -3672,16 +3872,22 @@ class TiredVpnService : VpnService() {
             // Attach + write + detach in one critical section. Split apart,
             // the 30-second `status` poll or a `network_available` could take
             // the descriptor with them and leave this command without one.
-            // Built with JSONObject rather than a literal now that it has an
-            // optional field; the core's decoder ignores what it does not know,
-            // so an omitted reason is exactly the old wire form.
-            val cmd = JSONObject().apply {
-                put("command", "network_changed")
-                if (reason.isNotEmpty()) put("reason", reason)
-            }.toString()
+            // Optional fields are left out rather than sent empty; the core's
+            // decoder ignores what it does not know, so an omitted reason is
+            // exactly the old wire form.
+            //
+            // network_id is the network traffic is moving to: the core hands
+            // the carry on with the last network it was told.
+            val networkId = underlyingNetworkId()
+            val cmd = ControlSocketProtocol.command(
+                "network_changed",
+                "reason" to reason.ifEmpty { null },
+                "network_id" to networkId,
+            )
             channel.send(cmd, fileDescriptor)
 
-            FileLogger.i(TAG, "Sent network_changed command with new TUN fd=$fd, reason=${reason.ifEmpty { "(none)" }}")
+            FileLogger.i(TAG, "Sent network_changed command with new TUN fd=$fd, reason=${reason.ifEmpty { "(none)" }}, " +
+                "network_id=${networkId ?: "(none)"}")
             // Response will be handled by eventListener in startStatusMonitoring
 
         } catch (e: Exception) {
@@ -3960,12 +4166,19 @@ class TiredVpnService : VpnService() {
             isNetworkLost = false  // Reset flag
 
             if (!skipConnectivityCheck) {
-                FileLogger.d(TAG, "Reconnect: Step 6 - Checking TCP connectivity to ${config.serverAddress}:${config.serverPort}...")
+                // Any server of the pool answering proves the network; a dead
+                // first server must not hold the reconnect (PrecheckMemory).
+                val precheckTargets = (if (config.fallbackEnabled) {
+                    ServerPoolConfig.selectPool(ServerRepository.getServers(this@TiredVpnService), config)
+                } else {
+                    listOf(config)
+                }).map { "${it.serverAddress}:${it.serverPort}" to (it.serverAddress to it.serverPort) }.distinctBy { it.first }
+                FileLogger.d(TAG, "Reconnect: Step 6 - Checking TCP connectivity to the pool (${precheckTargets.size} server(s))...")
                 enterReconnectingState("Checking network...")
 
                 var connectivityAttempts = 0
                 val maxConnectivityAttempts = 3  // Limit attempts
-                while (!checkTcpConnectivity(config.serverAddress, config.serverPort) && connectivityAttempts < maxConnectivityAttempts) {
+                while (!precheckPool(precheckTargets) && connectivityAttempts < maxConnectivityAttempts) {
                     connectivityAttempts++
                     // Shorter backoff: 1s, 2s, 3s (max 3s instead of 30s)
                     val waitMs = ReconnectBackoff.connectivityWaitMs(connectivityAttempts)
@@ -4623,6 +4836,18 @@ class TiredVpnService : VpnService() {
             FileLogger.i(TAG, "Parsed connection info: strategy=$connectedStrategy, latency=${connectedLatencyMs}ms, attempts=$connectedAttempts")
         }
         // Note: Keepalive tracking moved to Go side - events sent via control socket
+    }
+
+    /**
+     * One pre-check probe, at the server [PrecheckMemory] picks from [targets]
+     * ("host:port" to host and port, in pool order), and the outcome booked.
+     */
+    private suspend fun precheckPool(targets: List<Pair<String, Pair<String, Int>>>): Boolean {
+        val key = precheckMemory.pick(targets.map { it.first }, SystemClock.elapsedRealtime()) ?: return false
+        val (host, port) = targets.first { it.first == key }.second
+        val ok = checkTcpConnectivity(host, port)
+        if (ok) precheckMemory.answered(key) else precheckMemory.failed(key, SystemClock.elapsedRealtime())
+        return ok
     }
 
     /**

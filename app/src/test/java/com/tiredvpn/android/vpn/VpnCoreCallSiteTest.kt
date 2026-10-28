@@ -896,7 +896,9 @@ class VpnCoreCallSiteTest {
             "activeTunnelConfig must follow too, or forNetworkChange reads the old pair straight back",
             body.contains("activeTunnelConfig = activeTunnelConfig?.copy(")
         )
-        assertTrue("and the interface has to be rebuilt", body.contains("sendNetworkChangedCommand(forceReconnect = true)"))
+        // scheduleInterfaceRebuild sends the network_changed; pinned in
+        // `a rebuild does not keep the interface it is meant to replace`.
+        assertTrue("and the interface has to be rebuilt", body.contains("scheduleInterfaceRebuild(\"IPv6\")"))
     }
 
     @Test
@@ -933,15 +935,12 @@ class VpnCoreCallSiteTest {
             service.contains("NetworkTransition.reason(lastNetworkType, currentNetworkType)")
         )
         assertTrue(service.contains("sendNetworkChangedCommand(forceReconnect = false, isCritical = true, reason = reason)"))
+        // ControlSocketProtocol.command leaves a null field out; the
+        // ControlSocketProtocolTest pins that half.
         assertTrue(
-            "the reason has to reach the wire",
+            "the reason has to reach the wire, and an unnamed transition must be omitted, not sent blank",
             bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(fd: Int, reason: String = \"\") {")
-                .contains("""put("reason", reason)""")
-        )
-        assertTrue(
-            "an unnamed transition must be omitted, not sent blank",
-            bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(fd: Int, reason: String = \"\") {")
-                .contains("if (reason.isNotEmpty())")
+                .contains(""""reason" to reason.ifEmpty { null }""")
         )
     }
 
@@ -1339,7 +1338,7 @@ class VpnCoreCallSiteTest {
     fun `a network switch hands the core the interface it already has`() {
         val service = callSites("TiredVpnService.kt")
         val body = bodyAfter(service, "private fun sendNetworkChangedCommand(")
-        val keep = Regex("""if \(currentVpnFd != null && isVpnInterfaceValid\(currentVpnFd\)\) \{[\s\S]*?sendNetworkChangedWithFd\(currentVpnFd\.fd, reason\)\s*return@withLock""").find(body)
+        val keep = Regex("""if \(currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid\(currentVpnFd\)\) \{[\s\S]*?sendNetworkChangedWithFd\(currentVpnFd\.fd, reason\)\s*return@withLock""").find(body)
         assertTrue("a valid interface must be sent again, not replaced", keep != null)
         assertTrue("and that check comes before any new interface is built", keep!!.range.first < body.indexOf("establishVpn("))
     }
@@ -1891,5 +1890,166 @@ class VpnCoreCallSiteTest {
         val published = Regex("""if \(stopLatch\.isLatched\) throw CancellationException\([^)]*\)\s*clearPhase\(\)\s*_state\.value = VpnState\.Connected\(""")
             .findAll(callSites("TiredVpnService.kt")).count()
         assertEquals("a dead tunnel is never painted live after a stop, in tun and proxy mode", 2, published)
+    }
+
+    // --- core 1.11.9 contract: network_id and the awaited stop --------------
+    //
+    // UnderlyingNetworkTest, ControlSocketProtocolTest and ControlChannelTest
+    // cover the functions; these pin the places that have to call them.
+
+    @Test
+    fun `connect and network_changed name the network they are made on`() {
+        val service = source("TiredVpnService.kt")
+
+        val connect = bodyAfter(service, "private suspend fun connectToControlSocket(")
+        val id = connect.indexOf("val networkId = awaitUnderlyingNetworkId(")
+        val cmd = connect.indexOf("val connectCmd = ControlSocketProtocol.command(\"connect\", \"network_id\" to networkId)")
+        assertTrue("connect looks the network up", id >= 0)
+        assertTrue("and the command it sends carries it", cmd > id)
+        assertTrue("that command is the one sent", connect.indexOf("channel.send(connectCmd)") > cmd)
+
+        val changed = bodyAfter(service, "private suspend fun sendNetworkChangedWithFd(")
+        val changedId = changed.indexOf("val networkId = underlyingNetworkId()")
+        val changedCmd = changed.indexOf("val cmd = ControlSocketProtocol.command(")
+        assertTrue("network_changed looks the network up", changedId >= 0)
+        assertTrue("and names it", changed.indexOf("\"network_id\" to networkId", changedCmd) > changedCmd)
+        assertTrue("on the command that carries the new fd", changed.indexOf("channel.send(cmd, fileDescriptor)") > changedCmd)
+    }
+
+    /**
+     * A core restarted while the network is still gone must not send a
+     * connect that names none: the core then takes any carry, made on any
+     * network. Seen on the Pixel: every mobile-data drop sent network_id
+     * (none).
+     */
+    @Test
+    fun `connect waits for a network to name, within a bound`() {
+        val service = source("TiredVpnService.kt")
+        val wait = bodyAfter(service, "private suspend fun awaitUnderlyingNetworkId(maxWaitMs: Long): String? {")
+        assertTrue("answers at once when there is a network", wait.indexOf("underlyingNetworkId()?.let { return it }") >= 0)
+        assertTrue("polls while there is none", wait.contains("while (SystemClock.uptimeMillis() - started < maxWaitMs)"))
+        assertTrue("and gives up to send none", wait.contains("return null"))
+        val connect = bodyAfter(service, "private suspend fun connectToControlSocket(")
+        assertTrue(
+            "bounded by the attempt's budget",
+            connect.contains("budget.budgetMs(System.currentTimeMillis(), CONNECT_NETWORK_WAIT_MS)")
+        )
+    }
+
+    @Test
+    fun `the network named is the underlying one, never the VPN`() {
+        val service = source("TiredVpnService.kt")
+        val lookup = bodyAfter(service, "private fun underlyingNetworkId(): String? = try {")
+        assertTrue(lookup.contains("UnderlyingNetwork.choose(trackedUnderlyingNetwork, cm.activeNetwork, all)"))
+        assertTrue("a VPN is marked as one", lookup.contains("caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)"))
+        assertTrue(lookup.contains("!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)"))
+        assertTrue("none is left out, not sent as 0", lookup.contains("UnderlyingNetwork.wireId(chosen?.handle)"))
+    }
+
+    /** Every change to the callback's ranking reaches what network_changed names. */
+    @Test
+    fun `every move the network callback sees is published`() {
+        val service = source("TiredVpnService.kt")
+        val monitor = bodyAfter(service, "private fun startNetworkMonitoring() {")
+        val changes = occurrences(monitor, "networksUp.available(") + occurrences(monitor, "networksUp.lost(")
+        val published = occurrences(monitor, "trackedUnderlyingNetwork = ")
+        assertEquals(3, changes)
+        assertEquals("one publication per ranking change", changes, published)
+        assertTrue(
+            "a stopped callback publishes nothing",
+            bodyAfter(service, "private fun stopNetworkMonitoring() {").contains("trackedUnderlyingNetwork = null")
+        )
+    }
+
+    @Test
+    fun `a stop waits until the core has read disconnect`() {
+        val service = source("TiredVpnService.kt")
+        val tell = bodyAfter(service, "private fun sendDisconnectCommand() {")
+        assertTrue("over the open channel", tell.contains("awaitStopAnswer(channel, "))
+        assertTrue("or, with none, over a connection of its own", tell.contains("awaitStopAnswer(own, "))
+        assertFalse("never fire-and-forget", tell.contains(".send("))
+
+        val await = bodyAfter(service, "private fun awaitStopAnswer(")
+        assertTrue(await.contains("channel.request(cmd, DISCONNECT_ANSWER_TIMEOUT_MS, ControlSocketProtocol::isStopAnswer)"))
+
+        val disconnect = bodyAfter(service, "private fun disconnect(intent: StopIntent) {")
+        val told = disconnect.indexOf("sendDisconnectCommand()")
+        assertTrue("disconnect tells the core", told >= 0)
+        assertTrue("before the channel closes", told < disconnect.indexOf("closeControlChannel()"))
+        assertTrue("before the core stops", told < disconnect.indexOf("tiredvpnProcess?.stop()"))
+    }
+
+    @Test
+    fun `a force reset is a stop the core is told of, a connect's reset is not`() {
+        val service = source("TiredVpnService.kt")
+        assertTrue(
+            "ACTION_FORCE_RESET tells the core before resetting it",
+            Regex("""ACTION_FORCE_RESET -> \{[^}]*?sendDisconnectCommand\(\)[^}]*?forceResetCore\("user force reset"\)""")
+                .containsMatchIn(service)
+        )
+        // The reset a Connect tap does is no stop: it must not wipe what the
+        // previous core learned.
+        val connectBranch = service.substringAfter("ACTION_CONNECT, SERVICE_INTERFACE -> {").substringBefore("ACTION_DISCONNECT -> {")
+        assertFalse(connectBranch.contains("sendDisconnectCommand()"))
+        assertFalse(bodyAfter(service, "private fun forceResetCore(reason: String, keepInterface: Boolean = false) {").contains("sendDisconnectCommand()"))
+    }
+
+    // --- a renegotiated address rebuilds the interface ----------------------
+
+    @Test
+    fun `a reconnect's new IPv4 address is followed`() {
+        val service = source("TiredVpnService.kt")
+        val connectedAt = service.indexOf("_state.value = VpnState.Connected(", service.indexOf("\"connected\" -> {\n                                    // Response to network_changed or reconnect"))
+        val v4 = service.indexOf("applyRenegotiatedIpv4(json.optString(\"ip\", \"\"), source = \"network_changed response\")")
+        assertTrue("the network_changed answer is checked for a new address", v4 >= 0)
+        assertTrue("after Connected is published: the rebuild runs only then", connectedAt in 0 until v4)
+
+        val apply = bodyAfter(service, "private fun applyRenegotiatedIpv4(reportedIp: String, source: String) {")
+        assertTrue(apply.contains("if (!TunnelAddresses.ipv4Changed(currentVpnIp, reportedIp)) return"))
+        assertTrue("the rebuild reads the new address", apply.contains("currentVpnIp = reportedIp"))
+        assertTrue(apply.contains("activeTunnelConfig = activeTunnelConfig?.copy(ip = reportedIp)"))
+        assertTrue(apply.contains("scheduleInterfaceRebuild(\"IPv4\")"))
+        assertTrue(bodyAfter(service, "private fun applyRenegotiatedIpv6(").contains("scheduleInterfaceRebuild(\"IPv6\")"))
+    }
+
+    /**
+     * The rebuild goes through the network-change path, which keeps a valid
+     * interface. Without the stale mark it kept the one with the old address,
+     * for IPv4 and for IPv6 alike.
+     */
+    @Test
+    fun `a rebuild does not keep the interface it is meant to replace`() {
+        val service = source("TiredVpnService.kt")
+        val schedule = bodyAfter(service, "private fun scheduleInterfaceRebuild(family: String) {")
+        assertTrue(schedule.contains("interfaceAddressesStale = true"))
+        assertTrue(schedule.contains("if (interfaceAddressesStale) sendNetworkChangedCommand(forceReconnect = true)"))
+
+        val change = bodyAfter(service, "private fun sendNetworkChangedCommand(")
+        assertTrue(
+            "a stale interface is not kept",
+            change.contains("if (currentVpnFd != null && !interfaceAddressesStale && isVpnInterfaceValid(currentVpnFd)) {")
+        )
+        val swapped = change.indexOf("vpnInterface = newVpnFd")
+        val cleared = change.indexOf("interfaceAddressesStale = false")
+        assertTrue("cleared once the new interface is in place", swapped in 0 until cleared)
+        assertTrue("and before the core is handed it", cleared < change.indexOf("sendNetworkChangedWithFd(newVpnFd.fd, reason)"))
+    }
+
+    // --- the reconnect pre-check asks the pool, not only the active server --
+
+    @Test
+    fun `the reconnect pre-check is not held by a dead first server`() {
+        val service = source("TiredVpnService.kt")
+        val start = service.indexOf("val skipConnectivityCheck = isNetworkLost")
+        assertTrue("landmark not found: the pre-check", start >= 0)
+        val reconnect = service.substring(start).substringBefore("Reconnect: Step 7")
+        assertTrue("the pool is what is checked", reconnect.contains("ServerPoolConfig.selectPool(ServerRepository.getServers(this@TiredVpnService), config)"))
+        assertTrue("through the memory of dead servers", reconnect.contains("while (!precheckPool(precheckTargets) && connectivityAttempts < maxConnectivityAttempts) {"))
+        assertFalse("not the active server alone", reconnect.contains("checkTcpConnectivity(config.serverAddress, config.serverPort)"))
+
+        val probe = bodyAfter(service, "private suspend fun precheckPool(targets: List<Pair<String, Pair<String, Int>>>): Boolean {")
+        assertTrue(probe.contains("precheckMemory.pick("))
+        assertTrue("a failure is remembered", probe.contains("precheckMemory.failed(key, SystemClock.elapsedRealtime())"))
+        assertTrue("and an answer forgets it", probe.contains("precheckMemory.answered(key)"))
     }
 }

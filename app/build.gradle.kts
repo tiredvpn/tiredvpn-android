@@ -323,8 +323,8 @@ android {
         applicationId = "com.tiredvpn.android"
         minSdk = 24
         targetSdk = 37  // Android 16 QPR
-        versionCode = 27
-        versionName = "1.11.3"
+        versionCode = 28
+        versionName = "1.11.4"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -377,6 +377,17 @@ android {
     }
 
     buildTypes {
+        debug {
+            // A debug build that installs next to the release app instead of
+            // over it: -PdebugApplicationIdSuffix=.coretest gives it its own
+            // package, data and VPN profile, so a phone's real app and its
+            // configs stay untouched while a test build runs beside them.
+            // Unset, the debug build is com.tiredvpn.android as before.
+            providers.gradleProperty("debugApplicationIdSuffix").orNull?.let {
+                applicationIdSuffix = it
+                versionNameSuffix = "-${it.removePrefix(".")}"
+            }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -448,6 +459,15 @@ androidComponents {
 }
 
 dependencies {
+    constraints {
+        // CVE-2026-102554 / GHSA-xxph-c9ww-hj94: Guava <= 33.7.1 can be driven
+        // into uncontrolled memory allocation while deserializing its map/set
+        // types. It reaches the release runtime only transitively, through
+        // androidx.media3:media3-common. Force the patched line so the
+        // osv-scanner gate passes; drop this once media3 ships >= 33.7.2.
+        implementation("com.google.guava:guava:33.7.2-android")
+    }
+
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("com.google.android.material:material:1.14.0")

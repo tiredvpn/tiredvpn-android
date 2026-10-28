@@ -22,7 +22,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import java.io.File
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -36,6 +35,7 @@ import com.tiredvpn.android.importer.ImportPreview
 import com.tiredvpn.android.util.SharedFiles
 import com.tiredvpn.android.util.StoreWriteError
 import com.tiredvpn.android.vpn.ServerRepository
+import com.tiredvpn.android.vpn.SplitTunnelSettings
 import com.tiredvpn.android.vpn.TiredVpnService
 import com.tiredvpn.android.vpn.VpnState
 import com.tiredvpn.android.vpn.VpnConfig
@@ -508,7 +508,16 @@ class SettingsActivity : BaseActivity() {
 
     private fun exportAndShare(servers: List<VpnConfig>) {
         try {
-            val json = JSONArray().apply { servers.forEach { put(it.toJson()) } }
+            // Carry each server's split-tunnel rules alongside it. They live in
+            // SharedPreferences, apart from the config, so a bare toJson() export
+            // dropped them and the app list had to be re-picked after a restore.
+            // The assembly lives in ConfigCodec.encodeAll so a unit test covers it.
+            val json = ConfigCodec.encodeAll(servers) { server ->
+                ConfigCodec.SplitTunnelSpec(
+                    mode = SplitTunnelSettings.getMode(this, server.id),
+                    apps = SplitTunnelSettings.getApps(this, server.id),
+                )
+            }
             // SharedFiles and not cacheDir: FileProvider only grants the two
             // subdirectories declared in file_paths.xml.
             val file = SharedFiles.file(this, "tiredvpn-backup.json")
