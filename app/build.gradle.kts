@@ -492,7 +492,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.11.0")
 
     // OkHttp for update checking
-    implementation("com.squareup.okhttp3:okhttp:5.4.0")
+    implementation("com.squareup.okhttp3:okhttp:5.5.1")
 
     // Encrypted SharedPreferences for secure credential storage.
     // 1.1.0 went stable on 2025-07-30; nothing in this module needs an alpha.
@@ -505,8 +505,8 @@ dependencies {
     // server instead of being mocked away. okhttp-tls gives that server a
     // certificate, so the downloader's https-only rule can stay unconditional
     // instead of being relaxed for tests.
-    testImplementation("com.squareup.okhttp3:mockwebserver3:5.4.0")
-    testImplementation("com.squareup.okhttp3:okhttp-tls:5.4.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver3:5.5.1")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:5.5.1")
     // org.json ships inside the SDK, so the mockable android.jar stubs it out and
     // every parse silently returns null. The real implementation on the test
     // classpath is what lets the update manifest be parsed under test at all.
