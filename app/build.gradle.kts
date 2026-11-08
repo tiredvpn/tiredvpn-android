@@ -465,7 +465,7 @@ dependencies {
         // types. It reaches the release runtime only transitively, through
         // androidx.media3:media3-common. Force the patched line so the
         // osv-scanner gate passes; drop this once media3 ships >= 33.7.2.
-        implementation("com.google.guava:guava:33.7.2-android")
+        implementation("com.google.guava:guava:33.8.0-android")
     }
 
     implementation("androidx.core:core-ktx:1.19.1")
